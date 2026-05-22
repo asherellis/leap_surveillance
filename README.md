@@ -2,7 +2,7 @@
 
 Pipeline for running LLM surveillance on LEAP forecasting questions.
 
-It pulls questions from BigQuery, generates structured forecasts with web search, optionally uses browser automation when needed, and writes results to local files and Google Sheets. BigQuery write/sync support is included, but requires the appropriate warehouse permissions.
+It pulls questions from BigQuery, generates structured forecasts with web search, optionally uses browser automation when needed, and writes results to local files and Google Sheets. (BigQuery write/sync support is included but requires permissions.)
 
 ## Setup
 
