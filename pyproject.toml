@@ -1,0 +1,26 @@
+[project]
+name = "leap-surveillance"
+version = "0.1.0"
+description = "LEAP surveillance forecasting pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm==1.84.0",
+    "browser-use==0.11.13",
+    "pydantic>=2.11,<2.12",
+    "python-dotenv>=1.0.0",
+    "gspread>=6.2.1",
+    "google-auth-oauthlib>=1.2.0",
+    "google-cloud-bigquery>=3.35.1",
+    "langchain-litellm>=0.1.0",
+    "pandas>=2.3.1",
+]
+
+[project.scripts]
+leap-surveillance = "run_surveillance:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["bigquery", "data_utils", "research", "run_surveillance", "schemas"]

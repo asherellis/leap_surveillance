@@ -1,0 +1,235 @@
+"""Data schemas for surveillance questions, evidence, and responses."""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# Reject unexpected fields in strict structured outputs.
+STRICT_CONFIG = ConfigDict(extra="forbid")
+
+
+@dataclass
+class ExpectedForecast:
+    forecast_date: str
+    dimension: str
+    quantile: Optional[int]
+
+
+@dataclass
+class QuestionSpec:
+    id: str
+    name: str
+    prompt: str
+    expected_forecasts: list[ExpectedForecast] = field(default_factory=list)
+    question_type: str = "quantile"  # "quantile", "probability", or "when"
+    unit: str = ""
+    unit_min: Optional[float] = None
+    unit_max: Optional[float] = None
+
+
+@dataclass
+class EvidenceItem:
+    source_type: str
+    url: str
+    title: Optional[str] = None
+    snippet: Optional[str] = None
+    full_text: Optional[str] = None
+
+
+@dataclass
+class BrowserEvidence:
+    url: str
+    objective: str
+    extracted_text: str
+    success: bool
+    error: Optional[str] = None
+
+
+class ResearchQualityReport(BaseModel):
+    model_config = STRICT_CONFIG
+
+    adequate: bool = True
+    confidence: int = Field(default=50, ge=0, le=100)
+    missing_data: list[str] = Field(default_factory=list)
+    browser_would_help: bool = False
+    browser_url: str = ""
+    browser_objective: str = ""
+    reason: str = ""
+
+
+class ColorCode(str, Enum):
+    black = "black"
+    dark_gray = "dark gray"
+    light_gray = "light gray"
+    white = "white"
+
+
+class ProgressDirection(str, Enum):
+    more_progress = "more progress"
+    less_progress = "less progress"
+    unclear = "unclear"
+
+
+class OfficialValue(BaseModel):
+    dimension: str
+    value: Optional[float]
+    date: str
+    source: str
+
+
+class CurrentValue(BaseModel):
+    dimension: str
+    value: Optional[float]
+    confidence: int = Field(ge=0, le=100)
+
+
+class ForecastValue(BaseModel):
+    forecast_date: str
+    dimension: str
+    quantile: Optional[int]
+    forecast_value: Optional[float]
+    color_code: ColorCode
+
+
+class SurveillanceResponse(BaseModel):
+    last_official_values: list[OfficialValue]
+    current_resolve_today_values: list[CurrentValue]
+    forecasts: list[ForecastValue]
+    more_or_less_progress: ProgressDirection
+    rationale: str
+    sources: list[str]
+
+
+class StrictOfficialValue(BaseModel):
+    model_config = STRICT_CONFIG
+    dimension: str
+    value: float
+    date: str
+    source: str
+
+
+class StrictCurrentValue(BaseModel):
+    model_config = STRICT_CONFIG
+    dimension: str
+    value: float
+    confidence: int = Field(ge=0, le=100)
+
+
+class StrictForecastValue(BaseModel):
+    model_config = STRICT_CONFIG
+    forecast_date: str
+    dimension: str
+    quantile: int
+    forecast_value: float
+    color_code: ColorCode
+
+
+class StrictSource(BaseModel):
+    model_config = STRICT_CONFIG
+    url: str
+    title: str
+    snippet: str
+
+
+class StrictSurveillanceResponse(BaseModel):
+    model_config = STRICT_CONFIG
+    last_official_values: list[StrictOfficialValue]
+    current_resolve_today_values: list[StrictCurrentValue]
+    forecasts: list[StrictForecastValue]
+    more_or_less_progress: ProgressDirection
+    rationale: str
+    sources: list[StrictSource]
+
+
+def make_strict_schema(
+    model: type[BaseModel],
+    allowed_dimensions: Optional[list[str]] = None,
+    allowed_quantiles: Optional[list[int]] = None,
+    allowed_forecast_dates: Optional[list[str]] = None,
+) -> dict:
+    """Build an OpenAI strict schema and pin forecast row keys when provided."""
+    schema = model.model_json_schema()
+
+    def fix_schema(obj: dict) -> dict:
+        if not isinstance(obj, dict):
+            return obj
+        obj.pop("default", None)
+        if "properties" in obj:
+            obj["additionalProperties"] = False
+            obj["required"] = list(obj["properties"].keys())
+        for value in obj.values():
+            if isinstance(value, dict):
+                fix_schema(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        fix_schema(item)
+        if "$defs" in obj:
+            for def_schema in obj["$defs"].values():
+                fix_schema(def_schema)
+        return obj
+
+    schema = fix_schema(schema)
+
+    forecast_def = schema.get("$defs", {}).get("StrictForecastValue", {})
+    properties = forecast_def.get("properties", {})
+    if allowed_forecast_dates and "forecast_date" in properties:
+        properties["forecast_date"]["enum"] = allowed_forecast_dates
+    if allowed_dimensions and "dimension" in properties:
+        properties["dimension"]["enum"] = allowed_dimensions
+    if allowed_quantiles and "quantile" in properties:
+        properties["quantile"]["enum"] = allowed_quantiles
+
+    return schema
+
+
+def convert_sentinel_value(v: float) -> Optional[float]:
+    """Convert the strict-schema no-estimate sentinel back to None."""
+    return None if v == -999 else v
+
+
+def strict_to_regular_response(
+    strict: StrictSurveillanceResponse,
+) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    evidence = [
+        EvidenceItem(
+            source_type="web_search", url=s.url, title=s.title, snippet=s.snippet
+        )
+        for s in strict.sources
+    ]
+
+    response = SurveillanceResponse(
+        last_official_values=[
+            OfficialValue(
+                dimension=ov.dimension,
+                value=convert_sentinel_value(ov.value),
+                date=ov.date,
+                source=ov.source,
+            )
+            for ov in strict.last_official_values
+        ],
+        current_resolve_today_values=[
+            CurrentValue(
+                dimension=cv.dimension,
+                value=convert_sentinel_value(cv.value),
+                confidence=cv.confidence,
+            )
+            for cv in strict.current_resolve_today_values
+        ],
+        forecasts=[
+            ForecastValue(
+                forecast_date=fv.forecast_date,
+                dimension=fv.dimension,
+                quantile=fv.quantile,
+                forecast_value=convert_sentinel_value(fv.forecast_value),
+                color_code=fv.color_code,
+            )
+            for fv in strict.forecasts
+        ],
+        more_or_less_progress=strict.more_or_less_progress,
+        rationale=strict.rationale,
+        sources=[s.url for s in strict.sources],
+    )
+    return response, evidence
