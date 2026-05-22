@@ -2,7 +2,7 @@
 
 Pipeline for running LLM surveillance on LEAP forecasting questions.
 
-It pulls questions from BigQuery, generates structured forecasts with web search, optionally uses browser automation when needed, and writes results to local files, Google Sheets, and BigQuery.
+It pulls questions from BigQuery, generates structured forecasts with web search, optionally uses browser automation when needed, and writes results to local files and Google Sheets. BigQuery write/sync support is included, but requires the appropriate warehouse permissions.
 
 ## Setup
 
@@ -37,8 +37,10 @@ python run_surveillance.py run --test-mode --limit 3 --no-bq -y
 Production mode:
 
 ```bash
-python run_surveillance.py run --limit 10 -y
+python run_surveillance.py run --limit 10 --no-bq -y
 ```
+
+Omit `--no-bq` when BigQuery write access is configured.
 
 Reset the review sheet:
 
@@ -46,8 +48,14 @@ Reset the review sheet:
 python run_surveillance.py setup -y
 ```
 
-Sync reviewed rows:
+Sync reviewed rows to BigQuery:
 
 ```bash
 python run_surveillance.py sync
+```
+
+For Sheet-only review movement:
+
+```bash
+python run_surveillance.py sync --no-bq
 ```
