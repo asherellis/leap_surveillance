@@ -15,6 +15,7 @@ class ExpectedForecast:
     forecast_date: str
     dimension: str
     quantile: Optional[int]
+    value_type: str = "forecast"
 
 
 @dataclass
@@ -66,6 +67,11 @@ class ColorCode(str, Enum):
     white = "white"
 
 
+class ValueType(str, Enum):
+    forecast = "forecast"
+    resolution = "resolution"
+
+
 class ProgressDirection(str, Enum):
     more_progress = "more progress"
     less_progress = "less progress"
@@ -85,7 +91,17 @@ class CurrentValue(BaseModel):
     confidence: int = Field(ge=0, le=100)
 
 
+class ResolutionValue(BaseModel):
+    forecast_date: str
+    dimension: str
+    value: Optional[float]
+    source_date: str
+    source: str
+    confidence: int = Field(ge=0, le=100)
+
+
 class ForecastValue(BaseModel):
+    value_type: ValueType
     forecast_date: str
     dimension: str
     quantile: Optional[int]
@@ -95,7 +111,8 @@ class ForecastValue(BaseModel):
 
 class SurveillanceResponse(BaseModel):
     last_official_values: list[OfficialValue]
-    current_resolve_today_values: list[CurrentValue]
+    current_resolution_values: list[CurrentValue]
+    resolution_values: list[ResolutionValue]
     forecasts: list[ForecastValue]
     more_or_less_progress: ProgressDirection
     rationale: str
@@ -114,6 +131,16 @@ class StrictCurrentValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
     value: float
+    confidence: int = Field(ge=0, le=100)
+
+
+class StrictResolutionValue(BaseModel):
+    model_config = STRICT_CONFIG
+    forecast_date: str
+    dimension: str
+    value: float
+    source_date: str
+    source: str
     confidence: int = Field(ge=0, le=100)
 
 
@@ -136,7 +163,8 @@ class StrictSource(BaseModel):
 class StrictSurveillanceResponse(BaseModel):
     model_config = STRICT_CONFIG
     last_official_values: list[StrictOfficialValue]
-    current_resolve_today_values: list[StrictCurrentValue]
+    current_resolution_values: list[StrictCurrentValue]
+    resolution_values: list[StrictResolutionValue]
     forecasts: list[StrictForecastValue]
     more_or_less_progress: ProgressDirection
     rationale: str
@@ -181,6 +209,12 @@ def make_strict_schema(
         properties["dimension"]["enum"] = allowed_dimensions
     if allowed_quantiles and "quantile" in properties:
         properties["quantile"]["enum"] = allowed_quantiles
+    resolution_def = schema.get("$defs", {}).get("StrictResolutionValue", {})
+    resolution_properties = resolution_def.get("properties", {})
+    if allowed_forecast_dates and "forecast_date" in resolution_properties:
+        resolution_properties["forecast_date"]["enum"] = allowed_forecast_dates
+    if allowed_dimensions and "dimension" in resolution_properties:
+        resolution_properties["dimension"]["enum"] = allowed_dimensions
 
     return schema
 
@@ -192,6 +226,7 @@ def convert_sentinel_value(v: float) -> Optional[float]:
 
 def strict_to_regular_response(
     strict: StrictSurveillanceResponse,
+    expected_forecasts: Optional[list[ExpectedForecast]] = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     evidence = [
         EvidenceItem(
@@ -199,6 +234,44 @@ def strict_to_regular_response(
         )
         for s in strict.sources
     ]
+
+    expected_value_types = {}
+    if expected_forecasts:
+        expected_value_types = {
+            (e.forecast_date, e.dimension, e.quantile): e.value_type
+            for e in expected_forecasts
+        }
+    resolution_by_key = {
+        (rv.forecast_date, rv.dimension): convert_sentinel_value(rv.value)
+        for rv in strict.resolution_values
+    }
+    expected_resolution_keys = {
+        (e.forecast_date, e.dimension)
+        for e in expected_forecasts or []
+        if e.value_type == "resolution"
+    }
+
+    forecasts = []
+    for fv in strict.forecasts:
+        key = (fv.forecast_date, fv.dimension, fv.quantile)
+        value_type = ValueType(expected_value_types.get(key, "forecast"))
+        resolution_value = resolution_by_key.get((fv.forecast_date, fv.dimension))
+        if value_type == ValueType.resolution and resolution_value is not None:
+            forecast_value = resolution_value
+            color_code = ColorCode.black
+        else:
+            forecast_value = convert_sentinel_value(fv.forecast_value)
+            color_code = fv.color_code
+        forecasts.append(
+            ForecastValue(
+                value_type=value_type,
+                forecast_date=fv.forecast_date,
+                dimension=fv.dimension,
+                quantile=fv.quantile,
+                forecast_value=forecast_value,
+                color_code=color_code,
+            )
+        )
 
     response = SurveillanceResponse(
         last_official_values=[
@@ -210,24 +283,28 @@ def strict_to_regular_response(
             )
             for ov in strict.last_official_values
         ],
-        current_resolve_today_values=[
+        current_resolution_values=[
             CurrentValue(
                 dimension=cv.dimension,
                 value=convert_sentinel_value(cv.value),
                 confidence=cv.confidence,
             )
-            for cv in strict.current_resolve_today_values
+            for cv in strict.current_resolution_values
         ],
-        forecasts=[
-            ForecastValue(
-                forecast_date=fv.forecast_date,
-                dimension=fv.dimension,
-                quantile=fv.quantile,
-                forecast_value=convert_sentinel_value(fv.forecast_value),
-                color_code=fv.color_code,
+        resolution_values=[
+            ResolutionValue(
+                forecast_date=rv.forecast_date,
+                dimension=rv.dimension,
+                value=convert_sentinel_value(rv.value),
+                source_date=rv.source_date,
+                source=rv.source,
+                confidence=rv.confidence,
             )
-            for fv in strict.forecasts
+            for rv in strict.resolution_values
+            if expected_forecasts is None
+            or (rv.forecast_date, rv.dimension) in expected_resolution_keys
         ],
+        forecasts=forecasts,
         more_or_less_progress=strict.more_or_less_progress,
         rationale=strict.rationale,
         sources=[s.url for s in strict.sources],

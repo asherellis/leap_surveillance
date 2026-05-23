@@ -5,7 +5,7 @@ import json
 import math
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from schemas import ExpectedForecast, QuestionSpec
@@ -28,11 +28,20 @@ SHEET_HEADERS = [
     "created_at",
     "question_id",
     "question_name",
-    "forecast_date",
+    "target_value_type",
+    "target_date",
     "dimension",
     "quantile",
-    "forecast_value",
+    "forecast_target_value",
+    "resolution_target_value",
     "color_code",
+    "resolution_source_date",
+    "resolution_source",
+    "current_resolution_value",
+    "current_resolution_confidence",
+    "latest_official_value",
+    "latest_official_date",
+    "latest_official_source",
     "validation_ok",
     "usable_for_scoring",
     "rationale",
@@ -82,6 +91,14 @@ def to_float(val):
 
 FULL_QUANTILES = [0, 5, 25, 50, 75, 95, 100]
 TIMING_FORECAST_DATE = "event_occurrence"
+
+
+def _date_value_type(forecast_date: str, today: date | None = None) -> str:
+    today = today or datetime.now(timezone.utc).date()
+    try:
+        return "resolution" if date.fromisoformat(forecast_date) < today else "forecast"
+    except ValueError:
+        return "forecast"
 
 
 def _is_empty(val) -> bool:
@@ -164,7 +181,11 @@ def _expected_forecasts(
     question_type: str, dates: list[str], dimensions: list[str]
 ) -> list[ExpectedForecast]:
     if question_type == "probability":
-        return [ExpectedForecast(d, dim, 50) for d in dates for dim in dimensions]
+        return [
+            ExpectedForecast(d, dim, 50, _date_value_type(d))
+            for d in dates
+            for dim in dimensions
+        ]
 
     if question_type == "when":
         return [
@@ -174,11 +195,92 @@ def _expected_forecasts(
         ]
 
     return [
-        ExpectedForecast(d, dim, p)
+        ExpectedForecast(d, dim, p, _date_value_type(d))
         for d in dates
         for dim in dimensions
         for p in FULL_QUANTILES
     ]
+
+
+def _context_maps(response: dict) -> tuple[dict, dict, dict]:
+    official = {
+        item.get("dimension", "Overall"): item
+        for item in response.get("last_official_values", []) or []
+    }
+    current = {
+        item.get("dimension", "Overall"): item
+        for item in response.get("current_resolution_values", []) or []
+    }
+    resolution = {
+        (item.get("forecast_date"), item.get("dimension", "Overall")): item
+        for item in response.get("resolution_values", []) or []
+    }
+    return official, current, resolution
+
+
+def _forecast_output_row(
+    *,
+    q_id: str,
+    q_name: str,
+    forecast: dict,
+    response: dict,
+    validation: dict | None = None,
+    run_id: str | None = None,
+    created_at: str | None = None,
+    result_id: str | None = None,
+) -> dict:
+    official, current, resolution = _context_maps(response)
+    dim = forecast.get("dimension", "Overall")
+    forecast_date = forecast.get("forecast_date", "")
+    official_value = official.get(dim) or official.get("Overall") or {}
+    current_value = current.get(dim) or current.get("Overall") or {}
+    resolution_value = resolution.get((forecast_date, dim)) or resolution.get((forecast_date, "Overall")) or {}
+    target_value_type = forecast.get("value_type", "forecast")
+    forecast_target_value = forecast.get("forecast_value", "") if target_value_type == "forecast" else ""
+    resolution_target_value = resolution_value.get("value", "") if target_value_type == "resolution" else ""
+
+    row = {
+        "question_id": q_id,
+        "question_name": q_name,
+        "target_value_type": target_value_type,
+        "target_date": forecast_date,
+        "dimension": dim,
+        "quantile": forecast.get("quantile", ""),
+        "forecast_target_value": forecast_target_value,
+        "resolution_target_value": resolution_target_value,
+        "color_code": forecast.get("color_code", ""),
+        "resolution_source_date": resolution_value.get("source_date", ""),
+        "resolution_source": resolution_value.get("source", ""),
+        "current_resolution_value": current_value.get("value", ""),
+        "current_resolution_confidence": current_value.get("confidence", ""),
+        "latest_official_value": official_value.get("value", ""),
+        "latest_official_date": official_value.get("date", ""),
+        "latest_official_source": official_value.get("source", ""),
+    }
+    if result_id is not None:
+        row["result_id"] = result_id
+    if run_id is not None:
+        row["run_id"] = run_id
+    if created_at is not None:
+        row["created_at"] = created_at
+    if validation is not None:
+        row["validation_ok"] = str(validation.get("ok", False))
+        row["usable_for_scoring"] = str(validation.get("usable_for_scoring", False))
+    return row
+
+
+def _last_content_row(values: list[list], headers: list[str]) -> int:
+    reviewed_idx = headers.index("reviewed") if "reviewed" in headers else -1
+    last_row = 1
+    for row_number, row in enumerate(values[1:], start=2):
+        has_content = any(
+            safe_str(cell).strip()
+            for idx, cell in enumerate(row)
+            if idx != reviewed_idx
+        )
+        if has_content:
+            last_row = row_number
+    return last_row
 
 
 def load_questions(limit=None, prod=False) -> list[QuestionSpec]:
@@ -281,7 +383,7 @@ def write_json_output(
         result = {
             "id": q.id,
             "name": q.name,
-            "response": resp.model_dump() if resp else None,
+            "response": resp.model_dump(mode="json") if resp else None,
         }
         if val:
             result["validation"] = {
@@ -330,17 +432,15 @@ def write_csv_output(run_id, questions, responses, output_dir):
     rows = []
     for q, resp in zip(questions, responses):
         if resp:
-            for f in resp.forecasts:
+            response = resp.model_dump(mode="json")
+            for forecast in response.get("forecasts", []):
                 rows.append(
-                    {
-                        "question_id": q.id,
-                        "question_name": q.name,
-                        "forecast_date": f.forecast_date,
-                        "dimension": f.dimension,
-                        "quantile": f.quantile,
-                        "forecast_value": f.forecast_value,
-                        "color_code": f.color_code.value if f.color_code else None,
-                    }
+                    _forecast_output_row(
+                        q_id=q.id,
+                        q_name=q.name,
+                        forecast=forecast,
+                        response=response,
+                    )
                 )
     if not rows:
         return None
@@ -416,20 +516,39 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
         for forecast in response.get("forecasts", []):
             q_id = question.get("id", "")
             result_id = f"{run_id}_{q_id}_{forecast.get('forecast_date')}_{forecast.get('dimension')}_{forecast.get('quantile')}"
+            row = _forecast_output_row(
+                q_id=q_id,
+                q_name=question.get("name", ""),
+                forecast=forecast,
+                response=response,
+                validation=validation,
+                run_id=run_id,
+                created_at=created_at,
+                result_id=result_id,
+            )
             rows.append(
                 [
-                    result_id,
-                    run_id,
-                    created_at,
-                    q_id,
-                    question.get("name", ""),
-                    forecast.get("forecast_date", ""),
-                    forecast.get("dimension", ""),
-                    forecast.get("quantile", ""),
-                    forecast.get("forecast_value", ""),
-                    forecast.get("color_code", ""),
-                    str(validation.get("ok", False)),
-                    str(validation.get("usable_for_scoring", False)),
+                    row.get("result_id", ""),
+                    row.get("run_id", ""),
+                    row.get("created_at", ""),
+                    row.get("question_id", ""),
+                    row.get("question_name", ""),
+                    row.get("target_value_type", ""),
+                    row.get("target_date", ""),
+                    row.get("dimension", ""),
+                    row.get("quantile", ""),
+                    row.get("forecast_target_value", ""),
+                    row.get("resolution_target_value", ""),
+                    row.get("color_code", ""),
+                    row.get("resolution_source_date", ""),
+                    safe_str(row.get("resolution_source"))[:SHEET_TEXT_LIMIT],
+                    row.get("current_resolution_value", ""),
+                    row.get("current_resolution_confidence", ""),
+                    row.get("latest_official_value", ""),
+                    row.get("latest_official_date", ""),
+                    safe_str(row.get("latest_official_source"))[:SHEET_TEXT_LIMIT],
+                    row.get("validation_ok", ""),
+                    row.get("usable_for_scoring", ""),
                     rationale[:SHEET_TEXT_LIMIT],
                     sources[:SHEET_TEXT_LIMIT],
                     "",
@@ -441,7 +560,9 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
             )
 
     if rows:
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        existing = ws.get_all_values()
+        next_row = _last_content_row(existing, SHEET_HEADERS) + 1
+        ws.update(f"A{next_row}", rows, value_input_option="USER_ENTERED")
     return len(rows)
 
 
@@ -525,19 +646,30 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
         val_override = row.get("value_override")
         color_override = row.get("color_override")
         has_override = val_override not in (None, "") or color_override not in (None, "")
+        has_result = bool(safe_str(row.get("result_id")).strip())
 
-        if reviewed or has_override:
+        if has_result and (reviewed or has_override):
             reviewed_items.append(
                 {
                     "result_id": row.get("result_id"),
                     "run_id": row.get("run_id"),
                     "question_id": row.get("question_id"),
                     "question_name": row.get("question_name"),
-                    "forecast_date": row.get("forecast_date"),
+                    "target_value_type": row.get("target_value_type"),
+                    "target_date": row.get("target_date"),
                     "dimension": row.get("dimension"),
                     "quantile": row.get("quantile"),
-                    "original_value": row.get("forecast_value"),
+                    "original_value": row.get("forecast_target_value") or row.get("resolution_target_value"),
+                    "forecast_target_value": row.get("forecast_target_value"),
+                    "resolution_target_value": row.get("resolution_target_value"),
                     "original_color": row.get("color_code"),
+                    "resolution_source_date": row.get("resolution_source_date"),
+                    "resolution_source": row.get("resolution_source"),
+                    "current_resolution_value": row.get("current_resolution_value"),
+                    "current_resolution_confidence": row.get("current_resolution_confidence"),
+                    "latest_official_value": row.get("latest_official_value"),
+                    "latest_official_date": row.get("latest_official_date"),
+                    "latest_official_source": row.get("latest_official_source"),
                     "override_value": row.get("value_override"),
                     "override_color": row.get("color_override"),
                     "validation_ok": row.get("validation_ok"),
@@ -576,30 +708,42 @@ def move_to_reviewed(
     reviewed_at = datetime.now(timezone.utc).isoformat()
     rows_to_add = []
     for item in reviewed_items:
-        rows_to_add.append([
-            item.get("result_id", ""),
-            item.get("run_id", ""),
-            item.get("created_at", ""),
-            item.get("question_id", ""),
-            item.get("question_name", ""),
-            item.get("forecast_date", ""),
-            item.get("dimension", ""),
-            item.get("quantile", ""),
-            item.get("original_value", ""),
-            item.get("original_color", ""),
-            item.get("validation_ok", ""),
-            item.get("usable_for_scoring", ""),
-            item.get("rationale", "")[:SHEET_TEXT_LIMIT] if item.get("rationale") else "",
-            item.get("sources", "")[:SHEET_TEXT_LIMIT] if item.get("sources") else "",
-            item.get("override_value", ""),
-            item.get("override_color", ""),
-            "TRUE",
-            item.get("notes", ""),
-            reviewed_at,
-        ])
+        sheet_row = {
+            "result_id": item.get("result_id", ""),
+            "run_id": item.get("run_id", ""),
+            "created_at": item.get("created_at", ""),
+            "question_id": item.get("question_id", ""),
+            "question_name": item.get("question_name", ""),
+            "target_value_type": item.get("target_value_type", ""),
+            "target_date": item.get("target_date", ""),
+            "dimension": item.get("dimension", ""),
+            "quantile": item.get("quantile", ""),
+            "forecast_target_value": item.get("forecast_target_value", ""),
+            "resolution_target_value": item.get("resolution_target_value", ""),
+            "color_code": item.get("original_color", ""),
+            "resolution_source_date": item.get("resolution_source_date", ""),
+            "resolution_source": safe_str(item.get("resolution_source"))[:SHEET_TEXT_LIMIT],
+            "current_resolution_value": item.get("current_resolution_value", ""),
+            "current_resolution_confidence": item.get("current_resolution_confidence", ""),
+            "latest_official_value": item.get("latest_official_value", ""),
+            "latest_official_date": item.get("latest_official_date", ""),
+            "latest_official_source": safe_str(item.get("latest_official_source"))[:SHEET_TEXT_LIMIT],
+            "validation_ok": item.get("validation_ok", ""),
+            "usable_for_scoring": item.get("usable_for_scoring", ""),
+            "rationale": safe_str(item.get("rationale"))[:SHEET_TEXT_LIMIT],
+            "sources": safe_str(item.get("sources"))[:SHEET_TEXT_LIMIT],
+            "value_override": item.get("override_value", ""),
+            "color_override": item.get("override_color", ""),
+            "reviewed": "TRUE",
+            "notes": item.get("notes", ""),
+            "reviewed_at": reviewed_at,
+        }
+        rows_to_add.append([sheet_row.get(header, "") for header in SHEET_HEADERS])
 
     if rows_to_add:
-        reviewed_ws.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        existing = reviewed_ws.get_all_values()
+        next_row = _last_content_row(existing, SHEET_HEADERS) + 1
+        reviewed_ws.update(f"A{next_row}", rows_to_add, value_input_option="USER_ENTERED")
 
     try:
         pending_ws = sheet.worksheet("Pending Review")
@@ -662,19 +806,38 @@ def write_surveillance_to_bigquery(run_data: dict, prod: bool = False) -> dict:
         q_id = question.get("id")
 
         for forecast in response.get("forecasts", []):
-            forecast_val = forecast.get("forecast_value")
             color = forecast.get("color_code")
+            result_id = f"{run_id}_{q_id}_{forecast.get('forecast_date')}_{forecast.get('dimension')}_{forecast.get('quantile')}"
+            row = _forecast_output_row(
+                q_id=q_id,
+                q_name=question.get("name"),
+                forecast=forecast,
+                response=response,
+                validation=validation,
+                run_id=run_id,
+                created_at=created_at,
+                result_id=result_id,
+            )
             result_rows.append({
                 "result_id": f"{run_id}_{q_id}_{forecast.get('forecast_date')}_{forecast.get('dimension')}_{forecast.get('quantile')}",
                 "run_id": run_id,
                 "model": model,
                 "question_id": q_id,
                 "question_name": question.get("name"),
-                "forecast_date": forecast.get("forecast_date"),
+                "target_value_type": row.get("target_value_type"),
+                "target_date": row.get("target_date"),
                 "dimension": forecast.get("dimension"),
                 "quantile": forecast.get("quantile"),
-                "forecast_value": forecast_val,
+                "forecast_target_value": row.get("forecast_target_value") or None,
+                "resolution_target_value": row.get("resolution_target_value") or None,
                 "color_code": color,
+                "resolution_source_date": row.get("resolution_source_date") or None,
+                "resolution_source": row.get("resolution_source") or None,
+                "current_resolution_value": row.get("current_resolution_value") or None,
+                "current_resolution_confidence": row.get("current_resolution_confidence") or None,
+                "latest_official_value": row.get("latest_official_value") or None,
+                "latest_official_date": row.get("latest_official_date") or None,
+                "latest_official_source": row.get("latest_official_source") or None,
                 "rationale": (response.get("rationale") or "")[:2000],
                 "sources": ", ".join(response.get("sources") or [])[:1000],
                 "validation_ok": validation.get("ok", False),
@@ -684,7 +847,7 @@ def write_surveillance_to_bigquery(run_data: dict, prod: bool = False) -> dict:
                 "review_status": None,
                 "override_value": None,
                 "override_color": None,
-                "final_value": forecast_val,
+                "final_value": row.get("forecast_target_value") or row.get("resolution_target_value") or None,
                 "final_color": color,
                 "notes": None,
                 "reviewed_at": None,
@@ -724,6 +887,11 @@ def write_surveillance_to_bigquery(run_data: dict, prod: bool = False) -> dict:
         "review_status": "string",
         "notes": "string",
         "quality_confidence": "Int64",
+        "forecast_target_value": "Float64",
+        "resolution_target_value": "Float64",
+        "current_resolution_value": "Float64",
+        "current_resolution_confidence": "Int64",
+        "latest_official_value": "Float64",
     }
 
     return {

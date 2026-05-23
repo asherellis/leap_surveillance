@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from datetime import datetime, timezone
 
 import litellm
 from dotenv import load_dotenv
@@ -82,6 +83,8 @@ Assign one color_code per date/dimension combination, using the same color for a
 - light gray: the full natural range is still feasible, but monotonic change makes part of it implausible for the interior quantiles
 - white: the full natural range remains feasible and there is not enough information to narrow it
 
+Use black only when uncertainty has collapsed to a resolved value. If color_code is black for a date/dimension group, all quantile values in that group must be identical.
+
 Explain the color choice in the rationale."""
 
 
@@ -109,10 +112,26 @@ def _extract_text_from_response(response) -> str:
 def expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
     return "\n".join(
         [
-            f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}"
+            f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}, value_type={ef.value_type}"
             for ef in expected_forecasts
         ]
     )
+
+
+def resolution_guidance(question: QuestionSpec) -> str:
+    if not any(f.value_type == "resolution" for f in question.expected_forecasts):
+        return "No requested forecast rows are past resolution dates. Return resolution_values as an empty list."
+
+    return """RESOLUTION VALUE GUIDANCE:
+Some requested forecast rows have value_type="resolution" because their target dates are in the past.
+
+For each past forecast_date/dimension pair, report one fixed resolution value in resolution_values. This value should be the metric value as of that target date, not the current value today. The resolution_values.source_date field means the date the metric value represents, not the publication date of the source.
+
+Do not substitute the latest/current value for a past resolution date. A source published after the target date is only valid for resolution_values if it explicitly reports the historical value for that target date or target period. If the metric has changed after the target date, the post-target-date value belongs in current_resolution_values, not resolution_values. If you cannot find or reconstruct the target-date value, use -999 for that resolution value rather than using the current value.
+
+In forecasts, still return every requested quantile row. For value_type="resolution" rows, set all quantiles for that forecast_date/dimension to the same fixed resolution value and use color_code="black".
+
+Keep current_resolution_values separate. They are live as-of-today monitoring estimates and should not overwrite fixed past resolution values."""
 
 
 def question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
@@ -159,10 +178,12 @@ def _do_research(
     attempt: int,
     test_mode: bool = False
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    run_date = datetime.now(timezone.utc).date().isoformat()
     prompt = f"""You are a research analyst. Use web search to find current data, then produce a structured forecast.
 
 Question: {question.name}
 Question type: {question.question_type}
+Run date: {run_date}
 
 Context:
 {question.prompt}
@@ -172,19 +193,24 @@ Expected forecast rows:
 
 TASK OVERVIEW:
 1. Find the latest OFFICIAL VALUE for this metric (most recent published data with date and source)
-2. Estimate the CURRENT VALUE (what you would use if resolving today, may differ from official if metric has changed)
-3. Generate FUTURE FORECASTS for every expected date/quantile listed above
-4. Provide structured sources with url, title, and snippet
+2. Estimate the CURRENT RESOLUTION VALUE (what you would use if resolving today, may differ from official if metric has changed)
+3. For past target dates, estimate fixed RESOLUTION VALUES as of those target dates
+4. Generate FORECAST rows for every expected date/quantile listed above
+5. Provide structured sources with url, title, and snippet
 
 {question_type_guidance(question, full=True)}
+
+{resolution_guidance(question)}
 
 {COLOR_CODE_SYSTEM_FULL}
 
 REQUIREMENTS:
 - The question text, resolution criteria, unit, dates, dimensions, and quantiles above are the source of truth. Do not reinterpret the metric or change units based on search results.
 - Find the latest OFFICIAL published value when applicable (with date and source)
-- Estimate CURRENT value when applicable (if resolving today, based on latest data plus reasonable extrapolation)
-- Generate FUTURE forecasts for exactly the expected rows listed above
+- Estimate CURRENT RESOLUTION value when applicable (if resolving today, based on latest data plus reasonable extrapolation)
+- Return forecasts for exactly the expected rows listed above. The system assigns value_type from those rows.
+- Return one resolution_values entry for each past forecast_date/dimension pair, and no resolution_values entries for future dates
+- Do not use a post-target-date current value as a resolution value unless the source specifically reports the target-date value
 - Use -999 ONLY for individual values you truly cannot estimate (this should be rare)
 - Ensure quantile forecasts form an increasing sequence when this is a quantile or timing question
 - For each source: include url, title, and a key snippet/excerpt from that source
@@ -249,7 +275,7 @@ REQUIREMENTS:
             )
         raise
 
-    return strict_to_regular_response(strict_response)
+    return strict_to_regular_response(strict_response, question.expected_forecasts)
 
 
 def evaluate_response_quality(
@@ -337,10 +363,12 @@ Expected forecast rows: {expected_forecast_lines(question.expected_forecasts)}
 
 {question_type_guidance(question, full=False)}
 
+{resolution_guidance(question)}
+
 {COLOR_CODE_SYSTEM_BRIEF}
 
 INSTRUCTIONS:
-Integrate the new browser data to improve the forecasts. Update values if the browser data provides better/more recent information. Return exactly the expected rows. Use -999 only for individual values you truly cannot estimate (should be rare)."""
+Integrate the new browser data to improve the forecasts and resolution values. Update values if the browser data provides better/more relevant information. Return exactly the expected rows. The system assigns value_type from those rows. Use -999 only for individual values you truly cannot estimate (should be rare)."""
 
     allowed_dimensions = sorted({f.dimension for f in question.expected_forecasts})
     allowed_quantiles = sorted({f.quantile for f in question.expected_forecasts if f.quantile is not None})
@@ -374,7 +402,7 @@ Integrate the new browser data to improve the forecasts. Update values if the br
         response = litellm.responses(**params)
         text = _extract_text_from_response(response)
         strict_resp = StrictSurveillanceResponse.model_validate_json(text)
-        refined_response, _ = strict_to_regular_response(strict_resp)
+        refined_response, _ = strict_to_regular_response(strict_resp, question.expected_forecasts)
         return refined_response
     except Exception as e:
         print(f"  Refinement failed, keeping original: {e}")

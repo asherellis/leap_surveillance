@@ -11,7 +11,7 @@ if "__file__" in dir():
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from data_utils import (
@@ -41,6 +41,13 @@ from schemas import (
     QuestionSpec,
     SurveillanceResponse,
 )
+
+
+def _parse_iso_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def validate_response(
@@ -78,6 +85,9 @@ def validate_response(
         expected_triplets = {
             (e.forecast_date, e.dimension, e.quantile) for e in expected
         }
+        expected_value_types = {
+            (e.forecast_date, e.dimension, e.quantile): e.value_type for e in expected
+        }
         forecast_triplets = {
             (f.forecast_date, f.dimension, f.quantile) for f in response.forecasts
         }
@@ -91,6 +101,37 @@ def validate_response(
 
         if len(forecast_triplets) < len(response.forecasts):
             issues.append("duplicate_forecast_rows")
+
+        for f in response.forecasts:
+            key = (f.forecast_date, f.dimension, f.quantile)
+            expected_type = expected_value_types.get(key)
+            actual_type = getattr(f.value_type, "value", f.value_type)
+            if expected_type and actual_type != expected_type:
+                issues.append(f"value_type_mismatch_{f.forecast_date}_{f.dimension}_{f.quantile}")
+
+        resolution_keys = {
+            (e.forecast_date, e.dimension)
+            for e in expected
+            if e.value_type == "resolution"
+        }
+        returned_resolution_keys = {
+            (r.forecast_date, r.dimension)
+            for r in response.resolution_values
+            if r.value is not None
+        }
+        missing_resolution_keys = resolution_keys - returned_resolution_keys
+        if missing_resolution_keys:
+            issues.append(f"missing_{len(missing_resolution_keys)}_resolution_values")
+
+        unexpected_resolution_keys = returned_resolution_keys - resolution_keys
+        if unexpected_resolution_keys:
+            issues.append(f"unexpected_{len(unexpected_resolution_keys)}_resolution_values")
+
+        for r in response.resolution_values:
+            target_date = _parse_iso_date(r.forecast_date)
+            source_date = _parse_iso_date(r.source_date)
+            if target_date and source_date and source_date > target_date:
+                issues.append(f"resolution_source_after_target_{r.forecast_date}_{r.dimension}")
 
     null_count = sum(1 for f in response.forecasts if f.forecast_value is None)
     if null_count > len(response.forecasts) // 2:
@@ -108,6 +149,26 @@ def validate_response(
             if sorted_forecasts[i][1] > sorted_forecasts[i + 1][1]:
                 issues.append(f"quantiles_not_increasing_{key[0]}_{key[1]}")
                 break
+
+    resolution_groups = defaultdict(list)
+    black_groups = defaultdict(list)
+    for f in response.forecasts:
+        actual_type = getattr(f.value_type, "value", f.value_type)
+        if f.color_code.value == "black" and f.forecast_value is not None:
+            black_groups[(f.forecast_date, f.dimension)].append(f.forecast_value)
+        if actual_type == "resolution":
+            if f.color_code.value != "black":
+                issues.append(f"resolution_not_black_{f.forecast_date}_{f.dimension}")
+            if f.forecast_value is not None:
+                resolution_groups[(f.forecast_date, f.dimension)].append(f.forecast_value)
+
+    for key, values in resolution_groups.items():
+        if len({round(v, 12) for v in values}) > 1:
+            issues.append(f"resolution_quantiles_differ_{key[0]}_{key[1]}")
+
+    for key, values in black_groups.items():
+        if len({round(v, 12) for v in values}) > 1:
+            issues.append(f"black_quantiles_differ_{key[0]}_{key[1]}")
 
     if expected_has_q50:
         usable = any(
