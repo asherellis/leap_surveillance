@@ -38,8 +38,6 @@ class EvidenceItem:
     title: Optional[str] = None
     snippet: Optional[str] = None
     full_text: Optional[str] = None
-    url_verified: Optional[bool] = None
-    http_status: Optional[int] = None
 
 
 @dataclass
@@ -211,7 +209,6 @@ def make_strict_schema(
     allowed_quantiles: Optional[list[int]] = None,
     allowed_forecast_dates: Optional[list[str]] = None,
 ) -> dict:
-    """Build an OpenAI strict schema and pin forecast row keys when provided."""
     schema = model.model_json_schema()
 
     def fix_schema(obj: dict) -> dict:

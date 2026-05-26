@@ -136,7 +136,6 @@ def _infer_surveillance_question_type(
     dimensions: list[str],
     source_percentiles: list[int],
 ) -> str:
-    """Infer quantile/probability/timing shape from current warehouse fields."""
     text = question_text.lower()
     unit_lower = unit.lower()
     pct_set = set(source_percentiles)
@@ -419,8 +418,6 @@ def build_run_data(
                     "title": e.title,
                     "snippet": e.snippet,
                     "full_text": e.full_text,
-                    "url_verified": e.url_verified,
-                    "http_status": e.http_status,
                 }
                 for e in ev
             ]
@@ -636,10 +633,6 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> No
 
 
 def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
-    """Create or reset the Review tab and Instructions tab.
-
-    Removes legacy tabs from earlier sheet designs.
-    """
     import gspread
 
     client = get_sheets_client()
@@ -770,7 +763,6 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
 
 
 def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], list[int]]:
-    """Read rows where 'reviewed' is checked or any correction field is filled."""
     import gspread
 
     client = get_sheets_client()
@@ -833,7 +825,6 @@ def stamp_reviewed_rows(
     reviewed_items: list[dict],
     row_numbers: list[int],
 ) -> int:
-    """Stamp reviewed_at on each reviewed row in-place (single API call)."""
     if not reviewed_items:
         return 0
 
@@ -971,8 +962,6 @@ def write_surveillance_to_bigquery(run_data: dict, prod: bool = False) -> dict:
                 "title": ev.get("title"),
                 "snippet": (ev.get("snippet") or "")[:1000],
                 "full_text": (ev.get("full_text") or "")[:5000],
-                "url_verified": ev.get("url_verified"),
-                "http_status": ev.get("http_status"),
                 "created_at": created_at,
                 "ingestion_timestamp": datetime.now(timezone.utc),
             })
@@ -1040,7 +1029,6 @@ def get_existing_result_ids(result_ids: list[str], prod: bool = False) -> set[st
 
 
 def sync_reviews_to_bigquery(reviewed_items: list[dict], prod: bool = False) -> dict:
-    """Fan each reviewed sheet row (group_id) out to 7 BQ result_ids (one per quantile)."""
     if not reviewed_items:
         return {"results": None, "skipped": 0}
 

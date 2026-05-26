@@ -4,7 +4,6 @@ import argparse
 import os
 from collections import defaultdict
 from datetime import date, datetime
-from typing import Optional
 
 from data_utils import (
     DEFAULT_OUTPUT_DIR,
@@ -45,7 +44,7 @@ def _parse_iso_date(value: str) -> date | None:
 
 
 def validate_response(
-    response: SurveillanceResponse, expected: Optional[list[ExpectedForecast]] = None
+    response: SurveillanceResponse, expected: list[ExpectedForecast] | None = None
 ) -> dict:
     issues = []
     expected_has_q50 = bool(expected and any(e.quantile == 50 for e in expected))

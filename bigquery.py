@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Sequence
 
 import pandas as pd
 from google.auth import default
@@ -33,12 +33,11 @@ def merge_bq(
     dataset: str,
     table: str,
     *,
-    clock_col: Optional[str] = None,
-    update_cols: Optional[Sequence[str]] = None,
+    clock_col: str | None = None,
+    update_cols: Sequence[str] | None = None,
     create_target_if_missing: bool = False,
     keep_temp: bool = False,
 ) -> DmlStats | None:
-    """Upsert a DataFrame into BigQuery using a temporary table and MERGE."""
     if pk not in df.columns:
         raise ValueError(f"DataFrame must include '{pk}'.")
 

@@ -1,13 +1,11 @@
 """LLM research, quality checks, and browser-use."""
 
 import asyncio
-import dataclasses
 import ipaddress
 import os
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import httpx
 import litellm
 from dotenv import load_dotenv
 
@@ -47,6 +45,7 @@ def _env_int(name: str, default: int) -> int:
 
 DEFAULT_MODEL = "openai/gpt-5.5"
 DEFAULT_EVALUATOR_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_BROWSER_MODEL = "openai/gpt-4o"  # browser-use requires chat completions; gpt-5.5 incompatible
 DEFAULT_REASONING_EFFORT = "high"
 
 TEST_MODEL = "openai/gpt-4o-mini"
@@ -110,33 +109,6 @@ def _response_cost(response, model: str) -> float:
         return 0.0
 
 
-async def _verify_url(url: str, client: httpx.AsyncClient) -> tuple[bool, int]:
-    try:
-        r = await client.head(url, follow_redirects=True, timeout=5.0)
-        return r.status_code < 400, r.status_code
-    except Exception:
-        return False, 0
-
-
-async def _verify_sources_async(evidence: list[EvidenceItem]) -> list[EvidenceItem]:
-    async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(
-            *[_verify_url(e.url, client) for e in evidence],
-            return_exceptions=True,
-        )
-    verified = []
-    for e, res in zip(evidence, results):
-        ok, status = res if isinstance(res, tuple) else (False, 0)
-        verified.append(dataclasses.replace(e, url_verified=ok, http_status=status))
-    return verified
-
-
-def verify_sources(evidence: list[EvidenceItem]) -> list[EvidenceItem]:
-    if not evidence:
-        return evidence
-    return asyncio.run(_verify_sources_async(evidence))
-
-
 def _extract_text_from_response(response) -> str:
     if getattr(response, "output_text", None):
         return response.output_text
@@ -153,10 +125,8 @@ def _extract_text_from_response(response) -> str:
 
 def expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
     return "\n".join(
-        [
-            f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}, value_type={ef.value_type}"
-            for ef in expected_forecasts
-        ]
+        f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}, value_type={ef.value_type}"
+        for ef in expected_forecasts
     )
 
 
@@ -220,11 +190,9 @@ def research(
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     if test_mode:
         model = TEST_MODEL
-    response, evidence = _do_research(
+    return _do_research(
         question, model, retry_on_truncation, attempt=1, test_mode=test_mode, costs=costs
     )
-    evidence = verify_sources(evidence)
-    return response, evidence
 
 
 def _do_research(
@@ -373,7 +341,6 @@ def evaluate_adequacy(
     test_mode: bool = False,
     costs: RunCost | None = None,
 ) -> AdequacyAssessment:
-    """Stage 1 judge call: assess whether the surveillance response is adequate."""
     expected_summary = _format_expected_for_judge(question.expected_forecasts)
     sources_summary = _format_evidence_for_judge(evidence)
     forecasts_summary = _format_forecasts_for_judge(response)
@@ -447,7 +414,6 @@ def decide_browser(
     test_mode: bool = False,
     costs: RunCost | None = None,
 ) -> BrowserDecision:
-    """Stage 2 judge call: given an inadequate response, decide whether browser-use would help."""
     sources_summary = _format_evidence_for_judge(evidence)
     issues_list = "\n".join(f"- {i}" for i in adequacy.issues) or "- (no specific issues listed)"
 
@@ -645,33 +611,10 @@ def is_safe_url(url: str) -> tuple[bool, str]:
         return False, f"URL parse error: {e}"
 
 
-_BROWSER_LLM_CLASS = None
-
-
-def _browser_llm_class():
-    global _BROWSER_LLM_CLASS
-    if _BROWSER_LLM_CLASS is not None:
-        return _BROWSER_LLM_CLASS
-    from langchain_litellm import ChatLiteLLM
-    from pydantic import ConfigDict
-
-    # browser-use reads llm.provider / llm.model_name and monkey-patches ainvoke;
-    # ChatLiteLLM(extra='ignore') blocks setattr, so we open the door with extra='allow'.
-    class _ChatLiteLLMForBrowser(ChatLiteLLM):
-        model_config = ConfigDict(extra="allow", protected_namespaces=(), arbitrary_types_allowed=True)
-        provider: str = "litellm"
-
-    _BROWSER_LLM_CLASS = _ChatLiteLLMForBrowser
-    return _BROWSER_LLM_CLASS
-
-
 def _get_browser_llm(model: str):
-    """Return the LiteLLM adapter object browser-use expects."""
-    cls = _browser_llm_class()
-    model_kwargs = {}
-    if OPENAI_SAFETY_IDENTIFIER:
-        model_kwargs["safety_identifier"] = OPENAI_SAFETY_IDENTIFIER
-    return cls(model=model, model_name=model, model_kwargs=model_kwargs)
+    from browser_use.llm.openai.chat import ChatOpenAI as BrowserChatOpenAI
+    bare_model = model.split("/", 1)[-1] if "/" in model else model
+    return BrowserChatOpenAI(model=bare_model, api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 def browser_extract(
@@ -700,7 +643,7 @@ def browser_extract(
     async def _extract():
         from browser_use import Agent, Browser
 
-        model = model_override or (TEST_MODEL if test_mode else DEFAULT_MODEL)
+        model = model_override or (TEST_MODEL if test_mode else DEFAULT_BROWSER_MODEL)
         llm = _get_browser_llm(model)
         browser = Browser(headless=True)
         try:
