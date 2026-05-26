@@ -13,7 +13,6 @@ from data_utils import (
     load_questions,
     publish_to_sheet,
     setup_sheet,
-    stamp_reviewed_rows,
     sync_reviews_to_bigquery,
     write_csv_output,
     write_json_output,
@@ -332,15 +331,8 @@ def cmd_sync(args):
         if stats.get("skipped", 0) > 0:
             print(f"  ({stats['skipped']} items skipped - raw data missing in BQ)")
 
-    if bq_success or not bq_attempted:
-        moved = stamp_reviewed_rows(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
-        print(f"Stamped reviewed_at for {moved} rows")
-    else:
-        if args.force_move:
-            moved = stamp_reviewed_rows(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
-            print(f"Stamped reviewed_at for {moved} rows (--force-move)")
-        else:
-            print("Rows not stamped (BQ failed). Use --force-move to stamp anyway, or --no-bq to skip BQ entirely.")
+    if bq_attempted and not bq_success:
+        print("Sync failed. Use --no-bq to skip BigQuery and sync sheet-only.")
 
 
 def cmd_setup(args):
@@ -377,7 +369,6 @@ Examples:
 
     sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from Sheet to BigQuery")
     sync_parser.add_argument("--no-bq", action="store_true", help="Skip BigQuery sync (Sheet-only mode)")
-    sync_parser.add_argument("--force-move", action="store_true", help="Move rows even if BigQuery sync fails")
 
     setup_parser = subparsers.add_parser("setup", help="Reset the Google Sheet")
     setup_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")

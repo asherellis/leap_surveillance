@@ -29,6 +29,9 @@ class QuestionSpec:
     unit: str = ""
     unit_min: Optional[float] = None
     unit_max: Optional[float] = None
+    question_text: str = ""
+    resolution_criteria: str = ""
+    background_info: str = ""
 
 
 @dataclass

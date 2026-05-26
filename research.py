@@ -3,6 +3,7 @@
 import asyncio
 import ipaddress
 import os
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -280,6 +281,9 @@ REQUIREMENTS:
         costs.research += _response_cost(response, model)
 
     text = _extract_text_from_response(response)
+
+    # Collapse degenerate LLM floats (0.000000...0) that bloat JSON past token limit.
+    text = re.sub(r'(\d+\.\d{4})\d{4,}', r'\1', text)
 
     try:
         strict_response = StrictSurveillanceResponse.model_validate_json(text)
@@ -572,6 +576,7 @@ Integrate the new browser data to improve the forecasts and resolution values. U
         if costs is not None:
             costs.refinement += _response_cost(response, model)
         text = _extract_text_from_response(response)
+        text = re.sub(r'(\d+\.\d{4})\d{4,}', r'\1', text)
         strict_resp = StrictSurveillanceResponse.model_validate_json(text)
         refined_response, _ = strict_to_regular_response(strict_resp, question.expected_forecasts)
         return refined_response

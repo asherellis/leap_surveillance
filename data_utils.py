@@ -26,58 +26,63 @@ CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
 # Single review tab; one row per question / target_date / dimension.
 REVIEW_HEADERS = [
-    # ── Identity (frozen; cols 0–3) ─────────────────────────────────────────
-    "question_name",    # 0
-    "target_date",      # 1  the date the question asks about
-    "dimension",        # 2  sub-metric breakdown; "Overall" if none
-    "type",             # 3  resolved (past) or forecast (future)
-    # ── LLM output — read-only context (cols 4–12, blue header) ─────────────
-    "color_code",       # 4   LLM's classification (black/dark gray/light gray/white)
-    "confidence",       # 5   judge's confidence 0–100
-    "llm_value",        # 6   resolved value (type=resolved) or median q50 (type=forecast)
-    "q25",              # 7   25th-percentile forecast (forecast rows only)
-    "q75",              # 8   75th-percentile forecast (forecast rows only)
-    "source_date",      # 9   date of the data the LLM used (resolved rows)
-    "data_source",      # 10  citation for that data (resolved rows)
-    "rationale",        # 11  LLM's reasoning summary
-    "sources",          # 12  URLs the LLM searched
-    # ── Reviewer fills in (cols 13–18, green header) ─────────────────────────
-    "actual_value",     # 13  true resolved value (resolved rows)
-    "verified_source",  # 14  citation for actual_value (resolved rows)
-    "score",            # 15  correct / close / wrong / confidently_wrong (resolved rows)
-    "corrected_value",  # 16  your corrected median estimate if LLM is wrong (forecast rows)
-    "corrected_color",  # 17  your corrected color classification if LLM is wrong (either type)
-    "notes",            # 18  free-form observations
-    # ── Status (cols 19–20, yellow header) ───────────────────────────────────
-    "reviewed",         # 19  checkbox — check when done
-    "reviewed_at",      # 20  auto-stamped by sync command
-    # ── Pipeline metadata — hidden (cols 21–24) ───────────────────────────────
-    "group_id",         # 21  BQ sync key (one sheet row → 7 BQ rows, one per quantile)
-    "question_id",      # 22
-    "run_id",           # 23
-    "created_at",       # 24
+    # ── Identity (frozen; cols 0–2) ─────────────────────────────────────────
+    "question_name",         # 0
+    "target_date",           # 1  the date the question asks about
+    "dimension",             # 2  sub-metric breakdown; "Overall" if none
+    # ── Context: criteria reviewers grade against (cols 3–4, gray header) ───
+    "question_text",         # 3  full question sentence from BQ
+    "resolution_criteria",   # 4  how FRI says to score it (may be empty for some questions)
+    # ── LLM + judge output — read-only (cols 5–15, blue header) ─────────────
+    "color_code",            # 5   black = resolved (target_date passed); else forecast
+    "confidence",            # 6   judge's confidence the answer is correct (0–100)
+    "confidence_reason",     # 7   judge's reason / flagged issues
+    "target_date_value",     # 8   value AT target_date (locked resolution if black; q50 forecast otherwise)
+    "current_value",         # 9   LLM's live estimate AS OF TODAY (separate from target_date_value)
+    "q25",                   # 10  25th-percentile forecast (forecast rows only)
+    "q75",                   # 11  75th-percentile forecast (forecast rows only)
+    "source_date",           # 12  date of the data the LLM used (resolved rows)
+    "data_source",           # 13  citation for that data (resolved rows)
+    "rationale",             # 14  LLM's reasoning summary
+    "sources",               # 15  URLs the LLM searched
+    # ── Reviewer fills in (cols 16–20, green header) ─────────────────────────
+    "review_value",          # 16  resolved: true answer; forecast: corrected median estimate
+    "review_source",         # 17  citation for review_value
+    "review_verdict",        # 18  correct / close / wrong / confidently wrong (resolved rows)
+    "review_color",          # 19  your color override if you disagree with the LLM (leave blank to confirm)
+    "review_notes",          # 20  free-form observations
+    # ── Status (col 21, yellow header) ───────────────────────────────────────
+    "reviewed",              # 21  checkbox — check when done
+    # ── Pipeline metadata (cols 22–24, light gray header) ────────────────────
+    "group_id",              # 22  BQ sync key
+    "question_id",           # 23
+    "run_id",                # 24  encodes timestamp; no separate created_at column needed
 ]
 
-SCORE_OPTIONS = ["correct", "close", "wrong", "confidently_wrong"]
+VERDICT_OPTIONS = ["correct", "close", "wrong", "confidently wrong"]
 COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
 
 INSTRUCTIONS_CONTENT = [
     ["LEAP Surveillance Review"],
     [""],
     ["Each row is one question / target date / dimension. An LLM used web search to either"],
-    ["find the resolved answer (type=resolved) or produce a forecast (type=forecast)."],
+    ["find the resolved answer (color=black) or produce a forecast (any other color)."],
     [""],
-    ["FOR RESOLVED ROWS (type = resolved)"],
-    ["Read the llm_value and rationale, then fill in:"],
-    ["  actual_value    — the true answer from your own research"],
-    ["  verified_source — your source"],
-    ["  score           — correct / close / wrong / confidently_wrong"],
+    ["KEY COLUMNS"],
+    ["  target_date_value — value AT the target_date (the answer being verified)"],
+    ["  current_value     — LLM's live estimate AS OF TODAY (context only, not scored)"],
     [""],
-    ["FOR FORECAST ROWS (type = forecast)"],
-    ["llm_value is the median estimate; q25/q75 is the uncertainty range."],
+    ["FOR RESOLVED ROWS (color = black)"],
+    ["target_date_value is the locked historical resolution value. Fill in:"],
+    ["  review_value   — the true answer from your own research"],
+    ["  review_source  — your source"],
+    ["  review_verdict — correct / close / wrong / confidently wrong"],
+    [""],
+    ["FOR FORECAST ROWS (color != black)"],
+    ["target_date_value is the median estimate; q25/q75 is the uncertainty range."],
     ["Only fill in if something seems clearly wrong:"],
-    ["  corrected_value — your corrected median"],
-    ["  corrected_color — black/dark gray/light gray/white (how open is the question?)"],
+    ["  review_value   — your corrected median estimate"],
+    ["  review_color   — black/dark gray/light gray/white (how open is the question?)"],
     [""],
     ["Check 'reviewed' when done. Then run:  python run_surveillance.py sync"],
 ]
@@ -378,6 +383,9 @@ def load_questions(limit=None, prod=False) -> list[QuestionSpec]:
                 unit=unit,
                 unit_min=to_float(row.get("unit_min_value")),
                 unit_max=to_float(row.get("unit_max_value")),
+                question_text=question_text,
+                resolution_criteria=safe_str(row.get("question_set_resolution_criteria")),
+                background_info=safe_str(row.get("question_set_background_information")),
             )
         )
 
@@ -402,6 +410,9 @@ def build_run_data(
         result = {
             "id": q.id,
             "name": q.name,
+            "question_text": q.question_text,
+            "resolution_criteria": q.resolution_criteria,
+            "background_info": q.background_info,
             "response": resp.model_dump(mode="json") if resp else None,
         }
         if val:
@@ -526,14 +537,16 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
 
     rows: list[list] = []
     run_id = run_data.get("run_id", "unknown")
-    created_at = run_data.get("created_at", "")
 
     for question in run_data.get("questions", []):
         q_id = question.get("id", "")
         q_name = question.get("name", "")
+        q_text = safe_str(question.get("question_text", ""))[:SHEET_TEXT_LIMIT]
+        q_criteria = safe_str(question.get("resolution_criteria", ""))[:SHEET_TEXT_LIMIT]
         response = question.get("response") or {}
         quality = question.get("quality") or {}
         confidence = safe_str(quality.get("confidence", ""))
+        confidence_reason = safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT]
         rationale = safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT]
         sources = ", ".join(response.get("sources", []))[:SHEET_TEXT_LIMIT]
 
@@ -545,7 +558,7 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
             q = forecast.get("quantile")
             groups[(fdate, dim)][q] = forecast
 
-        _, _, resolution_map = _context_maps(response)
+        _, current_map, resolution_map = _context_maps(response)
 
         for (fdate, dim), quants in groups.items():
             group_id = f"{run_id}_{q_id}_{fdate}_{dim}"
@@ -556,64 +569,93 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
             res_val = resolution_map.get((fdate, dim)) or resolution_map.get((fdate, "Overall")) or {}
 
             if row_type == "resolved":
-                llm_val = safe_str(any_forecast.get("forecast_value", ""))
-                if not llm_val:
-                    llm_val = safe_str(res_val.get("value", ""))
+                td_val = safe_str(any_forecast.get("forecast_value", ""))
+                if not td_val:
+                    td_val = safe_str(res_val.get("value", ""))
                 q25_val = ""
                 q75_val = ""
                 res_source_date = safe_str(res_val.get("source_date", ""))
                 res_source = safe_str(res_val.get("source", ""))[:SHEET_TEXT_LIMIT]
             else:
-                llm_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
+                td_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
                 q25_val = safe_str(quants.get(25, {}).get("forecast_value", ""))
                 q75_val = safe_str(quants.get(75, {}).get("forecast_value", ""))
                 res_source_date = ""
                 res_source = ""
 
+            cur_val_obj = current_map.get(dim) or current_map.get("Overall") or {}
+            cur_val = safe_str(cur_val_obj.get("value", ""))
+
             row = {
                 "question_name": q_name,
                 "target_date": fdate,
                 "dimension": dim,
-                "type": row_type,
+                "question_text": q_text,
+                "resolution_criteria": q_criteria,
                 "color_code": color_code,
                 "confidence": confidence,
-                "llm_value": llm_val,
+                "confidence_reason": confidence_reason,
+                "target_date_value": td_val,
+                "current_value": cur_val,
                 "q25": q25_val,
                 "q75": q75_val,
                 "source_date": res_source_date,
                 "data_source": res_source,
                 "rationale": rationale,
                 "sources": sources,
-                "actual_value": "",
-                "verified_source": "",
-                "score": "",
-                "corrected_value": "",
-                "corrected_color": "",
-                "notes": "",
+                "review_value": "",
+                "review_source": "",
+                "review_verdict": "",
+                "review_color": "",
+                "review_notes": "",
                 "reviewed": "",
-                "reviewed_at": "",
                 "group_id": group_id,
                 "question_id": q_id,
                 "run_id": run_id,
-                "created_at": created_at,
             }
             rows.append([row.get(h, "") for h in REVIEW_HEADERS])
 
     if rows:
         existing = ws.get_all_values()
         next_row = _last_content_row(existing, REVIEW_HEADERS) + 1
+        end_row = next_row + len(rows) - 1
         ws.update(f"A{next_row}", rows, value_input_option="USER_ENTERED")
         # Apply validation only to the rows just written — no phantom arrows on empty rows.
-        _apply_row_validation(sheet, ws.id, next_row, next_row + len(rows) - 1)
+        _apply_row_validation(sheet, ws.id, next_row, end_row)
+        _sort_review_rows(sheet, ws.id)
 
     return len(rows)
 
 
+def _sort_review_rows(sheet, ws_id: int) -> None:
+    """Sort review rows (excluding header) by question_name, target_date, dimension."""
+    cols = [
+        REVIEW_HEADERS.index("question_name"),
+        REVIEW_HEADERS.index("target_date"),
+        REVIEW_HEADERS.index("dimension"),
+    ]
+    sheet.batch_update({"requests": [{
+        "sortRange": {
+            "range": {
+                "sheetId": ws_id,
+                "startRowIndex": 1,
+                "startColumnIndex": 0,
+                "endColumnIndex": len(REVIEW_HEADERS),
+            },
+            "sortSpecs": [{"dimensionIndex": c, "sortOrder": "ASCENDING"} for c in cols],
+        }
+    }]})
+
+
 def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> None:
-    """Apply checkbox and dropdown validation to a specific 1-indexed inclusive row range."""
-    def _val(col_name: str, rule: dict) -> dict:
+    """Apply checkbox and dropdown validation to a specific 1-indexed inclusive row range.
+
+    Clears validation on the target columns across the range first to avoid
+    stale rules from earlier publishes leaking through.
+    """
+    def _val(col_name: str, rule: dict | None) -> dict:
         idx = REVIEW_HEADERS.index(col_name)
-        return {
+        req = {
             "setDataValidation": {
                 "range": {
                     "sheetId": ws_id,
@@ -622,13 +664,20 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> No
                     "startColumnIndex": idx,
                     "endColumnIndex": idx + 1,
                 },
-                "rule": rule,
             }
         }
+        if rule is not None:
+            req["setDataValidation"]["rule"] = rule
+        return req
     sheet.batch_update({"requests": [
+        # Clear first (rule omitted = delete validation in range)
+        _val("reviewed", None),
+        _val("review_verdict", None),
+        _val("review_color", None),
+        # Then apply the right rule to each column
         _val("reviewed", {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}),
-        _val("score", {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in SCORE_OPTIONS]}, "showCustomUi": True}),
-        _val("corrected_color", {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in COLOR_OPTIONS]}, "showCustomUi": True}),
+        _val("review_verdict", {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in VERDICT_OPTIONS]}, "showCustomUi": True}),
+        _val("review_color", {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in COLOR_OPTIONS]}, "showCustomUi": True}),
     ]})
 
 
@@ -637,18 +686,6 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
 
     client = get_sheets_client()
     sheet = client.open_by_key(sheet_id)
-
-    legacy_tabs = (
-        "Pending Review",
-        "Reviewed",
-        "Resolution Review",
-        "Forecast Review",
-    )
-    for old_name in legacy_tabs:
-        try:
-            sheet.del_worksheet(sheet.worksheet(old_name))
-        except gspread.WorksheetNotFound:
-            pass
 
     try:
         ws = sheet.worksheet("Review")
@@ -681,43 +718,58 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
             }
         }
 
-    # Column widths (pixels), one per REVIEW_HEADERS entry
+    # Column widths (pixels), one per REVIEW_HEADERS entry (25 cols)
     col_widths = [
-        220,  # question_name
-        90,   # target_date
-        130,  # dimension
-        80,   # type
-        85,   # color_code
-        80,   # confidence
-        90,   # llm_value
-        70,   # q25
-        70,   # q75
-        90,   # source_date
-        160,  # data_source
-        260,  # rationale
-        200,  # sources
-        100,  # actual_value
-        180,  # verified_source
-        120,  # score
-        100,  # corrected_value
-        100,  # corrected_color
-        180,  # notes
-        80,   # reviewed
-        110,  # reviewed_at
-        160,  # group_id   (hidden)
-        120,  # question_id (hidden)
-        120,  # run_id      (hidden)
-        140,  # created_at  (hidden)
+        180,  # question_name
+        85,   # target_date
+        120,  # dimension
+        200,  # question_text
+        200,  # resolution_criteria
+        80,   # color_code
+        75,   # confidence
+        180,  # confidence_reason
+        95,   # target_date_value
+        85,   # current_value
+        65,   # q25
+        65,   # q75
+        85,   # source_date
+        140,  # data_source
+        200,  # rationale
+        160,  # sources
+        90,   # review_value
+        150,  # review_source
+        110,  # review_verdict
+        90,   # review_color
+        150,  # review_notes
+        75,   # reviewed
+        140,  # group_id
+        110,  # question_id
+        110,  # run_id
     ]
 
     format_requests = [
+        # Compact rows: clip text overflow and reset all row heights to single-line
+        {
+            "repeatCell": {
+                "range": {"sheetId": ws.id},
+                "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
+                "fields": "userEnteredFormat.wrapStrategy",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "ROWS"},
+                "properties": {"pixelSize": 21},
+                "fields": "pixelSize",
+            }
+        },
         # Header color groups
-        _color_header(0, 4, 0.91, 0.91, 0.91),      # identity: neutral gray
-        _color_header(4, 13, 0.79, 0.90, 0.97),     # LLM output: light blue
-        _color_header(13, 19, 0.83, 0.94, 0.83),    # reviewer: light green
-        _color_header(19, 21, 1.00, 0.95, 0.80),    # status: light yellow
-        _color_header(21, 25, 0.95, 0.95, 0.95),    # metadata: light gray (hidden)
-        # Freeze header row + first 4 identity columns
+        _color_header(0, 5, 0.91, 0.91, 0.91),      # identity + context: neutral gray
+        _color_header(5, 16, 0.79, 0.90, 0.97),     # LLM + judge output: light blue
+        _color_header(16, 21, 0.83, 0.94, 0.83),    # reviewer: light green
+        _color_header(21, 22, 1.00, 0.95, 0.80),    # status: light yellow
+        _color_header(22, 25, 0.95, 0.95, 0.95),    # metadata: light gray
+        # Freeze header row + first 4 identity/context columns (through question_text)
         {
             "updateSheetProperties": {
                 "properties": {
@@ -727,15 +779,17 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
                 "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
             }
         },
-        # Hide pipeline-internal metadata columns
+        # Clear ALL validation across the entire sheet — explicit bounds are
+        # more reliable than open-ended ranges (which sometimes leave stale rules).
         {
-            "updateDimensionProperties": {
+            "setDataValidation": {
                 "range": {
-                    "sheetId": ws.id, "dimension": "COLUMNS",
-                    "startIndex": 21, "endIndex": 25,
+                    "sheetId": ws.id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1000,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(REVIEW_HEADERS) + 4,
                 },
-                "properties": {"hiddenByUser": True},
-                "fields": "hiddenByUser",
             }
         },
     ]
@@ -785,7 +839,7 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
 
         has_override = any(
             row.get(col) not in (None, "")
-            for col in ("corrected_value", "corrected_color", "actual_value")
+            for col in ("review_color", "review_value")
         )
 
         group_id = safe_str(row.get("group_id", "")).strip()
@@ -795,6 +849,7 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
         if not (reviewed or has_override):
             continue
 
+        color_code = row.get("color_code", "")
         reviewed_items.append({
             "group_id": group_id,
             "run_id": row.get("run_id"),
@@ -802,52 +857,22 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
             "question_name": row.get("question_name"),
             "target_date": row.get("target_date"),
             "dimension": row.get("dimension"),
-            "type": row.get("type"),
-            "color_code": row.get("color_code"),
+            "type": "resolved" if str(color_code).strip().lower() == "black" else "forecast",
+            "color_code": color_code,
             "confidence": row.get("confidence"),
-            "llm_value": row.get("llm_value"),
+            "target_date_value": row.get("target_date_value"),
+            "current_value": row.get("current_value"),
             "q25": row.get("q25"),
             "q75": row.get("q75"),
-            "actual_value": row.get("actual_value"),
-            "verified_source": row.get("verified_source"),
-            "score": row.get("score"),
-            "corrected_value": row.get("corrected_value"),
-            "corrected_color": row.get("corrected_color"),
-            "notes": row.get("notes"),
+            "review_value": row.get("review_value"),
+            "review_source": row.get("review_source"),
+            "review_verdict": row.get("review_verdict"),
+            "review_color": row.get("review_color"),
+            "review_notes": row.get("review_notes"),
         })
         row_numbers.append(i)
 
     return reviewed_items, row_numbers
-
-
-def stamp_reviewed_rows(
-    sheet_id: str,
-    reviewed_items: list[dict],
-    row_numbers: list[int],
-) -> int:
-    if not reviewed_items:
-        return 0
-
-    import gspread
-    from gspread.utils import rowcol_to_a1
-
-    client = get_sheets_client()
-    sheet = client.open_by_key(sheet_id)
-
-    try:
-        ws = sheet.worksheet("Review")
-    except gspread.WorksheetNotFound:
-        return 0
-
-    reviewed_at = datetime.now(timezone.utc).isoformat()
-    reviewed_at_col = REVIEW_HEADERS.index("reviewed_at") + 1
-    updates = [
-        {"range": rowcol_to_a1(r, reviewed_at_col), "values": [[reviewed_at]]}
-        for r in row_numbers
-    ]
-    if updates:
-        ws.batch_update(updates, value_input_option="USER_ENTERED")
-    return len(row_numbers)
 
 
 def try_merge_bigquery_rows(
@@ -1039,13 +1064,13 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict], prod: bool = False) -> 
     for item in reviewed_items:
         group_id = item.get("group_id", "")
         row_type = item.get("type", "")
-        override_color = item.get("corrected_color")
+        override_color = item.get("review_color")
         override_color = override_color if override_color not in (None, "") else None
-        free_notes = safe_str(item.get("notes")) or ""
+        free_notes = safe_str(item.get("review_notes")) or ""
 
+        override_val = to_float(item.get("review_value"))
         if row_type == "resolved":
-            override_val = to_float(item.get("actual_value"))
-            score = safe_str(item.get("score", ""))
+            score = safe_str(item.get("review_verdict", ""))
             note_parts = []
             if score:
                 note_parts.append(f"score:{score}")
@@ -1053,7 +1078,6 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict], prod: bool = False) -> 
                 note_parts.append(free_notes)
             notes = " ".join(note_parts) or None
         else:
-            override_val = to_float(item.get("corrected_value"))
             notes = free_notes or None
 
         for q in FULL_QUANTILES:

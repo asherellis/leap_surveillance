@@ -36,7 +36,6 @@ def merge_bq(
     clock_col: str | None = None,
     update_cols: Sequence[str] | None = None,
     create_target_if_missing: bool = False,
-    keep_temp: bool = False,
 ) -> DmlStats | None:
     if pk not in df.columns:
         raise ValueError(f"DataFrame must include '{pk}'.")
@@ -108,7 +107,6 @@ def merge_bq(
     job = client.query(merge_sql)
     job.result()
 
-    if not keep_temp:
-        client.query(f"DROP TABLE `{temp}`").result()
+    client.query(f"DROP TABLE `{temp}`").result()
 
     return job.dml_stats
