@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+
 from pydantic import BaseModel, ConfigDict, Field
 
 # Reject unexpected fields in strict structured outputs.
@@ -37,6 +38,29 @@ class EvidenceItem:
     title: Optional[str] = None
     snippet: Optional[str] = None
     full_text: Optional[str] = None
+    url_verified: Optional[bool] = None
+    http_status: Optional[int] = None
+
+
+@dataclass
+class RunCost:
+    research: float = 0.0
+    judge_stage1: float = 0.0
+    judge_stage2: float = 0.0
+    refinement: float = 0.0
+
+    @property
+    def total(self) -> float:
+        return self.research + self.judge_stage1 + self.judge_stage2 + self.refinement
+
+    def as_dict(self) -> dict:
+        return {
+            "research": self.research,
+            "judge_stage1": self.judge_stage1,
+            "judge_stage2": self.judge_stage2,
+            "refinement": self.refinement,
+            "total": self.total,
+        }
 
 
 @dataclass
@@ -60,6 +84,24 @@ class ResearchQualityReport(BaseModel):
     reason: str = ""
 
 
+class AdequacyAssessment(BaseModel):
+    model_config = STRICT_CONFIG
+
+    adequate: bool
+    confidence: int = Field(ge=0, le=100)
+    issues: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class BrowserDecision(BaseModel):
+    model_config = STRICT_CONFIG
+
+    browser_would_help: bool
+    browser_url: str = ""
+    browser_objective: str = ""
+    reason: str = ""
+
+
 class ColorCode(str, Enum):
     black = "black"
     dark_gray = "dark gray"
@@ -70,12 +112,6 @@ class ColorCode(str, Enum):
 class ValueType(str, Enum):
     forecast = "forecast"
     resolution = "resolution"
-
-
-class ProgressDirection(str, Enum):
-    more_progress = "more progress"
-    less_progress = "less progress"
-    unclear = "unclear"
 
 
 class OfficialValue(BaseModel):
@@ -114,7 +150,6 @@ class SurveillanceResponse(BaseModel):
     current_resolution_values: list[CurrentValue]
     resolution_values: list[ResolutionValue]
     forecasts: list[ForecastValue]
-    more_or_less_progress: ProgressDirection
     rationale: str
     sources: list[str]
 
@@ -166,7 +201,6 @@ class StrictSurveillanceResponse(BaseModel):
     current_resolution_values: list[StrictCurrentValue]
     resolution_values: list[StrictResolutionValue]
     forecasts: list[StrictForecastValue]
-    more_or_less_progress: ProgressDirection
     rationale: str
     sources: list[StrictSource]
 
@@ -305,7 +339,6 @@ def strict_to_regular_response(
             or (rv.forecast_date, rv.dimension) in expected_resolution_keys
         ],
         forecasts=forecasts,
-        more_or_less_progress=strict.more_or_less_progress,
         rationale=strict.rationale,
         sources=[s.url for s in strict.sources],
     )

@@ -2,5 +2,8 @@
 .env
 __pycache__/
 *.py[cod]
+*.egg-info/
 output/
 surveillance-test-output/
+notes/
+archive/

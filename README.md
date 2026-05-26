@@ -6,8 +6,6 @@ It pulls questions from BigQuery, generates structured forecasts with web search
 
 ## Setup
 
-Create a `.env` file:
-
 ```bash
 cp .env.example .env
 ```
@@ -20,7 +18,7 @@ OPENAI_SAFETY_IDENTIFIER
 LEAP_SHEET_ID
 ```
 
-Install dependencies:
+Install:
 
 ```bash
 pip install -e .
@@ -28,34 +26,53 @@ pip install -e .
 
 ## Run
 
-Cheap test mode:
+Cheap test mode (uses gpt-4o-mini):
 
 ```bash
 python run_surveillance.py run --test-mode --limit 3 --no-bq -y
 ```
 
-Production mode:
+Production:
 
 ```bash
 python run_surveillance.py run --limit 10 --no-bq -y
 ```
 
-Omit `--no-bq` when BigQuery write access is configured.
-
-Reset the review sheet:
+Specific questions:
 
 ```bash
-python run_surveillance.py setup -y
+python run_surveillance.py run --questions recABC123,recDEF456 -y
 ```
 
-Sync reviewed rows to BigQuery:
+Drop `--no-bq` once BigQuery write access is configured. Add `--no-browser` to skip browser-use (faster, more reliable but loses dashboard extraction).
+
+## Review workflow
+
+After a run, open the Google Sheet (`LEAP_SHEET_ID`). The **Review** tab has one row per question / target_date / dimension. The `type` column tells the reviewer what to do:
+
+- **type=resolved** (color_code=black): the LLM found the actual answer.
+  - `llm_value` is the LLM's answer. Read `rationale` and `data_source` to judge quality.
+  - Fill `actual_value` from your own research, `verified_source`, and pick a `score` from the dropdown (correct / close / wrong / confidently_wrong).
+- **type=forecast** (color_code ≠ black): the LLM is still forecasting.
+  - `llm_value` is the LLM's q50. `q25` / `q75` are the uncertainty range.
+  - If something seems wrong, fill `corrected_value` (fixes q50) or `corrected_color` (fixes classification).
+
+Check `reviewed` when done. Then:
 
 ```bash
 python run_surveillance.py sync
 ```
 
-For Sheet-only review movement:
+Syncs corrections back to BigQuery and stamps `reviewed_at`. For sheet-only (no BQ write):
 
 ```bash
 python run_surveillance.py sync --no-bq
 ```
+
+## Reset the sheet
+
+```bash
+python run_surveillance.py setup -y
+```
+
+Wipes the Review tab, deletes legacy tabs, and recreates Instructions.

@@ -1,27 +1,20 @@
 """CLI for LEAP surveillance runs and review sync."""
 
-import sys
-from pathlib import Path
-
-if "__file__" in dir():
-    _repo_root = Path(__file__).resolve().parent.parent
-    if str(_repo_root) not in sys.path:
-        sys.path.insert(0, str(_repo_root))
-
 import argparse
-import json
 import os
+from collections import defaultdict
 from datetime import date, datetime
 from typing import Optional
 
 from data_utils import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_SHEET_ID,
+    build_run_data,
     get_reviewed_items,
     load_questions,
-    move_to_reviewed,
     publish_to_sheet,
     setup_sheet,
+    stamp_reviewed_rows,
     sync_reviews_to_bigquery,
     write_csv_output,
     write_json_output,
@@ -39,6 +32,7 @@ from schemas import (
     EvidenceItem,
     ExpectedForecast,
     QuestionSpec,
+    RunCost,
     SurveillanceResponse,
 )
 
@@ -137,7 +131,6 @@ def validate_response(
     if null_count > len(response.forecasts) // 2:
         issues.append(f"{null_count}_null_values")
 
-    from collections import defaultdict
     quantile_groups = defaultdict(list)
     for f in response.forecasts:
         if f.forecast_value is not None and f.quantile is not None:
@@ -183,12 +176,13 @@ def validate_response(
 def process_question(
     q: QuestionSpec, model: str, use_browser: bool = True, test_mode: bool = False
 ):
+    costs = RunCost()
     print("  -> Researching with web search...", flush=True)
-    response, evidence = research(q, model=model, test_mode=test_mode)
+    response, evidence = research(q, model=model, test_mode=test_mode, costs=costs)
     print(f"  Research: {len(evidence)} sources, {len(response.forecasts)} forecasts", flush=True)
 
     print("  -> Evaluating quality...", flush=True)
-    quality = evaluate_response_quality(response, q, test_mode=test_mode)
+    quality = evaluate_response_quality(response, q, evidence, test_mode=test_mode, costs=costs)
     browser_used = False
 
     if use_browser and not quality.adequate and quality.browser_would_help and quality.browser_url:
@@ -206,8 +200,8 @@ def process_question(
                     full_text=browser_result.extracted_text,
                 )
             )
-            response = refine_with_browser(q, response, browser_result, test_mode=test_mode)
-            quality = evaluate_response_quality(response, q, test_mode=test_mode)
+            response = refine_with_browser(q, response, browser_result, test_mode=test_mode, costs=costs)
+            quality = evaluate_response_quality(response, q, evidence, test_mode=test_mode, costs=costs)
             print(f"  -> Refined with browser data ({quality.confidence}% confidence)")
             browser_used = True
         else:
@@ -218,7 +212,7 @@ def process_question(
     validation = validate_response(response, q.expected_forecasts)
     color = response.forecasts[0].color_code.value if response.forecasts else "N/A"
     print(f"  -> {color} | {'ok' if validation['ok'] else 'warning'}", flush=True)
-    return response, evidence, validation, quality, browser_used
+    return response, evidence, validation, quality, browser_used, costs
 
 
 def cmd_run(args):
@@ -246,20 +240,21 @@ def cmd_run(args):
         print(f"Loaded {len(questions)} questions")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    responses, evidences, validations, quality_reports = [], [], [], []
+    responses, evidences, validations, quality_reports, costs_list = [], [], [], [], []
     ok_count = 0
     browser_count = 0
 
     for i, q in enumerate(questions, 1):
         print(f"\n[{i}/{len(questions)}] {q.name}", flush=True)
         try:
-            response, evidence, validation, quality, browser_used = process_question(
+            response, evidence, validation, quality, browser_used, costs = process_question(
                 q, active_model, use_browser=not args.no_browser, test_mode=args.test_mode
             )
             responses.append(response)
             evidences.append(evidence)
             validations.append(validation)
             quality_reports.append(quality)
+            costs_list.append(costs)
             ok_count += 1 if validation["ok"] else 0
             browser_count += 1 if browser_used else 0
         except Exception as e:
@@ -268,8 +263,9 @@ def cmd_run(args):
             evidences.append(None)
             quality_reports.append(None)
             validations.append(None)
+            costs_list.append(None)
 
-    json_path = write_json_output(
+    run_data = build_run_data(
         run_id,
         active_model,
         questions,
@@ -277,14 +273,14 @@ def cmd_run(args):
         validations,
         evidences,
         quality_reports,
-        DEFAULT_OUTPUT_DIR,
+        costs_list=costs_list,
     )
+    json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     write_csv_output(run_id, questions, responses, DEFAULT_OUTPUT_DIR)
+    total_cost = sum(c.total for c in costs_list if c is not None)
     print(f"\nSaved: {json_path}")
     print(f"Summary: {ok_count}/{len(questions)} OK, {browser_count} browser extractions")
-
-    with open(json_path) as f:
-        run_data = json.load(f)
+    print(f"Estimated cost: ${total_cost:.4f}")
 
     if not args.no_bq:
         try:
@@ -338,14 +334,14 @@ def cmd_sync(args):
             print(f"  ({stats['skipped']} items skipped - raw data missing in BQ)")
 
     if bq_success or not bq_attempted:
-        moved = move_to_reviewed(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
-        print(f"Moved {moved} rows to 'Reviewed' tab")
+        moved = stamp_reviewed_rows(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
+        print(f"Stamped reviewed_at for {moved} rows")
     else:
         if args.force_move:
-            moved = move_to_reviewed(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
-            print(f"Moved {moved} rows to 'Reviewed' tab (--force-move)")
+            moved = stamp_reviewed_rows(DEFAULT_SHEET_ID, reviewed_items, row_numbers)
+            print(f"Stamped reviewed_at for {moved} rows (--force-move)")
         else:
-            print("Rows not moved (BQ failed). Use --force-move to move anyway, or --no-bq to skip BQ entirely.")
+            print("Rows not stamped (BQ failed). Use --force-move to stamp anyway, or --no-bq to skip BQ entirely.")
 
 
 def cmd_setup(args):
