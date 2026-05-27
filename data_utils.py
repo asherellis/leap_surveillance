@@ -24,39 +24,36 @@ SHEET_SCOPES = [
 ]
 CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
-# Single review tab; one row per question / target_date / dimension.
 REVIEW_HEADERS = [
-    # ── Identity (frozen; cols 0–2) ─────────────────────────────────────────
+    # ── Identity (frozen; cols 0–2, gray) ───────────────────────────────────
     "question_name",         # 0
     "target_date",           # 1  the date the question asks about
     "dimension",             # 2  sub-metric breakdown; "Overall" if none
-    # ── Context: criteria reviewers grade against (cols 3–4, gray header) ───
-    "question_text",         # 3  full question sentence from BQ
-    "resolution_criteria",   # 4  how FRI says to score it (may be empty for some questions)
-    # ── LLM + judge output — read-only (cols 5–15, blue header) ─────────────
-    "color_code",            # 5   black = resolved (target_date passed); else forecast
-    "confidence",            # 6   judge's confidence the answer is correct (0–100)
-    "confidence_reason",     # 7   judge's reason / flagged issues
-    "target_date_value",     # 8   value AT target_date (locked resolution if black; q50 forecast otherwise)
-    "current_value",         # 9   LLM's live estimate AS OF TODAY (separate from target_date_value)
-    "q25",                   # 10  25th-percentile forecast (forecast rows only)
-    "q75",                   # 11  75th-percentile forecast (forecast rows only)
-    "source_date",           # 12  date of the data the LLM used (resolved rows)
-    "data_source",           # 13  citation for that data (resolved rows)
-    "rationale",             # 14  LLM's reasoning summary
-    "sources",               # 15  URLs the LLM searched
-    # ── Reviewer fills in (cols 16–20, green header) ─────────────────────────
-    "review_value",          # 16  resolved: true answer; forecast: corrected median estimate
-    "review_source",         # 17  citation for review_value
-    "review_verdict",        # 18  correct / close / wrong / confidently wrong (resolved rows)
-    "review_color",          # 19  your color override if you disagree with the LLM (leave blank to confirm)
-    "review_notes",          # 20  free-form observations
-    # ── Status (col 21, yellow header) ───────────────────────────────────────
-    "reviewed",              # 21  checkbox — check when done
-    # ── Pipeline metadata (cols 22–24, light gray header) ────────────────────
-    "group_id",              # 22  BQ sync key
+    # ── LLM + judge output — read-only (cols 3–12, blue) ────────────────────
+    "status",                # 3  black = resolved; dark/light gray/white = forecast
+    "llm_answer",            # 4  value AT target_date (locked if black; q50 forecast otherwise)
+    "current_value",         # 5  LLM's live estimate as of today
+    "q25",                   # 6  25th-percentile forecast (forecast rows only)
+    "q75",                   # 7  75th-percentile forecast (forecast rows only)
+    "source_date",           # 8  date of the data the LLM used (resolved rows)
+    "source",                # 9  citation for that data
+    "rationale",             # 10 LLM's reasoning summary
+    "sources",               # 11 URLs the LLM searched
+    "judge_confidence",      # 12 judge's confidence the answer is correct (0–100)
+    # ── Reviewer fills in (cols 13–18, green) ────────────────────────────────
+    "review_value",          # 13 resolved: true answer; forecast: corrected median estimate
+    "review_source",         # 14 citation for review_value
+    "review_verdict",        # 15 correct / close / wrong / confidently wrong (resolved rows)
+    "review_notes",          # 16 free-form observations
+    "review_color",          # 17 color override if you disagree with the LLM
+    "reviewed",              # 18 checkbox — check when done
+    # ── Reference / metadata (cols 19–24, light gray) ────────────────────────
+    "question_text",         # 19 full question sentence from BQ
+    "resolution_criteria",   # 20 how FRI says to score it
+    "judge_reason",          # 21 judge's verbose explanation (check if something looks off)
+    "group_id",              # 22 BQ sync key
     "question_id",           # 23
-    "run_id",                # 24  encodes timestamp; no separate created_at column needed
+    "run_id",                # 24
 ]
 
 VERDICT_OPTIONS = ["correct", "close", "wrong", "confidently wrong"]
@@ -66,20 +63,21 @@ INSTRUCTIONS_CONTENT = [
     ["LEAP Surveillance Review"],
     [""],
     ["Each row is one question / target date / dimension. An LLM used web search to either"],
-    ["find the resolved answer (color=black) or produce a forecast (any other color)."],
+    ["find the resolved answer (status=black) or produce a forecast (any other color)."],
     [""],
     ["KEY COLUMNS"],
-    ["  target_date_value — value AT the target_date (the answer being verified)"],
-    ["  current_value     — LLM's live estimate AS OF TODAY (context only, not scored)"],
+    ["  llm_answer    — value AT the target_date (the answer being verified)"],
+    ["  current_value — LLM's live estimate AS OF TODAY (context only, not scored)"],
     [""],
-    ["FOR RESOLVED ROWS (color = black)"],
-    ["target_date_value is the locked historical resolution value. Fill in:"],
+    ["FOR RESOLVED ROWS (status = black)"],
+    ["llm_answer is the locked historical resolution value. Fill in:"],
     ["  review_value   — the true answer from your own research"],
     ["  review_source  — your source"],
     ["  review_verdict — correct / close / wrong / confidently wrong"],
+    ["  review_notes   — context, caveats, or flags for Nadja/Zack"],
     [""],
-    ["FOR FORECAST ROWS (color != black)"],
-    ["target_date_value is the median estimate; q25/q75 is the uncertainty range."],
+    ["FOR FORECAST ROWS (status is not black)"],
+    ["llm_answer is the median estimate; q25/q75 is the uncertainty range."],
     ["Only fill in if something seems clearly wrong:"],
     ["  review_value   — your corrected median estimate"],
     ["  review_color   — black/dark gray/light gray/white (how open is the question?)"],
@@ -590,25 +588,25 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
                 "question_name": q_name,
                 "target_date": fdate,
                 "dimension": dim,
-                "question_text": q_text,
-                "resolution_criteria": q_criteria,
-                "color_code": color_code,
-                "confidence": confidence,
-                "confidence_reason": confidence_reason,
-                "target_date_value": td_val,
+                "status": color_code,
+                "llm_answer": td_val,
                 "current_value": cur_val,
                 "q25": q25_val,
                 "q75": q75_val,
                 "source_date": res_source_date,
-                "data_source": res_source,
+                "source": res_source,
                 "rationale": rationale,
                 "sources": sources,
+                "judge_confidence": confidence,
                 "review_value": "",
                 "review_source": "",
                 "review_verdict": "",
-                "review_color": "",
                 "review_notes": "",
+                "review_color": "",
                 "reviewed": "",
+                "question_text": q_text,
+                "resolution_criteria": q_criteria,
+                "judge_reason": confidence_reason,
                 "group_id": group_id,
                 "question_id": q_id,
                 "run_id": run_id,
@@ -648,11 +646,6 @@ def _sort_review_rows(sheet, ws_id: int) -> None:
 
 
 def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> None:
-    """Apply checkbox and dropdown validation to a specific 1-indexed inclusive row range.
-
-    Clears validation on the target columns across the range first to avoid
-    stale rules from earlier publishes leaking through.
-    """
     def _val(col_name: str, rule: dict | None) -> dict:
         idx = REVIEW_HEADERS.index(col_name)
         req = {
@@ -697,9 +690,7 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
         ws.update("A1", [REVIEW_HEADERS])
         ws.freeze(rows=1)
 
-    # ── Formatting ────────────────────────────────────────────────────────────
-    # Validation is applied per-publish in _apply_row_validation so it covers
-    # only actual data rows and never produces phantom arrows on empty rows.
+    # Validation runs per-publish in _apply_row_validation; not applied here so empty rows get no phantom dropdowns.
     def _color_header(start_col: int, end_col: int, r: float, g: float, b: float) -> dict:
         return {
             "repeatCell": {
@@ -723,32 +714,31 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
         180,  # question_name
         85,   # target_date
         120,  # dimension
-        200,  # question_text
-        200,  # resolution_criteria
-        80,   # color_code
-        75,   # confidence
-        180,  # confidence_reason
-        95,   # target_date_value
+        75,   # status
+        90,   # llm_answer
         85,   # current_value
-        65,   # q25
-        65,   # q75
+        60,   # q25
+        60,   # q75
         85,   # source_date
-        140,  # data_source
-        200,  # rationale
+        140,  # source
+        220,  # rationale
         160,  # sources
+        80,   # judge_confidence
         90,   # review_value
         150,  # review_source
         110,  # review_verdict
+        180,  # review_notes
         90,   # review_color
-        150,  # review_notes
         75,   # reviewed
+        150,  # question_text
+        150,  # resolution_criteria
+        150,  # judge_reason
         140,  # group_id
         110,  # question_id
         110,  # run_id
     ]
 
     format_requests = [
-        # Compact rows: clip text overflow and reset all row heights to single-line
         {
             "repeatCell": {
                 "range": {"sheetId": ws.id},
@@ -763,24 +753,21 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
                 "fields": "pixelSize",
             }
         },
-        # Header color groups
-        _color_header(0, 5, 0.91, 0.91, 0.91),      # identity + context: neutral gray
-        _color_header(5, 16, 0.79, 0.90, 0.97),     # LLM + judge output: light blue
-        _color_header(16, 21, 0.83, 0.94, 0.83),    # reviewer: light green
-        _color_header(21, 22, 1.00, 0.95, 0.80),    # status: light yellow
-        _color_header(22, 25, 0.95, 0.95, 0.95),    # metadata: light gray
-        # Freeze header row + first 4 identity/context columns (through question_text)
+        _color_header(0, 3, 0.91, 0.91, 0.91),      # identity: neutral gray
+        _color_header(3, 13, 0.79, 0.90, 0.97),     # LLM + judge output: light blue
+        _color_header(13, 19, 0.83, 0.94, 0.83),    # reviewer: light green
+        _color_header(19, 25, 0.95, 0.95, 0.95),    # reference + metadata: light gray
+        # Freeze row 1 + first 3 cols — pinning question_text was too wide when scrolling to review_*.
         {
             "updateSheetProperties": {
                 "properties": {
                     "sheetId": ws.id,
-                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 4},
+                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 3},
                 },
                 "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
             }
         },
-        # Clear ALL validation across the entire sheet — explicit bounds are
-        # more reliable than open-ended ranges (which sometimes leave stale rules).
+        # Clear ALL validation — explicit bounds prevent stale rules from open-ended ranges.
         {
             "setDataValidation": {
                 "range": {
@@ -839,7 +826,7 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
 
         has_override = any(
             row.get(col) not in (None, "")
-            for col in ("review_color", "review_value")
+            for col in ("review_value", "review_color")
         )
 
         group_id = safe_str(row.get("group_id", "")).strip()
@@ -849,7 +836,7 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
         if not (reviewed or has_override):
             continue
 
-        color_code = row.get("color_code", "")
+        status = row.get("status", "")
         reviewed_items.append({
             "group_id": group_id,
             "run_id": row.get("run_id"),
@@ -857,10 +844,10 @@ def get_reviewed_items(sheet_id: str = DEFAULT_SHEET_ID) -> tuple[list[dict], li
             "question_name": row.get("question_name"),
             "target_date": row.get("target_date"),
             "dimension": row.get("dimension"),
-            "type": "resolved" if str(color_code).strip().lower() == "black" else "forecast",
-            "color_code": color_code,
-            "confidence": row.get("confidence"),
-            "target_date_value": row.get("target_date_value"),
+            "type": "resolved" if str(status).strip().lower() == "black" else "forecast",
+            "status": status,
+            "judge_confidence": row.get("judge_confidence"),
+            "llm_answer": row.get("llm_answer"),
             "current_value": row.get("current_value"),
             "q25": row.get("q25"),
             "q75": row.get("q75"),

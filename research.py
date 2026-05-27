@@ -367,12 +367,14 @@ Forecasts generated:
 Sources consulted (with title and snippet):
 {sources_summary}
 
+RESOLUTION ROWS: Any (date, dimension) group with value_type=resolution MUST have all quantile values equal and color_code=black. This is the required behavior for past dates — do NOT flag identical quantiles in a resolution group as lacking variation or collapsing the distribution. Only flag resolution rows if the value itself looks wrong, the source is weak, or the rationale doesn't support the stated value.
+
 Evaluation criteria:
 - Are the sources authoritative and recent for this question?
 - Do the source snippets actually support the specific claims in the rationale?
 - Is the rationale well-grounded in the cited evidence (not just plausible-sounding)?
 - Are all expected forecast rows present (no missing date/dimension/quantile combinations)?
-- Are the forecasts internally consistent (quantiles non-decreasing per date/dimension, values coherent across time horizons)?
+- For FORECAST rows (value_type=forecast): are quantiles non-decreasing and internally consistent across time horizons?
 - Are there material data gaps where the LLM clearly lacked information?
 
 Set adequate=true ONLY if the response is broadly trustworthy on all of the above. Set adequate=false if any criterion fails. List specific problems in issues[] (each item should be one concrete issue). Provide a brief reason explaining the overall judgment."""
@@ -668,7 +670,6 @@ def browser_extract(
         # Prefer final result; full histories include transient errors.
         extracted = getattr(result, "final_result", lambda: None)() or ""
 
-        # Do not treat browser/tooling failures as usable evidence.
         failure_markers = [
             "Invalid schema for response_format",
             "Stopping due to 3 consecutive failures",
