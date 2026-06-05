@@ -1,9 +1,8 @@
 .DS_Store
 .env
 __pycache__/
+.pytest_cache/
 *.py[cod]
-*.egg-info/
-output/
-surveillance-test-output/
-notes/
-archive/
+**/*.egg-info/
+outputs/
+internal/

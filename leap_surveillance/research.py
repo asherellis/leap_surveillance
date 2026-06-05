@@ -10,7 +10,14 @@ from urllib.parse import urlparse
 import litellm
 from dotenv import load_dotenv
 
-from schemas import (
+from .common import (
+    DEFAULT_BROWSER_MODEL,
+    DEFAULT_EVALUATOR_MODEL,
+    DEFAULT_MODEL,
+    TEST_EVALUATOR_MODEL,
+    TEST_MODEL,
+)
+from .models import (
     AdequacyAssessment,
     BrowserDecision,
     BrowserEvidence,
@@ -44,13 +51,7 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
-DEFAULT_MODEL = "openai/gpt-5.5"
-DEFAULT_EVALUATOR_MODEL = "openai/gpt-4.1-mini"
-DEFAULT_BROWSER_MODEL = "openai/gpt-4o"  # browser-use requires chat completions; gpt-5.5 incompatible
 DEFAULT_REASONING_EFFORT = "high"
-
-TEST_MODEL = "openai/gpt-4o-mini"
-TEST_EVALUATOR_MODEL = "openai/gpt-4o-mini"
 
 BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
 MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
@@ -58,47 +59,64 @@ BROWSER_EVIDENCE_LIMIT = 4000
 RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 1800.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 2)
+MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
 
 
-QUANTILE_INTERPRETATION_FULL = """QUANTILE INTERPRETATION:
+QUANTILE_INTERPRETATION_FULL = """Quantile interpretation:
 Return exactly seven forecast entries for each date/dimension: q0, q5, q25, q50, q75, q95, and q100.
 
 Use q0 and q100 as feasibility bounds, not ordinary probabilistic quantiles. q0 is the lowest coherent value given current constraints; q100 is the highest coherent value. For bounded metrics, use natural bounds where appropriate. For cumulative metrics, q0 should not be below the latest known value.
 
-Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles MAY be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
+Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
 
 Do not return all -999 values because the future is uncertain. Use -999 only when no reasonable estimate is possible for a specific value."""
 
 
-QUANTILE_INTERPRETATION_BRIEF = """QUANTILE INTERPRETATION:
+QUANTILE_INTERPRETATION_BRIEF = """Quantile interpretation:
 You must return exactly seven forecast entries for each date/dimension combination, one for each quantile: 0, 5, 25, 50, 75, 95, and 100.
 
-All seven quantile forecast values must be valid numbers. Quantile values MUST be in non-decreasing order: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by feasibility bounds or high confidence.
+All seven quantile forecast values must be valid numbers and non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by feasibility bounds or high confidence.
 
 Quantile meanings:
-- q=0: Absolute minimum feasible value (physical bounds, or current value if cumulative metric)
+- q=0: Absolute minimum feasible value (physical bound, or current value for a cumulative metric)
 - q=5, 25, 50, 75, 95: Probability distribution (q=50 is your median/best estimate)
 - q=100: Absolute maximum feasible value (natural upper bound or practical limit)"""
 
 
-COLOR_CODE_SYSTEM_FULL = """COLOR CODE SYSTEM:
+COLOR_CODE_SYSTEM_FULL = """Color coding:
 Assign one color_code per date/dimension combination, using the same color for all quantiles in that group.
 
-- black: resolved because the date has passed and official data is available, or because a development definitively resolves it
+- black: resolved - an authoritative value for this date/dimension is available, or a development definitively resolves it. A past date alone does not make a group black; if the date has passed but no authoritative value exists yet (never measured, not published, or only later sources), use the non-black color that reflects your remaining uncertainty.
 - dark gray: new evidence changes the feasible range; some previously possible values are now impossible
 - light gray: the full natural range is still feasible, but monotonic change makes part of it implausible for the interior quantiles
 - white: the full natural range remains feasible and there is not enough information to narrow it
 
-Use black only when uncertainty has collapsed to a resolved value. If color_code is black for a date/dimension group, all quantile values in that group must be identical.
+Color reflects how much uncertainty has collapsed, not whether the date is past or future. Use black only when the row has a resolved value. If color_code is black for a date/dimension group, all quantile values in that group must be identical.
 
 Explain the color choice in the rationale."""
 
 
-COLOR_CODE_SYSTEM_BRIEF = """COLOR CODE GUIDANCE:
-- BLACK: Question resolved (date passed, data available)
-- DARK GRAY: Feasible range changed (part of previous range now impossible)
-- LIGHT GRAY: Monotonic expectation (full range feasible but part implausible)
-- WHITE: Full natural range feasible, no monotonicity assumptions"""
+COLOR_CODE_SYSTEM_BRIEF = """Color coding:
+- black: resolved - authoritative value available (a past date alone is not enough)
+- dark gray: feasible range changed; part of the previous range is now impossible
+- light gray: full range remains feasible, but part is implausible because of monotonic expectations
+- white: full natural range remains feasible; no monotonicity assumptions"""
+
+
+RESEARCH_PRINCIPLES = """Research principles:
+- Match the period. When a value is tied to a specific date or period, find the value as of that period and prefer sources from that period; include the period in your searches. Do not substitute a value from a different time than the one asked about.
+- Use central estimates. Report a point estimate or stated central value, not an interval bound or range endpoint. If a source gives a range or confidence interval, use its midpoint or stated central value, and say which you used in your rationale.
+- Respect scope. If the metric is limited to a particular category, track, subset, or population, confirm each source matches that scope, and note in your rationale what you included and excluded.
+- Build aggregates exactly as the question defines them. If the metric is an average, sum, or index over components, gather each component and compute it yourself rather than copying a headline figure; list the components used. Combine them using the method the question's resolution criteria specifies; impose no default weighting of your own. When the component structure is ambiguous (e.g., a benchmark reports multiple sub-scores or tiers and the criteria doesn't say how they roll up), state the assumption you made and flag it explicitly in your rationale.
+- Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer -999 (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
+
+
+RATIONALE_REQUIREMENTS = """Rationale requirements:
+- State the source basis for the latest official value, current estimate, and each resolved target-date value.
+- For each target date/dimension, state the status decision: resolved, unresolved past date, future forecast, or resolved early.
+- Explain the color_code choice for each target date/dimension.
+- State any unit conversion, aggregation formula, or scope assumption used.
+- For forecast rows, explain the q50 and the main drivers of the q25/q75 spread. Do not explain every quantile separately unless q0/q100 need special justification."""
 
 
 def _response_cost(response, model: str) -> float:
@@ -135,38 +153,35 @@ def resolution_guidance(question: QuestionSpec) -> str:
     if not any(f.value_type == "resolution" for f in question.expected_forecasts):
         return "No requested forecast rows are past resolution dates. Return resolution_values as an empty list."
 
-    return """RESOLUTION VALUE GUIDANCE:
-Some requested forecast rows have value_type="resolution" because their target dates are in the past.
+    return """Resolution value guidance:
+Some requested rows have value_type="resolution": their target date has passed, so try to find the metric's authoritative value as of that exact target date. A past date does not guarantee that a resolved value exists.
 
-For each past forecast_date/dimension pair, report one fixed resolution value in resolution_values. This value should be the metric value as of that target date, not the current value today. The resolution_values.source_date field means the date the metric value represents, not the publication date of the source.
-
-Do not substitute the latest/current value for a past resolution date. A source published after the target date is only valid for resolution_values if it explicitly reports the historical value for that target date or target period. If the metric has changed after the target date, the post-target-date value belongs in current_resolution_values, not resolution_values. If you cannot find or reconstruct the target-date value, use -999 for that resolution value rather than using the current value.
-
-In forecasts, still return every requested quantile row. For value_type="resolution" rows, set all quantiles for that forecast_date/dimension to the same fixed resolution value and use color_code="black".
-
-Keep current_resolution_values separate. They are live as-of-today monitoring estimates and should not overwrite fixed past resolution values."""
+- If you find an authoritative value for the target date: report it in resolution_values (with source and source_date), set all quantiles for that group to that single value, and use color_code="black".
+- If no authoritative value exists for the target date (the metric was never measured for it, the data is not published yet, or only post-target-date sources exist): leave that group out of resolution_values, give your best-estimate distribution across the quantiles, and use the non-black color that reflects your remaining uncertainty. Put your single best guess in current_estimates so the estimate is not lost.
+- resolution_values.source_date = the date the value represents, not the source's publication date.
+- current_estimates reflect today's best guess and must never overwrite or substitute for a past resolution value."""
 
 
 def question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
     if question.question_type == "probability":
-        return """PROBABILITY QUESTION GUIDANCE:
+        return """Probability question guidance:
 This is a probability question. Return exactly one forecast entry for each expected date/dimension row, with quantile=50.
 
 Forecast values are probabilities on a 0 to 100 scale. Do not return the 0, 5, 25, 75, 95, or 100 quantiles for probability questions.
 
-Latest official values and current resolve-today values are not applicable for this question type. For those value fields, use -999 and set confidence=0.
+Latest official values and current estimates are not applicable for this question type. For those value fields, use -999 and set confidence=0.
 
 Use color_code="white" if the event remains unresolved and the full probability range is still open. Use color_code="black" if the event has occurred or the question is already resolved."""
 
     if question.question_type == "when":
-        return """TIMING QUESTION GUIDANCE:
+        return """Timing question guidance:
 This is a timing question asking when an event will first occur. The forecast_date value is a placeholder label; the forecast_value itself must be a year.
 
 Return exactly seven forecast entries for each expected row: quantiles 0, 5, 25, 50, 75, 95, and 100. Forecast values must be years only, with no ranges, dates, or extra text.
 
 All seven timing quantiles must be present, non-null, and non-decreasing. If the event has not yet occurred, q=0 should usually be the current year as the earliest feasible occurrence year. If the event may never occur, represent that tail risk with distant future years rather than -999; use 2500 only as an extreme upper-tail year when needed.
 
-Latest official values and current resolve-today values are not applicable for this question type. For those value fields, use -999 and set confidence=0.
+Latest official values and current estimates are not applicable for this question type. For those value fields, use -999 and set confidence=0.
 
 Use color_code="black" if the event has already occurred. If it has not occurred, use color_code="dark gray" because first occurrence in past years is no longer feasible."""
 
@@ -205,7 +220,7 @@ def _do_research(
     costs: RunCost | None = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     run_date = datetime.now(timezone.utc).date().isoformat()
-    prompt = f"""You are a research analyst. Use web search to find current data, then produce a structured forecast.
+    prompt = f"""You are a research analyst. Use web search to find the relevant evidence, then produce a structured forecast.
 
 Question: {question.name}
 Question type: {question.question_type}
@@ -217,12 +232,14 @@ Context:
 Expected forecast rows:
 {expected_forecast_lines(question.expected_forecasts)}
 
-TASK OVERVIEW:
-1. Find the latest OFFICIAL VALUE for this metric (most recent published data with date and source)
-2. Estimate the CURRENT RESOLUTION VALUE (what you would use if resolving today, may differ from official if metric has changed)
-3. For past target dates, estimate fixed RESOLUTION VALUES as of those target dates
-4. Generate FORECAST rows for every expected date/quantile listed above
-5. Provide structured sources with url, title, and snippet
+Task:
+1. Find the latest official value for the metric, including date and source.
+2. Estimate the current value as of the run date. This may differ from the latest official value if the metric has changed.
+3. For past target dates, report a resolution value only when an authoritative source supports it. If no such value exists, leave it unresolved rather than guessing one.
+4. Generate forecast rows for every expected date/quantile listed above.
+5. Provide structured sources with url, title, and snippet.
+
+{RESEARCH_PRINCIPLES}
 
 {question_type_guidance(question, full=True)}
 
@@ -230,17 +247,16 @@ TASK OVERVIEW:
 
 {COLOR_CODE_SYSTEM_FULL}
 
-REQUIREMENTS:
-- The question text, resolution criteria, unit, dates, dimensions, and quantiles above are the source of truth. Do not reinterpret the metric or change units based on search results.
-- Find the latest OFFICIAL published value when applicable (with date and source)
-- Estimate CURRENT RESOLUTION value when applicable (if resolving today, based on latest data plus reasonable extrapolation)
+{RATIONALE_REQUIREMENTS}
+
+Requirements:
+- Stay faithful to the question text, resolution criteria, unit, dates, dimensions, and quantiles. Do not reinterpret the metric or change units based on search results.
 - Return forecasts for exactly the expected rows listed above. The system assigns value_type from those rows.
-- Return one resolution_values entry for each past forecast_date/dimension pair, and no resolution_values entries for future dates
-- Do not use a post-target-date current value as a resolution value unless the source specifically reports the target-date value
-- Use -999 ONLY for individual values you truly cannot estimate (this should be rare)
-- Ensure quantile forecasts form an increasing sequence when this is a quantile or timing question
-- For each source: include url, title, and a key snippet/excerpt from that source
-- Do NOT anchor on existing LEAP forecasts if you encounter them - form independent estimates based on your research"""
+- Use -999 only when no defensible estimate is possible.
+- Quantile forecasts must be non-decreasing.
+- If unit bounds are provided, forecast values must respect them unless the question text explicitly overrides them.
+- For each source: include url, title, and a key snippet.
+- Do not anchor on existing LEAP forecasts; form independent estimates."""
 
     schema = _research_schema(question)
 
@@ -263,7 +279,7 @@ REQUIREMENTS:
                 "timeout": RESEARCH_TIMEOUT,
                 "safety_identifier": OPENAI_SAFETY_IDENTIFIER or None,
             }
-            # gpt-4o-mini does not support reasoning_effort
+            # Some lower-cost test models do not support reasoning_effort.
             if not test_mode:
                 params["reasoning_effort"] = DEFAULT_REASONING_EFFORT
             response = litellm.responses(**params)
@@ -329,6 +345,26 @@ def _format_forecasts_for_judge(response: SurveillanceResponse) -> str:
     )
 
 
+def _format_context_values_for_judge(response: SurveillanceResponse) -> str:
+    parts = []
+    if response.last_official_values:
+        parts.append("Latest official values:")
+        for v in response.last_official_values:
+            parts.append(f"- {v.dimension}: {v.value} as of {v.date}; source={v.source}")
+    if response.current_estimates:
+        parts.append("Current estimates:")
+        for v in response.current_estimates:
+            parts.append(f"- {v.dimension}: {v.value}; confidence={v.confidence}")
+    if response.resolution_values:
+        parts.append("Resolution values:")
+        for v in response.resolution_values:
+            parts.append(
+                f"- {v.forecast_date} {v.dimension}: {v.value}; "
+                f"source_date={v.source_date}; source={v.source}; confidence={v.confidence}"
+            )
+    return "\n".join(parts) if parts else "No official/current/resolution values."
+
+
 def _format_expected_for_judge(expected: list[ExpectedForecast]) -> str:
     if not expected:
         return "No expected forecasts specified."
@@ -336,6 +372,30 @@ def _format_expected_for_judge(expected: list[ExpectedForecast]) -> str:
         f"- {e.forecast_date} {e.dimension} q{e.quantile} (type={e.value_type})"
         for e in expected
     )
+
+
+def _call_structured_judge(
+    prompt: str,
+    schema_class: type,
+    eval_model: str,
+    max_output_tokens: int,
+    cost_bucket: str,
+    costs: RunCost | None,
+):
+    """Call a judge LLM with a strict-JSON schema and return the parsed model."""
+    schema = make_strict_schema(schema_class)
+    result = litellm.responses(
+        model=eval_model,
+        input=[{"role": "user", "content": prompt}],
+        text={"format": {"type": "json_schema", "name": schema_class.__name__, "schema": schema, "strict": True}},
+        max_output_tokens=max_output_tokens,
+        timeout=EVALUATION_TIMEOUT,
+        safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
+    )
+    if costs is not None:
+        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(result, eval_model))
+    text = _extract_text_from_response(result)
+    return schema_class.model_validate_json(text)
 
 
 def evaluate_adequacy(
@@ -348,60 +408,53 @@ def evaluate_adequacy(
     expected_summary = _format_expected_for_judge(question.expected_forecasts)
     sources_summary = _format_evidence_for_judge(evidence)
     forecasts_summary = _format_forecasts_for_judge(response)
+    context_values_summary = _format_context_values_for_judge(response)
 
-    prompt = f"""Evaluate whether this surveillance response adequately answers the forecasting question.
+    prompt = f"""Evaluate whether this surveillance response is adequate for review.
 
 Question: {question.name}
 Question details:
 {question.prompt}
 
-Expected forecast rows (what the response was asked to produce):
+Expected forecast rows:
 {expected_summary}
 
-Response rationale (full):
+Response rationale:
 {response.rationale}
 
-Forecasts generated:
+Official/current/resolution values:
+{context_values_summary}
+
+Generated forecasts:
 {forecasts_summary}
 
-Sources consulted (with title and snippet):
+Sources:
 {sources_summary}
 
-RESOLUTION ROWS: Any (date, dimension) group with value_type=resolution MUST have all quantile values equal and color_code=black. This is the required behavior for past dates — do NOT flag identical quantiles in a resolution group as lacking variation or collapsing the distribution. Only flag resolution rows if the value itself looks wrong, the source is weak, or the rationale doesn't support the stated value.
+Resolution rows (value_type=resolution) have two valid outcomes:
+- Resolved: an authoritative value for the target date was found. The group should be color_code=black with all quantiles equal to that value. Do not flag identical black quantiles as a problem.
+- Unresolved: no authoritative as-of-date value exists because the metric was never measured, is not yet published, or only post-target-date sources exist. A non-black estimate distribution with no resolution value is acceptable.
+
+Flag a resolution row when it is black but unsupported, fabricated, based on a post-target-date source, or otherwise appears wrong.
 
 Evaluation criteria:
-- Are the sources authoritative and recent for this question?
+- Are the sources authoritative and appropriate for this question?
+- Do the cited sources report the value for the period and scope the question asks about? A relevant source is not enough if it reports a different time period, category, or subset.
 - Do the source snippets actually support the specific claims in the rationale?
+- Are the unit, scale, and bounds correct? Probabilities must be on a 0-100 scale.
 - Is the rationale well-grounded in the cited evidence (not just plausible-sounding)?
+- If the rationale says a specific dashboard or page did not expose needed values, did the response use an adequate alternative source for the same metric, period, and scope? If not, treat it as a data gap.
 - Are all expected forecast rows present (no missing date/dimension/quantile combinations)?
-- For FORECAST rows (value_type=forecast): are quantiles non-decreasing and internally consistent across time horizons?
-- Are there material data gaps where the LLM clearly lacked information?
+- For forecast rows: are quantiles non-decreasing and internally consistent across time horizons?
+- Are there material data gaps?
 
-Set adequate=true ONLY if the response is broadly trustworthy on all of the above. Set adequate=false if any criterion fails. List specific problems in issues[] (each item should be one concrete issue). Provide a brief reason explaining the overall judgment."""
+Confidence means confidence in the response's evidence, interpretation, row completeness, and methodology. It is not confidence that a future forecast will come true. A well-supported long-range forecast can have high methodology confidence even though the future outcome is uncertain.
 
-    schema = make_strict_schema(AdequacyAssessment)
+Set adequate=true only if the response meets the criteria above. Set adequate=false if any criterion fails. Base confidence on whether the evidence and rationale substantiate the method and values well enough for review, not on the mere presence of sources or inherent future uncertainty. If methodology/evidence confidence is below {MIN_ADEQUATE_CONFIDENCE}, set adequate=false even when the answer is structurally complete. List concrete problems in issues[] and provide a brief reason for the overall judgment."""
+
     eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
-
     try:
-        result = litellm.responses(
-            model=eval_model,
-            input=[{"role": "user", "content": prompt}],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "AdequacyAssessment",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=1500,
-            timeout=EVALUATION_TIMEOUT,
-            safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
-        )
-        if costs is not None:
-            costs.judge_stage1 += _response_cost(result, eval_model)
-        text = _extract_text_from_response(result)
-        return AdequacyAssessment.model_validate_json(text)
+        return _call_structured_judge(prompt, AdequacyAssessment, eval_model, 1500, "judge_stage1", costs)
     except Exception as e:
         # On evaluator failure, mark inadequate so a human reviewer is alerted.
         return AdequacyAssessment(
@@ -423,62 +476,62 @@ def decide_browser(
     sources_summary = _format_evidence_for_judge(evidence)
     issues_list = "\n".join(f"- {i}" for i in adequacy.issues) or "- (no specific issues listed)"
 
-    prompt = f"""The surveillance response was flagged as inadequate. Decide whether using browser automation to scrape a specific URL would meaningfully help fix the gap.
+    prompt = f"""The surveillance response was flagged as inadequate. Decide whether browser automation on a specific URL would address the problem.
 
 Question: {question.name}
 Question details:
 {question.prompt}
 
-Issues identified by adequacy review:
+Issues from adequacy review:
 {issues_list}
 
 Adequacy reviewer reason: {adequacy.reason}
 
-Sources already consulted (via web search):
+Response rationale:
+{response.rationale}
+
+Sources already consulted:
 {sources_summary}
 
 Browser automation is useful for:
 - JavaScript-heavy dashboards (e.g., METR time horizons, lmarena.ai, livecodebenchpro.com, Kaggle leaderboards)
 - Interactive tables or charts that need clicking/scrolling to reveal data
 - Pages where web search returns the URL but not the specific value
+- Cases where the rationale says a referenced page or dashboard did not expose a needed value. Phrases like "the fetched text does not expose the values", "the page would not load the chart", or "I could not retrieve the table" are extraction problems, not methodology problems.
 
-Browser automation is NOT useful for:
-- Methodological problems (LLM misinterpreted the question)
+Browser automation is not useful for:
+- Genuine methodological problems (LLM misinterpreted the question, used the wrong metric, applied wrong aggregation)
 - Issues that more careful reading of existing sources would fix
 - PDF documents (separate path)
 - Paywalled content (cannot bypass)
 - Search engines (do not propose google.com or similar)
 
 Decide:
-- Set browser_would_help=true only if browser scraping a specific URL would plausibly fix the identified issues.
-- If yes, propose a specific browser_url (must NOT be a search engine, must NOT be a private/local IP) and a concrete browser_objective ("Extract the X value from the Y table").
+- Set browser_would_help=true only if browser scraping a specific URL would plausibly fix the identified issue.
+- If yes, propose a specific browser_url (not a search engine, not a private/local IP) and a concrete browser_objective ("Extract the X value from the Y table").
 - If no, set browser_would_help=false and leave browser_url empty. Explain briefly in reason.
 
-Note: Do not propose search engines (google.com, bing.com, etc.), localhost, or private/internal IPs — these are blocked by the pipeline's URL safety filter and will silently fail."""
+Do not propose search engines (google.com, bing.com, etc.), localhost, or private/internal IPs. These are blocked by the pipeline's URL safety filter."""
 
-    schema = make_strict_schema(BrowserDecision)
     eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
-
     try:
-        result = litellm.responses(
-            model=eval_model,
-            input=[{"role": "user", "content": prompt}],
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "BrowserDecision",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=800,
-            timeout=EVALUATION_TIMEOUT,
-            safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
-        )
-        if costs is not None:
-            costs.judge_stage2 += _response_cost(result, eval_model)
-        text = _extract_text_from_response(result)
-        return BrowserDecision.model_validate_json(text)
+        decision = _call_structured_judge(prompt, BrowserDecision, eval_model, 800, "judge_stage2", costs)
+        if decision.browser_would_help:
+            url = decision.browser_url.strip()
+            if not url:
+                return BrowserDecision(
+                    browser_would_help=False,
+                    reason=f"Browser was recommended but no URL was provided. Original reason: {decision.reason}",
+                )
+            safe, reason = is_safe_url(url)
+            if not safe:
+                return BrowserDecision(
+                    browser_would_help=False,
+                    browser_url=url,
+                    browser_objective=decision.browser_objective,
+                    reason=f"Browser URL rejected by safety filter ({reason}). Original reason: {decision.reason}",
+                )
+        return decision
     except Exception as e:
         return BrowserDecision(
             browser_would_help=False,
@@ -494,6 +547,20 @@ def evaluate_response_quality(
     costs: RunCost | None = None,
 ) -> ResearchQualityReport:
     adequacy = evaluate_adequacy(response, question, evidence, test_mode=test_mode, costs=costs)
+
+    if adequacy.adequate and adequacy.confidence < MIN_ADEQUATE_CONFIDENCE:
+        adequacy = AdequacyAssessment(
+            adequate=False,
+            confidence=adequacy.confidence,
+            issues=[
+                *(adequacy.issues or []),
+                f"low_confidence_below_{MIN_ADEQUATE_CONFIDENCE}",
+            ],
+            reason=(
+                f"Evaluator marked adequate but confidence was {adequacy.confidence}%, "
+                f"below the {MIN_ADEQUATE_CONFIDENCE}% minimum. Original reason: {adequacy.reason}"
+            ),
+        )
 
     if adequacy.adequate:
         return ResearchQualityReport(
@@ -527,9 +594,18 @@ def refine_with_browser(
     question: QuestionSpec,
     original_response: SurveillanceResponse,
     browser_evidence: BrowserEvidence,
+    evidence: list[EvidenceItem] | None = None,
     test_mode: bool = False,
     costs: RunCost | None = None,
 ) -> SurveillanceResponse:
+    original_sources = [e for e in (evidence or []) if e.source_type != "browser"]
+    sources_block = (
+        _format_evidence_for_judge(original_sources)
+        if original_sources
+        else ", ".join(original_response.sources)
+    )
+    original_values = _format_context_values_for_judge(original_response)
+    original_forecasts = _format_forecasts_for_judge(original_response)
     prompt = f"""Update the surveillance response with new browser-extracted data.
 
 Question: {question.name}
@@ -537,12 +613,22 @@ Original prompt: {question.prompt}
 
 Original response:
 - Rationale: {original_response.rationale}
-- Sources: {', '.join(original_response.sources)}
+
+Original official/current/resolution values:
+{original_values}
+
+Original forecasts:
+{original_forecasts}
+
+Sources already consulted (with title and snippet):
+{sources_block}
 
 New browser data from {browser_evidence.url}:
 {browser_evidence.extracted_text[:BROWSER_EVIDENCE_LIMIT]}
 
 Expected forecast rows: {expected_forecast_lines(question.expected_forecasts)}
+
+{RESEARCH_PRINCIPLES}
 
 {question_type_guidance(question, full=False)}
 
@@ -550,8 +636,10 @@ Expected forecast rows: {expected_forecast_lines(question.expected_forecasts)}
 
 {COLOR_CODE_SYSTEM_BRIEF}
 
-INSTRUCTIONS:
-Integrate the new browser data to improve the forecasts and resolution values. Update values if the browser data provides better/more relevant information. Return exactly the expected rows. The system assigns value_type from those rows. Use -999 only for individual values you truly cannot estimate (should be rare)."""
+Instructions:
+Integrate the new browser data to improve the forecasts and resolution values. Preserve original values unless the browser data is more relevant or contradicts them. If the browser data only shows that a dashboard does not expose the needed value, say that in the rationale and keep the original forecast distribution unless the original was directly contradicted. Return exactly the expected rows. The system assigns value_type from those rows. Use -999 only when no defensible estimate is possible.
+
+{RATIONALE_REQUIREMENTS}"""
 
     schema = _research_schema(question)
 
@@ -597,7 +685,17 @@ def is_safe_url(url: str) -> tuple[bool, str]:
         host = parsed.hostname or ""
 
         # Avoid letting the agent wander into search engines / CAPTCHA loops.
-        if host.endswith("google.com") or host.endswith("googleusercontent.com"):
+        search_domains = (
+            "google.com",
+            "googleusercontent.com",
+            "bing.com",
+            "duckduckgo.com",
+            "yahoo.com",
+            "baidu.com",
+            "yandex.com",
+            "search.brave.com",
+        )
+        if any(host == d or host.endswith(f".{d}") for d in search_domains):
             return False, "Search engine domain blocked"
 
         if host in ("localhost", "127.0.0.1", "::1"):

@@ -1,82 +1,113 @@
 # LEAP Surveillance
 
-Pipeline for running LLM surveillance on LEAP forecasting questions.
+Runs LLM surveillance on LEAP forecasting questions.
 
-It pulls questions from BigQuery, generates structured forecasts with web search, optionally uses browser automation when needed, and writes results to local files and Google Sheets. BigQuery write/sync support is included but requires edit permissions.
+The pipeline loads questions from BigQuery, generates structured forecasts with web search,
+optionally uses browser automation, and writes local JSON/CSV plus Google Sheet review tabs.
+BigQuery writes are enabled by default and require write access.
 
 ## Setup
 
 ```bash
 cp .env.example .env
+python3 -m pip install -e .
 ```
 
-Fill in:
+Commands below use the installed `leap-surveillance` script. If your shell cannot find it,
+use `python3 -m leap_surveillance.run_surveillance` in its place.
+
+Required:
 
 ```text
 OPENAI_API_KEY
 OPENAI_SAFETY_IDENTIFIER
+```
+
+Optional:
+
+```text
 LEAP_SHEET_ID
+LEAP_BQ_PROJECT
+LEAP_SURVEILLANCE_DATASET
+LEAP_MODEL
+LEAP_EVALUATOR_MODEL
+LEAP_BROWSER_MODEL
+LEAP_TEST_MODEL
+LEAP_TEST_EVALUATOR_MODEL
 ```
 
-Install:
+Defaults:
+
+- `LEAP_SHEET_ID` uses the shared LEAP review sheet.
+- `LEAP_BQ_PROJECT` uses the LEAP development warehouse.
+- `LEAP_SURVEILLANCE_DATASET` uses `surveillance`.
+
+## Run Surveillance
+
+Start with a low-cost live run. This still calls the pipeline, but uses lower-cost models:
 
 ```bash
-pip install -e .
+leap-surveillance run --test-mode --limit 3 --no-bq -y
 ```
 
-## Run
-
-Cheap test mode (uses gpt-4o-mini):
+Run a normal batch without BigQuery writes:
 
 ```bash
-python run_surveillance.py run --test-mode --limit 3 --no-bq -y
+leap-surveillance run --limit 10 --no-bq -y
 ```
 
-Production:
+Run specific questions:
 
 ```bash
-python run_surveillance.py run --limit 10 --no-bq -y
+leap-surveillance run --questions <question_id_1>,<question_id_2> --no-bq -y
 ```
 
-Specific questions:
+Drop `--no-bq` to write to BigQuery. Add `--no-browser` to skip browser automation.
+
+## Review and Sync
+
+Each run creates a Sheet tab named `run_<run_id>` (e.g. `run_20260602_143000`).
+The **Instructions** tab explains the columns and status values:
+`resolved`, `due_unresolved`, `forecast`, `resolved_early`.
+
+Run tabs have one row per question / target date / dimension. Quantile questions produce
+q0/q5/q25/q50/q75/q95/q100 in JSON/CSV/BigQuery; the Sheet shows q50 as `llm_answer`
+plus `q25` and `q75`.
+
+Review `status`, `question_type`, `unit`, `judge_confidence`, and `validation_issues`.
+Fill the `review_*` columns, tick `reviewed`, then sync:
 
 ```bash
-python run_surveillance.py run --questions recABC123,recDEF456 -y
+leap-surveillance sync          # writes reviewed rows to BigQuery
+leap-surveillance sync --no-bq  # previews reviewed rows without writing
 ```
 
-Drop `--no-bq` once BigQuery write access is configured. Add `--no-browser` to skip browser-use (faster, more reliable but loses dashboard extraction).
+`sync` reads the most recent `run_*` tab by default. Use `--tab run_<run_id>` for a specific tab.
 
-## Review workflow
-
-After a run, open the Google Sheet (`LEAP_SHEET_ID`). The **Review** tab has one row per question / target_date / dimension.
-
-Each row has two value columns:
-- `target_date_value` — the value AT the question's target_date (the answer being verified).
-- `current_value` — the LLM's live estimate AS OF TODAY (context only, not scored).
-
-- **color_code = black** (resolved): the LLM found the actual answer.
-  - `target_date_value` is the locked historical value. Read `rationale` and `data_source`.
-  - Fill `review_value` from your own research, `review_source`, and pick a `review_verdict` (correct / close / wrong / confidently wrong).
-- **color_code ≠ black** (forecast): the LLM is still forecasting.
-  - `target_date_value` is the LLM's q50. `q25` / `q75` are the uncertainty range.
-  - If something seems wrong, fill `review_value` (your corrected median) or `review_color` (fixes classification).
-
-Check `reviewed` when done. Then:
+To rebuild only the **Instructions** tab:
 
 ```bash
-python run_surveillance.py sync
+leap-surveillance setup -y
 ```
 
-Syncs corrections back to BigQuery. For sheet-only (no BQ write):
+## Offline Tests
+
+These tests do not call OpenAI, Google Sheets, or BigQuery:
 
 ```bash
-python run_surveillance.py sync --no-bq
+python3 -m pytest -q
 ```
 
-## Reset the sheet
+## Repo Layout
 
-```bash
-python run_surveillance.py setup -y
-```
+Source lives in the root-level `leap_surveillance` package:
 
-Wipes the Review tab and recreates it with current formatting and column structure.
+- `leap_surveillance.run_surveillance`: CLI for `run`, `sync`, and `setup`.
+- `leap_surveillance.research`: LLM research, judge, browser/refinement, and prompts.
+- `leap_surveillance.questions`: BigQuery question loading and expected-row shaping.
+- `leap_surveillance.storage`: local JSON/CSV outputs and BigQuery writes/sync.
+- `leap_surveillance.sheets`: Google Sheets review UI.
+- `leap_surveillance.models`: dataclasses, Pydantic schemas, and deterministic validation.
+- `leap_surveillance.common`: shared constants, env-configurable defaults, and small helpers.
+
+Each run writes its artifacts to `outputs/` as `run_<run_id>.json` and `run_<run_id>.csv`.

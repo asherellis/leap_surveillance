@@ -1,13 +1,13 @@
-"""Data schemas for surveillance questions, evidence, and responses."""
+"""Schemas and deterministic validation for LEAP surveillance."""
 
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Optional
 
-
 from pydantic import BaseModel, ConfigDict, Field
 
-# Reject unexpected fields in strict structured outputs.
 STRICT_CONFIG = ConfigDict(extra="forbid")
 
 
@@ -25,7 +25,7 @@ class QuestionSpec:
     name: str
     prompt: str
     expected_forecasts: list[ExpectedForecast] = field(default_factory=list)
-    question_type: str = "quantile"  # "quantile", "probability", or "when"
+    question_type: str = "quantile"
     unit: str = ""
     unit_min: Optional[float] = None
     unit_max: Optional[float] = None
@@ -75,7 +75,6 @@ class BrowserEvidence:
 
 class ResearchQualityReport(BaseModel):
     model_config = STRICT_CONFIG
-
     adequate: bool = True
     confidence: int = Field(default=50, ge=0, le=100)
     missing_data: list[str] = Field(default_factory=list)
@@ -87,7 +86,6 @@ class ResearchQualityReport(BaseModel):
 
 class AdequacyAssessment(BaseModel):
     model_config = STRICT_CONFIG
-
     adequate: bool
     confidence: int = Field(ge=0, le=100)
     issues: list[str] = Field(default_factory=list)
@@ -96,7 +94,6 @@ class AdequacyAssessment(BaseModel):
 
 class BrowserDecision(BaseModel):
     model_config = STRICT_CONFIG
-
     browser_would_help: bool
     browser_url: str = ""
     browser_objective: str = ""
@@ -148,7 +145,7 @@ class ForecastValue(BaseModel):
 
 class SurveillanceResponse(BaseModel):
     last_official_values: list[OfficialValue]
-    current_resolution_values: list[CurrentValue]
+    current_estimates: list[CurrentValue]
     resolution_values: list[ResolutionValue]
     forecasts: list[ForecastValue]
     rationale: str
@@ -199,7 +196,7 @@ class StrictSource(BaseModel):
 class StrictSurveillanceResponse(BaseModel):
     model_config = STRICT_CONFIG
     last_official_values: list[StrictOfficialValue]
-    current_resolution_values: list[StrictCurrentValue]
+    current_estimates: list[StrictCurrentValue]
     resolution_values: list[StrictResolutionValue]
     forecasts: list[StrictForecastValue]
     rationale: str
@@ -234,7 +231,6 @@ def make_strict_schema(
         return obj
 
     schema = fix_schema(schema)
-
     forecast_def = schema.get("$defs", {}).get("StrictForecastValue", {})
     properties = forecast_def.get("properties", {})
     if allowed_forecast_dates and "forecast_date" in properties:
@@ -249,12 +245,10 @@ def make_strict_schema(
         resolution_properties["forecast_date"]["enum"] = allowed_forecast_dates
     if allowed_dimensions and "dimension" in resolution_properties:
         resolution_properties["dimension"]["enum"] = allowed_dimensions
-
     return schema
 
 
 def convert_sentinel_value(v: float) -> Optional[float]:
-    """Convert the strict-schema no-estimate sentinel back to None."""
     return None if v == -999 else v
 
 
@@ -263,18 +257,13 @@ def strict_to_regular_response(
     expected_forecasts: Optional[list[ExpectedForecast]] = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     evidence = [
-        EvidenceItem(
-            source_type="web_search", url=s.url, title=s.title, snippet=s.snippet
-        )
+        EvidenceItem(source_type="web_search", url=s.url, title=s.title, snippet=s.snippet)
         for s in strict.sources
     ]
-
-    expected_value_types = {}
-    if expected_forecasts:
-        expected_value_types = {
-            (e.forecast_date, e.dimension, e.quantile): e.value_type
-            for e in expected_forecasts
-        }
+    expected_value_types = {
+        (e.forecast_date, e.dimension, e.quantile): e.value_type
+        for e in expected_forecasts or []
+    }
     resolution_by_key = {
         (rv.forecast_date, rv.dimension): convert_sentinel_value(rv.value)
         for rv in strict.resolution_values
@@ -317,13 +306,13 @@ def strict_to_regular_response(
             )
             for ov in strict.last_official_values
         ],
-        current_resolution_values=[
+        current_estimates=[
             CurrentValue(
                 dimension=cv.dimension,
                 value=convert_sentinel_value(cv.value),
                 confidence=cv.confidence,
             )
-            for cv in strict.current_resolution_values
+            for cv in strict.current_estimates
         ],
         resolution_values=[
             ResolutionValue(
@@ -343,3 +332,96 @@ def strict_to_regular_response(
         sources=[s.url for s in strict.sources],
     )
     return response, evidence
+
+
+def _parse_iso_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_response(
+    response: SurveillanceResponse, expected: list[ExpectedForecast] | None = None
+) -> dict:
+    issues = []
+    expected_has_q50 = bool(expected and any(e.quantile == 50 for e in expected))
+
+    if not response.forecasts:
+        issues.append("no_forecasts")
+    if not response.sources:
+        issues.append("no_sources")
+
+    if expected:
+        expected_keys = {(e.forecast_date, e.dimension) for e in expected}
+        forecast_keys = {(f.forecast_date, f.dimension) for f in response.forecasts}
+        missing_keys = expected_keys - forecast_keys
+        if missing_keys:
+            issues.append(f"missing_{len(missing_keys)}_date_dims")
+        unexpected_keys = forecast_keys - expected_keys
+        if unexpected_keys:
+            issues.append(f"unexpected_{len(unexpected_keys)}_date_dims")
+
+        if expected_has_q50:
+            q50s = {
+                (f.forecast_date, f.dimension)
+                for f in response.forecasts
+                if f.quantile == 50 and f.forecast_value is not None
+            }
+            missing_q50s = expected_keys - q50s
+            if missing_q50s:
+                issues.append(f"missing_{len(missing_q50s)}_q50s")
+
+        expected_triplets = {(e.forecast_date, e.dimension, e.quantile) for e in expected}
+        forecast_triplets = {(f.forecast_date, f.dimension, f.quantile) for f in response.forecasts}
+        missing_triplets = expected_triplets - forecast_triplets
+        if missing_triplets:
+            issues.append(f"missing_{len(missing_triplets)}_forecast_rows")
+        unexpected_triplets = forecast_triplets - expected_triplets
+        if unexpected_triplets:
+            issues.append(f"unexpected_{len(unexpected_triplets)}_forecast_rows")
+        if len(forecast_triplets) < len(response.forecasts):
+            issues.append("duplicate_forecast_rows")
+
+        for r in response.resolution_values:
+            target_date = _parse_iso_date(r.forecast_date)
+            source_date = _parse_iso_date(r.source_date)
+            if target_date and source_date and source_date > target_date:
+                issues.append(f"resolution_source_after_target_{r.forecast_date}_{r.dimension}")
+
+    null_count = sum(1 for f in response.forecasts if f.forecast_value is None)
+    if null_count > len(response.forecasts) // 2:
+        issues.append(f"{null_count}_null_values")
+
+    quantile_groups = defaultdict(list)
+    for f in response.forecasts:
+        if f.forecast_value is not None and f.quantile is not None:
+            quantile_groups[(f.forecast_date, f.dimension)].append((f.quantile, f.forecast_value))
+    for key, forecasts in quantile_groups.items():
+        sorted_forecasts = sorted(forecasts, key=lambda x: x[0])
+        for i in range(len(sorted_forecasts) - 1):
+            if sorted_forecasts[i][1] > sorted_forecasts[i + 1][1]:
+                issues.append(f"quantiles_not_increasing_{key[0]}_{key[1]}")
+                break
+
+    black_groups = defaultdict(list)
+    group_colors = defaultdict(set)
+    for f in response.forecasts:
+        group_colors[(f.forecast_date, f.dimension)].add(f.color_code.value)
+        if f.color_code.value == "black" and f.forecast_value is not None:
+            black_groups[(f.forecast_date, f.dimension)].append(f.forecast_value)
+
+    for key, values in black_groups.items():
+        if len({round(v, 12) for v in values}) > 1:
+            issues.append(f"black_quantiles_differ_{key[0]}_{key[1]}")
+    for key, colors in group_colors.items():
+        if len(colors) > 1:
+            issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")
+
+    if expected_has_q50:
+        usable_for_scoring = any(
+            f.quantile == 50 and f.forecast_value is not None for f in response.forecasts
+        )
+    else:
+        usable_for_scoring = any(f.forecast_value is not None for f in response.forecasts)
+    return {"ok": len(issues) == 0, "usable_for_scoring": usable_for_scoring, "issues": issues}
