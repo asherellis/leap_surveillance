@@ -274,9 +274,15 @@ def write_csv_output(run_id, questions, responses, output_dir, validations=None)
     return str(path)
 
 
+_bq_client_cache: bigquery.Client | None = None
+
+
 def _get_client() -> bigquery.Client:
-    credentials, _ = default()
-    return bigquery.Client(credentials=credentials, project=DEFAULT_BQ_PROJECT)
+    global _bq_client_cache
+    if _bq_client_cache is None:
+        credentials, _ = default()
+        _bq_client_cache = bigquery.Client(credentials=credentials, project=DEFAULT_BQ_PROJECT)
+    return _bq_client_cache
 
 
 def query_bq(

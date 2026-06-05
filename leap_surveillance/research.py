@@ -53,13 +53,19 @@ def _env_int(name: str, default: int) -> int:
 
 DEFAULT_REASONING_EFFORT = "high"
 
+import threading
+
 BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
 MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
 BROWSER_EVIDENCE_LIMIT = 4000
-RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 1800.0)
+RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 300.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
-MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 2)
+MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 1)
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
+
+# Limit browser-use Agent invocations to one at a time across worker threads.
+# Each Agent spawns a Chromium process; running >1 concurrently risks resource contention.
+_BROWSER_SEMAPHORE = threading.Semaphore(1)
 
 
 QUANTILE_INTERPRETATION_FULL = """Quantile interpretation:
@@ -764,7 +770,8 @@ def browser_extract(
             await browser.stop()
 
     try:
-        result = asyncio.run(_extract())
+        with _BROWSER_SEMAPHORE:
+            result = asyncio.run(_extract())
         # Prefer final result; full histories include transient errors.
         extracted = getattr(result, "final_result", lambda: None)() or ""
 

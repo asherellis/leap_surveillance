@@ -2,7 +2,9 @@
 
 import argparse
 import os
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from .common import DEFAULT_MODEL, DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, TEST_MODEL, safe_str
@@ -214,35 +216,53 @@ def cmd_run(args):
         return
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    responses, evidences, validations, quality_reports, costs_list, browser_useds, errors_list = [], [], [], [], [], [], []
+    n = len(questions)
+    responses = [None] * n
+    evidences = [None] * n
+    validations = [None] * n
+    quality_reports = [None] * n
+    costs_list = [None] * n
+    browser_useds = [False] * n
+    errors_list = [None] * n
 
-    for i, q in enumerate(questions, 1):
-        print(f"\n[{i}/{len(questions)}] {q.name}", flush=True)
+    workers = max(1, min(args.workers, n))
+    print_lock = threading.Lock()
+
+    def _run_one(i: int, q):
+        with print_lock:
+            print(f"[{i + 1}/{n}] {q.name} - starting", flush=True)
         try:
-            response, evidence, validation, quality, browser_used, costs = process_question(
+            result = process_question(
                 q, active_model, use_browser=not args.no_browser, test_mode=args.test_mode
             )
-            responses.append(response)
-            evidences.append(evidence)
-            validations.append(validation)
-            quality_reports.append(quality)
-            costs_list.append(costs)
-            browser_useds.append(browser_used)
-            errors_list.append(None)
+            with print_lock:
+                print(f"[{i + 1}/{n}] {q.name} - done", flush=True)
+            return i, result, None
         except Exception as e:
             tb = traceback.format_exc()
-            print(f"  -> error: {e}")
-            responses.append(None)
-            evidences.append(None)
-            quality_reports.append(None)
-            validations.append(None)
-            costs_list.append(None)
-            browser_useds.append(False)
-            errors_list.append({
+            with print_lock:
+                print(f"[{i + 1}/{n}] {q.name} - error: {e}", flush=True)
+            return i, None, {
                 "type": type(e).__name__,
                 "message": str(e)[:1000],
                 "traceback": tb[-2000:],
-            })
+            }
+
+    print(f"Running with {workers} worker(s)")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_run_one, i, q) for i, q in enumerate(questions)]
+        for fut in as_completed(futures):
+            i, result, err = fut.result()
+            if err:
+                errors_list[i] = err
+            else:
+                response, evidence, validation, quality, browser_used, costs = result
+                responses[i] = response
+                evidences[i] = evidence
+                validations[i] = validation
+                quality_reports[i] = quality
+                costs_list[i] = costs
+                browser_useds[i] = browser_used
 
     run_data = build_run_data(
         run_id,
@@ -361,6 +381,7 @@ Examples:
         help="Skip browser extraction (faster; may miss dashboard-only data)",
     )
     run_parser.add_argument("--test-mode", "-t", action="store_true", help="Use lower-cost test models")
+    run_parser.add_argument("--workers", "-w", type=int, default=1, help="Parallel question workers (default 1, recommended 5)")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
     sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from a run tab to BigQuery")
