@@ -18,7 +18,7 @@ DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "openai/gpt-
 DEFAULT_BROWSER_MODEL = os.environ.get("LEAP_BROWSER_MODEL") or "openai/gpt-4o"
 TEST_MODEL = os.environ.get("LEAP_TEST_MODEL") or "openai/gpt-4o-mini"
 TEST_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_EVALUATOR_MODEL") or "openai/gpt-4o-mini"
-SHEET_TEXT_LIMIT = 1000
+SHEET_TEXT_LIMIT = 10000
 FULL_QUANTILES = [0, 5, 25, 50, 75, 95, 100]
 TIMING_FORECAST_DATE = "event_occurrence"
 

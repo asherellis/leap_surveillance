@@ -86,7 +86,7 @@ INSTRUCTIONS_CONTENT = [
     ["Key columns"],
     ["status", "What the row needs: resolved (verify), due_unresolved (find the value), forecast (usually leave alone), resolved_early (verify)."],
     ["llm_answer", "The value to review. For forecast rows, this is q50."],
-    ["current_estimate", "The LLM's value as of today — not the same as llm_answer (which is at the target date)."],
+    ["current_estimate", "The LLM's value as of today — not the same as llm_answer (which is at the target date). Quantile questions only; blank for probability and timing questions by design."],
     ["q25 / q75", "50% confidence interval (IQR) around q50. Forecast rows only."],
     ["judge_confidence", "Confidence in the research, not confidence that the forecast will happen."],
     ["validation_issues", "Problems to check before approving."],
@@ -165,6 +165,18 @@ def _reorder_tabs(sheet) -> None:
         sheet.reorder_worksheets(ordered)
 
 
+def _render_when_year(value: str) -> str:
+    """Display the 9999 'never' sentinel as a human-readable label."""
+    if not value:
+        return value
+    try:
+        if int(float(value)) == 9999:
+            return "never"
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
 def build_review_rows(run_data: dict) -> list[list]:
     """Collapse raw forecast rows into human-review rows ordered by REVIEW_HEADERS."""
     run_id = run_data.get("run_id", "unknown")
@@ -184,7 +196,7 @@ def build_review_rows(run_data: dict) -> list[list]:
         confidence_reason = safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT]
         validation_issues = ", ".join(validation.get("issues", []) or [])[:SHEET_TEXT_LIMIT]
         missing_data = ", ".join(quality.get("missing_data", []) or [])[:SHEET_TEXT_LIMIT]
-        browser_used_str = "TRUE" if question.get("browser_used") else ""
+        browser_used_str = "TRUE" if question.get("browser_used") else "FALSE"
         rationale = safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT]
         sources = ", ".join(response.get("sources", []))[:SHEET_TEXT_LIMIT]
 
@@ -223,6 +235,14 @@ def build_review_rows(run_data: dict) -> list[list]:
                 q100_val = safe_str(quants.get(100, {}).get("forecast_value", ""))
                 res_source_date = ""
                 res_source = ""
+                if q_type == "when":
+                    td_val = _render_when_year(td_val)
+                    q0_val = _render_when_year(q0_val)
+                    q5_val = _render_when_year(q5_val)
+                    q25_val = _render_when_year(q25_val)
+                    q75_val = _render_when_year(q75_val)
+                    q95_val = _render_when_year(q95_val)
+                    q100_val = _render_when_year(q100_val)
 
             cur_val_obj = current_map.get(dim) or current_map.get("Overall") or {}
             cur_val = safe_str(cur_val_obj.get("value", ""))
@@ -320,9 +340,9 @@ def _sort_review_rows(sheet, ws_id: int) -> None:
 
 
 def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> None:
-    def _val(col_name: str, rule: dict | None) -> dict:
+    def _val(col_name: str, rule: dict) -> dict:
         idx = REVIEW_HEADERS.index(col_name)
-        req = {
+        return {
             "setDataValidation": {
                 "range": {
                     "sheetId": ws_id,
@@ -331,11 +351,9 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> No
                     "startColumnIndex": idx,
                     "endColumnIndex": idx + 1,
                 },
+                "rule": rule,
             }
         }
-        if rule is not None:
-            req["setDataValidation"]["rule"] = rule
-        return req
 
     def _one_of(values: list[str]) -> dict:
         return {
@@ -435,7 +453,7 @@ def _create_run_tab(sheet, tab_name: str):
         sheet.del_worksheet(existing)
     except gspread.WorksheetNotFound:
         pass
-    ws = sheet.add_worksheet(tab_name, rows=1000, cols=len(REVIEW_HEADERS) + 2)
+    ws = sheet.add_worksheet(tab_name, rows=1000, cols=len(REVIEW_HEADERS))
     ws.update("A1", [REVIEW_HEADERS])
 
     def _header_band(start_col: int, end_col: int, r: float, g: float, b: float) -> dict:
@@ -494,17 +512,6 @@ def _create_run_tab(sheet, tab_name: str):
                         "endColumnIndex": len(REVIEW_HEADERS),
                     }
                 }
-            }
-        },
-        {
-            "setDataValidation": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1000,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(REVIEW_HEADERS) + 4,
-                },
             }
         },
     ]

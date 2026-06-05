@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -53,8 +54,6 @@ def _env_int(name: str, default: int) -> int:
 
 DEFAULT_REASONING_EFFORT = "high"
 
-import threading
-
 BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
 MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
 BROWSER_EVIDENCE_LIMIT = 4000
@@ -62,6 +61,9 @@ RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 300.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 1)
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
+
+# Collapse degenerate LLM floats (0.000000...0) that bloat JSON past token limit.
+_COLLAPSE_FLOATS_RE = re.compile(r'(\d+\.\d{4})\d{4,}')
 
 # Limit browser-use Agent invocations to one at a time across worker threads.
 # Each Agent spawns a Chromium process; running >1 concurrently risks resource contention.
@@ -185,7 +187,9 @@ This is a timing question asking when an event will first occur. The forecast_da
 
 Return exactly seven forecast entries for each expected row: quantiles 0, 5, 25, 50, 75, 95, and 100. Forecast values must be years only, with no ranges, dates, or extra text.
 
-All seven timing quantiles must be present, non-null, and non-decreasing. If the event has not yet occurred, q=0 should usually be the current year as the earliest feasible occurrence year. If the event may never occur, represent that tail risk with distant future years rather than -999; use 2500 only as an extreme upper-tail year when needed.
+All seven timing quantiles must be present, non-null, and non-decreasing. If the event has not yet occurred, q=0 should usually be the current year as the earliest feasible occurrence year.
+
+If you believe the event could literally never occur (p(never) ≥ 5%), use 9999 as the q100 year — it is a sentinel meaning "never", not a literal year. For events that are long-tail-but-finite (likely beyond 2100 but plausible eventually), use a real far-future year such as 2200, 2300, or 2500. Do not reach for 9999 as a default upper bound; only use it when you genuinely believe the event might never occur. Multiple upper quantiles can be 9999 only if they truly all represent the "never" judgment and strict monotonicity is preserved (e.g., q95=9999 only if q100=9999 too).
 
 Latest official values and current estimates are not applicable for this question type. For those value fields, use -999 and set confidence=0.
 
@@ -207,21 +211,8 @@ def research(
     question: QuestionSpec,
     model: str = DEFAULT_MODEL,
     retry_on_truncation: bool = True,
-    test_mode: bool = False,
-    costs: RunCost | None = None,
-) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
-    if test_mode:
-        model = TEST_MODEL
-    return _do_research(
-        question, model, retry_on_truncation, attempt=1, test_mode=test_mode, costs=costs
-    )
-
-
-def _do_research(
-    question: QuestionSpec,
-    model: str,
-    retry_on_truncation: bool,
-    attempt: int,
+    *,
+    attempt: int = 1,
     test_mode: bool = False,
     costs: RunCost | None = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
@@ -303,20 +294,18 @@ Requirements:
         costs.research += _response_cost(response, model)
 
     text = _extract_text_from_response(response)
-
-    # Collapse degenerate LLM floats (0.000000...0) that bloat JSON past token limit.
-    text = re.sub(r'(\d+\.\d{4})\d{4,}', r'\1', text)
+    text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
 
     try:
         strict_response = StrictSurveillanceResponse.model_validate_json(text)
     except Exception as e:
         if retry_on_truncation and attempt < 3 and "EOF while parsing" in str(e):
             print(f"    truncation retry {attempt + 1}/3 ({len(text)} chars)...")
-            return _do_research(
+            return research(
                 question,
                 model,
                 retry_on_truncation,
-                attempt + 1,
+                attempt=attempt + 1,
                 test_mode=test_mode,
                 costs=costs,
             )
@@ -456,7 +445,9 @@ Evaluation criteria:
 
 Confidence means confidence in the response's evidence, interpretation, row completeness, and methodology. It is not confidence that a future forecast will come true. A well-supported long-range forecast can have high methodology confidence even though the future outcome is uncertain.
 
-Set adequate=true only if the response meets the criteria above. Set adequate=false if any criterion fails. Base confidence on whether the evidence and rationale substantiate the method and values well enough for review, not on the mere presence of sources or inherent future uncertainty. If methodology/evidence confidence is below {MIN_ADEQUATE_CONFIDENCE}, set adequate=false even when the answer is structurally complete. List concrete problems in issues[] and provide a brief reason for the overall judgment."""
+Set adequate=true only if the response meets the criteria above. Set adequate=false if any criterion fails. Base confidence on whether the evidence and rationale substantiate the method and values well enough for review, not on the mere presence of sources or inherent future uncertainty. If methodology/evidence confidence is below {MIN_ADEQUATE_CONFIDENCE}, set adequate=false even when the answer is structurally complete.
+
+List ONLY concrete problems in issues[] — gaps, errors, contradictions, missing data, wrong scope, fabricated values, unsupported claims. Do NOT include affirmative observations like "sources are authoritative", "forecasts are complete", "rationale is well-grounded", "correctly cited", or "transparent methodology". If there are no problems, leave issues[] empty. Provide a brief reason for the overall judgment in `reason`."""
 
     eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
     try:
@@ -545,6 +536,33 @@ Do not propose search engines (google.com, bing.com, etc.), localhost, or privat
         )
 
 
+_AFFIRMATIVE_ISSUE_MARKERS = (
+    "sources are authoritative",
+    "all expected forecast rows",
+    "well-grounded",
+    "transparent and",
+    "rationale is well",
+    "correctly cited",
+    "are present with consistent",
+    "appropriate authoritative",
+    "are authoritative and relevant",
+)
+
+
+def _filter_affirmative_issues(issues: list[str]) -> list[str]:
+    """Drop affirmative observations the judge wrote into issues[] against instruction."""
+    filtered = []
+    for item in issues or []:
+        if not isinstance(item, str):
+            filtered.append(item)
+            continue
+        lowered = item.lower()
+        if any(marker in lowered for marker in _AFFIRMATIVE_ISSUE_MARKERS):
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def evaluate_response_quality(
     response: SurveillanceResponse,
     question: QuestionSpec,
@@ -553,6 +571,12 @@ def evaluate_response_quality(
     costs: RunCost | None = None,
 ) -> ResearchQualityReport:
     adequacy = evaluate_adequacy(response, question, evidence, test_mode=test_mode, costs=costs)
+    adequacy = AdequacyAssessment(
+        adequate=adequacy.adequate,
+        confidence=adequacy.confidence,
+        issues=_filter_affirmative_issues(adequacy.issues),
+        reason=adequacy.reason,
+    )
 
     if adequacy.adequate and adequacy.confidence < MIN_ADEQUATE_CONFIDENCE:
         adequacy = AdequacyAssessment(
@@ -672,7 +696,7 @@ Integrate the new browser data to improve the forecasts and resolution values. P
         if costs is not None:
             costs.refinement += _response_cost(response, model)
         text = _extract_text_from_response(response)
-        text = re.sub(r'(\d+\.\d{4})\d{4,}', r'\1', text)
+        text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
         strict_resp = StrictSurveillanceResponse.model_validate_json(text)
         refined_response, _ = strict_to_regular_response(strict_resp, question.expected_forecasts)
         return refined_response
