@@ -248,7 +248,7 @@ def make_strict_schema(
     return schema
 
 
-def convert_sentinel_value(v: float) -> Optional[float]:
+def _convert_sentinel_value(v: float) -> Optional[float]:
     return None if v == -999 else v
 
 
@@ -265,7 +265,7 @@ def strict_to_regular_response(
         for e in expected_forecasts or []
     }
     resolution_by_key = {
-        (rv.forecast_date, rv.dimension): convert_sentinel_value(rv.value)
+        (rv.forecast_date, rv.dimension): _convert_sentinel_value(rv.value)
         for rv in strict.resolution_values
     }
     expected_resolution_keys = {
@@ -283,7 +283,7 @@ def strict_to_regular_response(
             forecast_value = resolution_value
             color_code = ColorCode.black
         else:
-            forecast_value = convert_sentinel_value(fv.forecast_value)
+            forecast_value = _convert_sentinel_value(fv.forecast_value)
             color_code = fv.color_code
         forecasts.append(
             ForecastValue(
@@ -300,7 +300,7 @@ def strict_to_regular_response(
         last_official_values=[
             OfficialValue(
                 dimension=ov.dimension,
-                value=convert_sentinel_value(ov.value),
+                value=_convert_sentinel_value(ov.value),
                 date=ov.date,
                 source=ov.source,
             )
@@ -309,7 +309,7 @@ def strict_to_regular_response(
         current_estimates=[
             CurrentValue(
                 dimension=cv.dimension,
-                value=convert_sentinel_value(cv.value),
+                value=_convert_sentinel_value(cv.value),
                 confidence=cv.confidence,
             )
             for cv in strict.current_estimates
@@ -318,7 +318,7 @@ def strict_to_regular_response(
             ResolutionValue(
                 forecast_date=rv.forecast_date,
                 dimension=rv.dimension,
-                value=convert_sentinel_value(rv.value),
+                value=_convert_sentinel_value(rv.value),
                 source_date=rv.source_date,
                 source=rv.source,
                 confidence=rv.confidence,

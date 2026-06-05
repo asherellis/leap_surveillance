@@ -142,14 +142,14 @@ def _extract_text_from_response(response) -> str:
     raise RuntimeError("No text output found in response")
 
 
-def expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
+def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
     return "\n".join(
         f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}, value_type={ef.value_type}"
         for ef in expected_forecasts
     )
 
 
-def resolution_guidance(question: QuestionSpec) -> str:
+def _resolution_guidance(question: QuestionSpec) -> str:
     if not any(f.value_type == "resolution" for f in question.expected_forecasts):
         return "No requested forecast rows are past resolution dates. Return resolution_values as an empty list."
 
@@ -162,7 +162,7 @@ Some requested rows have value_type="resolution": their target date has passed, 
 - current_estimates reflect today's best guess and must never overwrite or substitute for a past resolution value."""
 
 
-def question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
+def _question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
     if question.question_type == "probability":
         return """Probability question guidance:
 This is a probability question. Return exactly one forecast entry for each expected date/dimension row, with quantile=50.
@@ -230,7 +230,7 @@ Context:
 {question.prompt}
 
 Expected forecast rows:
-{expected_forecast_lines(question.expected_forecasts)}
+{_expected_forecast_lines(question.expected_forecasts)}
 
 Task:
 1. Find the latest official value for the metric, including date and source.
@@ -241,9 +241,9 @@ Task:
 
 {RESEARCH_PRINCIPLES}
 
-{question_type_guidance(question, full=True)}
+{_question_type_guidance(question, full=True)}
 
-{resolution_guidance(question)}
+{_resolution_guidance(question)}
 
 {COLOR_CODE_SYSTEM_FULL}
 
@@ -626,13 +626,13 @@ Sources already consulted (with title and snippet):
 New browser data from {browser_evidence.url}:
 {browser_evidence.extracted_text[:BROWSER_EVIDENCE_LIMIT]}
 
-Expected forecast rows: {expected_forecast_lines(question.expected_forecasts)}
+Expected forecast rows: {_expected_forecast_lines(question.expected_forecasts)}
 
 {RESEARCH_PRINCIPLES}
 
-{question_type_guidance(question, full=False)}
+{_question_type_guidance(question, full=False)}
 
-{resolution_guidance(question)}
+{_resolution_guidance(question)}
 
 {COLOR_CODE_SYSTEM_BRIEF}
 

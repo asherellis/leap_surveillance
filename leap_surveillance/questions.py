@@ -12,6 +12,7 @@ from .common import (
     to_float,
 )
 from .models import ExpectedForecast, QuestionSpec
+from .storage import query_bq
 
 
 def _infer_surveillance_question_type(
@@ -102,7 +103,6 @@ def _expected_forecasts(
 
 
 def load_questions(limit=None) -> list[QuestionSpec]:
-    from .storage import query_bq
 
     query = f"""
     WITH forecast_groups AS (

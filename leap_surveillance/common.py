@@ -80,7 +80,7 @@ def is_empty(val) -> bool:
     except (TypeError, ValueError):
         pass
     s = safe_str(val).strip()
-    return s == "" or s.lower() in ("nat", "nan", "none", "<na>")
+    return s == "" or s.lower() in ("nat", "nan", "none")
 
 
 def make_review_group_id(run_id: str, question_id: str, forecast_date: str, dimension: str) -> str:

@@ -20,73 +20,79 @@ SHEET_SCOPES = [
 CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
 REVIEW_HEADERS = [
-    # Context band (cols 0-5): identify the row + its status at a glance.
-    "question_name",         # 0
-    "target_date",           # 1  the date the question asks about
-    "dimension",             # 2  sub-metric breakdown; "Overall" if none
-    "status",                # 3  DERIVED: resolved / due_unresolved / resolved_early / forecast
-    "question_type",         # 4  quantile / probability / when
-    "unit",                  # 5  display unit for numeric values
-    # LLM/judge band (cols 6-17): the answer, the uncertainty, and the trust signals.
-    "llm_answer",            # 6  value AT target_date (resolved value if resolved, else q50 estimate)
-    "q25",                   # 7  25th-percentile estimate (non-resolved rows)
-    "q75",                   # 8  75th-percentile estimate (non-resolved rows)
-    "judge_confidence",      # 9  judge's methodology/evidence confidence (0-100)
-    "validation_issues",     # 10 deterministic validator issues, if any
-    "judge_reason",          # 11 judge explanation for the confidence score
-    "rationale",             # 12 LLM's reasoning summary
-    "all_sources",           # 13 every URL the LLM consulted
-    "resolution_source",     # 14 citation for the resolved value (resolved rows)
-    "resolution_source_date",  # 15 date the resolved value represents (resolved rows)
-    "current_estimate",      # 16 LLM's value as of today (context, not scored)
-    "llm_color",             # 17 raw LLM color_code (already encoded in status)
-    # Reviewer band (cols 18-23): fill left-to-right.
-    "review_verdict",        # 18 correct / close / wrong / confidently wrong
-    "review_value",          # 19 corrected value (if verdict != correct)
-    "review_source",         # 20 citation for review_value
-    "review_color",          # 21 color override if you disagree with the LLM
-    "review_notes",          # 22 free-form observations
-    "reviewed",              # 23 checkbox - check when done
-    # Reference band (cols 24-28): question text + sync keys.
-    "question_text",         # 24 full question sentence from BQ
-    "resolution_criteria",   # 25 how FRI says to score it
-    "group_id",              # 26 BQ sync key
-    "question_id",           # 27
-    "run_id",                # 28
+    "question_name",
+    "question_text",
+    "resolution_criteria",
+    "target_date",
+    "dimension",
+    "status",
+    "question_type",
+    "unit",
+    "llm_answer",
+    "q0",
+    "q5",
+    "q25",
+    "q75",
+    "q95",
+    "q100",
+    "judge_confidence",
+    "judge_reason",
+    "validation_issues",
+    "missing_data",
+    "browser_used",
+    "rationale",
+    "all_sources",
+    "resolution_source",
+    "resolution_source_date",
+    "latest_official_value",
+    "latest_official_date",
+    "latest_official_source",
+    "current_estimate",
+    "current_estimate_confidence",
+    "llm_color",
+    "review_verdict",
+    "review_value",
+    "review_source",
+    "review_color",
+    "review_notes",
+    "reviewed",
+    "group_id",
+    "question_id",
+    "run_id",
 ]
 
 VERDICT_OPTIONS = ["correct", "close", "wrong", "confidently wrong"]
 COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
 
-# Two-column glossary: [term, definition]. Single-cell rows are the title, section
-# headers, intro, and the closing line. Formatting is applied in _format_instructions().
 INSTRUCTIONS_CONTENT = [
     ["LEAP Surveillance Review"],
+    ["Use this sheet to review the results from each LEAP surveillance run."],
+    ["Each run gets its own run_<run_id> tab. Each row is one question result for a target date and dimension."],
     [""],
-    ["Each surveillance run lives in its own `run_<run_id>` tab. Open the most recent tab to review the latest run."],
-    ["One row per question / target date / dimension. Confirm or correct the LLM's value, tick `reviewed`, then run sync."],
+    ["How to review"],
+    ["Open the newest run tab."],
+    ["Read the question, resolution criteria, answer, rationale, sources, and any validation issues."],
+    ["Fill review_verdict for each row you review."],
+    ["If you change the answer, fill review_value and review_source."],
+    ["Tick reviewed when the row is done."],
+    ["When finished, run leap-surveillance sync. To preview first, run leap-surveillance sync --no-bq."],
     [""],
-    ["STATUS"],
-    ["resolved", "Date passed, LLM found a published value. Confirm it."],
-    ["due_unresolved", "Date passed, no published value yet. Track down the real value."],
-    ["forecast", "Future date. Leave it unless the value or rationale looks wrong."],
-    ["resolved_early", "Future date, outcome already settled. Confirm the value."],
+    ["Column groups"],
+    ["A-H", "Question, resolution criteria, target date, status, type, and unit."],
+    ["I-AD", "The LLM's answer, the full forecast distribution, judge evaluation, rationale, and cited sources."],
+    ["AE-AJ", "Your review."],
+    ["AK-AM", "Sync identifiers — do not edit."],
     [""],
-    ["FILL IN"],
-    ["review_value", "Correct value from your research, or a forecast correction."],
-    ["review_source", "Link or citation for that value."],
+    ["Key columns"],
+    ["status", "What the row needs: resolved (verify), due_unresolved (find the value), forecast (usually leave alone), resolved_early (verify)."],
+    ["llm_answer", "The value to review. For forecast rows, this is q50."],
+    ["current_estimate", "The LLM's value as of today — not the same as llm_answer (which is at the target date)."],
+    ["q25 / q75", "50% confidence interval (IQR) around q50. Forecast rows only."],
+    ["judge_confidence", "Confidence in the research, not confidence that the forecast will happen."],
+    ["validation_issues", "Problems to check before approving."],
+    ["missing_data", "The judge's specific list of gaps or weak spots in the response."],
     ["review_verdict", "correct / close / wrong / confidently wrong."],
-    ["review_color", "Override color if you'd classify the certainty differently."],
-    ["review_notes", "Anything worth flagging."],
-    ["reviewed", "Tick once the row is done."],
-    [""],
-    ["Then run: leap-surveillance sync"],
-    [""],
-    ["KEY LLM COLUMNS"],
-    ["llm_answer", "Resolved value, or q50 forecast."],
-    ["q25 / q75", "Uncertainty range around q50 (forecast rows)."],
-    ["judge_confidence", "Second model's confidence in evidence + methodology (0-100)."],
-    ["validation_issues", "Mechanical checks: missing rows, mixed colors, non-increasing quantiles."],
+    ["reviewed", "Only reviewed rows are synced."],
 ]
 
 
@@ -131,7 +137,7 @@ def get_sheets_client():
 RUN_TAB_PREFIX = "run_"
 
 
-def _run_tab_name(run_id: str) -> str:
+def run_tab_name(run_id: str) -> str:
     return f"{RUN_TAB_PREFIX}{run_id}"
 
 
@@ -141,6 +147,22 @@ def _latest_run_tab(sheet):
     if not run_tabs:
         return None
     return max(run_tabs, key=lambda ws: ws.title)
+
+
+def _reorder_tabs(sheet) -> None:
+    """Instructions leftmost, then run_* tabs newest-first, then anything else."""
+    all_ws = sheet.worksheets()
+    instructions = [w for w in all_ws if w.title == "Instructions"]
+    run_tabs = sorted(
+        (w for w in all_ws if w.title.startswith(RUN_TAB_PREFIX)),
+        key=lambda w: w.title,
+        reverse=True,
+    )
+    handled = set(instructions) | set(run_tabs)
+    others = [w for w in all_ws if w not in handled]
+    ordered = instructions + run_tabs + others
+    if ordered != all_ws:
+        sheet.reorder_worksheets(ordered)
 
 
 def build_review_rows(run_data: dict) -> list[list]:
@@ -161,6 +183,8 @@ def build_review_rows(run_data: dict) -> list[list]:
         confidence = safe_str(quality.get("confidence", ""))
         confidence_reason = safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT]
         validation_issues = ", ".join(validation.get("issues", []) or [])[:SHEET_TEXT_LIMIT]
+        missing_data = ", ".join(quality.get("missing_data", []) or [])[:SHEET_TEXT_LIMIT]
+        browser_used_str = "TRUE" if question.get("browser_used") else ""
         rationale = safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT]
         sources = ", ".join(response.get("sources", []))[:SHEET_TEXT_LIMIT]
 
@@ -172,7 +196,7 @@ def build_review_rows(run_data: dict) -> list[list]:
             q = forecast.get("quantile")
             groups[(fdate, dim)][q] = forecast
 
-        _, current_map, resolution_map = context_maps(response)
+        official_map, current_map, resolution_map = context_maps(response)
 
         for (fdate, dim), quants in groups.items():
             group_id = make_review_group_id(run_id, q_id, fdate, dim)
@@ -186,19 +210,28 @@ def build_review_rows(run_data: dict) -> list[list]:
                 td_val = safe_str(display_forecast.get("forecast_value", ""))
                 if not td_val:
                     td_val = safe_str(res_val.get("value", ""))
-                q25_val = ""
-                q75_val = ""
+                q0_val = q5_val = q25_val = q75_val = q95_val = q100_val = ""
                 res_source_date = safe_str(res_val.get("source_date", ""))
                 res_source = safe_str(res_val.get("source", ""))[:SHEET_TEXT_LIMIT]
             else:
                 td_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
+                q0_val = safe_str(quants.get(0, {}).get("forecast_value", ""))
+                q5_val = safe_str(quants.get(5, {}).get("forecast_value", ""))
                 q25_val = safe_str(quants.get(25, {}).get("forecast_value", ""))
                 q75_val = safe_str(quants.get(75, {}).get("forecast_value", ""))
+                q95_val = safe_str(quants.get(95, {}).get("forecast_value", ""))
+                q100_val = safe_str(quants.get(100, {}).get("forecast_value", ""))
                 res_source_date = ""
                 res_source = ""
 
             cur_val_obj = current_map.get(dim) or current_map.get("Overall") or {}
             cur_val = safe_str(cur_val_obj.get("value", ""))
+            cur_conf = safe_str(cur_val_obj.get("confidence", ""))
+
+            off_val_obj = official_map.get(dim) or official_map.get("Overall") or {}
+            off_val = safe_str(off_val_obj.get("value", ""))
+            off_date = safe_str(off_val_obj.get("date", ""))
+            off_source = safe_str(off_val_obj.get("source", ""))[:SHEET_TEXT_LIMIT]
 
             row = {
                 "question_name": q_name,
@@ -210,14 +243,24 @@ def build_review_rows(run_data: dict) -> list[list]:
                 "llm_color": color_code,
                 "llm_answer": td_val,
                 "current_estimate": cur_val,
+                "current_estimate_confidence": cur_conf,
+                "q0": q0_val,
+                "q5": q5_val,
                 "q25": q25_val,
                 "q75": q75_val,
+                "q95": q95_val,
+                "q100": q100_val,
                 "resolution_source_date": res_source_date,
                 "resolution_source": res_source,
+                "latest_official_value": off_val,
+                "latest_official_date": off_date,
+                "latest_official_source": off_source,
                 "rationale": rationale,
                 "all_sources": sources,
                 "judge_confidence": confidence,
                 "validation_issues": validation_issues,
+                "missing_data": missing_data,
+                "browser_used": browser_used_str,
                 "review_value": "",
                 "review_source": "",
                 "review_verdict": "",
@@ -241,7 +284,7 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
     client = get_sheets_client()
     sheet = client.open_by_key(sheet_id)
     run_id = run_data.get("run_id", "unknown")
-    tab_name = _run_tab_name(run_id)
+    tab_name = run_tab_name(run_id)
     ws = _create_run_tab(sheet, tab_name)
     rows = build_review_rows(run_data)
 
@@ -252,6 +295,7 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
         _apply_row_validation(sheet, ws.id, start_row, end_row)
         _sort_review_rows(sheet, ws.id)
 
+    _reorder_tabs(sheet)
     return len(rows)
 
 
@@ -303,9 +347,6 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> No
         }
 
     sheet.batch_update({"requests": [
-        _val("reviewed", None),
-        _val("review_verdict", None),
-        _val("review_color", None),
         _val("reviewed", {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}),
         _val("review_verdict", _one_of(VERDICT_OPTIONS)),
         _val("review_color", _one_of(COLOR_OPTIONS)),
@@ -313,8 +354,8 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> No
 
 
 def _format_instructions(sheet, ws) -> None:
-    """Style the Instructions tab: bold title, section headers, and terms; set column widths."""
-    header_prefixes = ("STATUS", "FILL IN", "KEY LLM COLUMNS")
+    """Style the Instructions tab."""
+    section_headers = ("How to review", "Column groups", "Key columns")
 
     def _bold(row_idx: int, col_end: int = 1) -> dict:
         return {"repeatCell": {
@@ -323,73 +364,70 @@ def _format_instructions(sheet, ws) -> None:
             "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
             "fields": "userEnteredFormat.textFormat"}}
 
+    def _section_header(row_idx: int) -> dict:
+        return {"repeatCell": {
+            "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
+                      "startColumnIndex": 0, "endColumnIndex": 2},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.93, "green": 0.93, "blue": 0.93},
+                "textFormat": {"bold": True, "fontSize": 12},
+                "padding": {"top": 4, "bottom": 4, "left": 6, "right": 6}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat,padding)"}}
+
     reqs = [
         {"updateDimensionProperties": {
             "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
             "properties": {"pixelSize": 165}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {
             "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
-            "properties": {"pixelSize": 680}, "fields": "pixelSize"}},
+            "properties": {"pixelSize": 700}, "fields": "pixelSize"}},
+        {"repeatCell": {
+            "range": {"sheetId": ws.id},
+            "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)"}},
         {"repeatCell": {
             "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
-                      "startColumnIndex": 0, "endColumnIndex": 1},
-            "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13}}},
+                      "startColumnIndex": 0, "endColumnIndex": 2},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 16}}},
             "fields": "userEnteredFormat.textFormat"}},
     ]
 
+    def _merge(row_idx: int) -> dict:
+        return {"mergeCells": {
+            "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
+                      "startColumnIndex": 0, "endColumnIndex": 2},
+            "mergeType": "MERGE_ALL"}}
+
     for i, row in enumerate(INSTRUCTIONS_CONTENT):
+        first = (row[0] if row else "").strip() if row else ""
         if i == 0:
+            reqs.append(_merge(i))
             continue
-        first = (row[0] if row else "").strip()
         if not first:
             continue
-        if len(row) >= 2:                          # term / definition row
-            reqs.append(_bold(i))                  # bold the term in col A
-        elif first.startswith(header_prefixes):    # section header
+        if len(row) >= 2:
             reqs.append(_bold(i))
+        elif first in section_headers:
+            reqs.append(_merge(i))
+            reqs.append(_section_header(i))
+        else:
+            reqs.append(_merge(i))
 
     sheet.batch_update({"requests": reqs})
 
 
-# Column widths (pixels), one per REVIEW_HEADERS entry, in the same order.
 _REVIEW_COL_WIDTHS = [
-    180,  # question_name
-    85,   # target_date
-    120,  # dimension
-    115,  # status (derived)
-    95,   # question_type
-    90,   # unit
-    90,   # llm_answer
-    60,   # q25
-    60,   # q75
-    80,   # judge_confidence
-    170,  # validation_issues
-    200,  # judge_reason
-    220,  # rationale
-    160,  # all_sources
-    150,  # resolution_source
-    130,  # resolution_source_date
-    100,  # current_estimate
-    80,   # llm_color
-    110,  # review_verdict
-    90,   # review_value
-    150,  # review_source
-    90,   # review_color
-    180,  # review_notes
-    75,   # reviewed
-    150,  # question_text
-    150,  # resolution_criteria
-    140,  # group_id
-    110,  # question_id
-    110,  # run_id
+    180, 260, 260, 85, 120, 115, 95, 90,
+    90, 55, 55, 55, 55, 55, 55,
+    80, 200, 170, 170, 70, 220, 160,
+    150, 130, 100, 110, 150, 100, 90, 80,
+    110, 90, 150, 90, 180, 75,
+    140, 110, 110,
 ]
 
 
 def _create_run_tab(sheet, tab_name: str):
-    """Create a per-run review tab with bold headers.
-
-    If a tab with this name already exists, it is deleted and recreated so any prior
-    formatting (backgrounds, conditional rules, freezes) does not persist."""
+    """Create a per-run review tab."""
     import gspread
 
     try:
@@ -400,8 +438,6 @@ def _create_run_tab(sheet, tab_name: str):
     ws = sheet.add_worksheet(tab_name, rows=1000, cols=len(REVIEW_HEADERS) + 2)
     ws.update("A1", [REVIEW_HEADERS])
 
-    # Header-row category bands: cue the reader about what each column group is for.
-    # Light backgrounds only; data rows stay plain white.
     def _header_band(start_col: int, end_col: int, r: float, g: float, b: float) -> dict:
         return {
             "repeatCell": {
@@ -422,6 +458,15 @@ def _create_run_tab(sheet, tab_name: str):
 
     format_requests = [
         {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 0},
+                },
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+            }
+        },
+        {
             "repeatCell": {
                 "range": {"sheetId": ws.id},
                 "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP"}},
@@ -435,10 +480,10 @@ def _create_run_tab(sheet, tab_name: str):
                 "fields": "pixelSize",
             }
         },
-        _header_band(0, 6, 0.93, 0.93, 0.93),       # Context: light gray
-        _header_band(6, 18, 0.85, 0.92, 0.98),      # LLM + judge output: light blue
-        _header_band(18, 24, 0.86, 0.94, 0.86),     # Reviewer edits: light green
-        _header_band(24, len(REVIEW_HEADERS), 0.96, 0.96, 0.96),  # Reference: very light gray
+        _header_band(0, 8, 0.93, 0.93, 0.93),
+        _header_band(8, 30, 0.85, 0.92, 0.98),
+        _header_band(30, 36, 0.86, 0.94, 0.86),
+        _header_band(36, len(REVIEW_HEADERS), 0.96, 0.96, 0.96),
         {
             "setBasicFilter": {
                 "filter": {
@@ -496,6 +541,7 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
     rows2 = [list(r) + [""] * (2 - len(r)) for r in INSTRUCTIONS_CONTENT]
     instructions_ws.update("A1", rows2)
     _format_instructions(sheet, instructions_ws)
+    _reorder_tabs(sheet)
     print(f"Instructions tab refreshed: {sheet_id}")
 
 

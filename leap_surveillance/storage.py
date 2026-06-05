@@ -52,7 +52,7 @@ def _first_non_empty(*values):
     return None
 
 
-def forecast_output_row(
+def _forecast_output_row(
     *,
     q_id: str,
     q_name: str,
@@ -249,7 +249,7 @@ def write_csv_output(run_id, questions, responses, output_dir, validations=None)
         if resp is not None:
             response = resp.model_dump(mode="json")
             for forecast in response.get("forecasts", []):
-                row = forecast_output_row(
+                row = _forecast_output_row(
                     q_id=q.id,
                     q_name=q.name,
                     forecast=forecast,
@@ -274,13 +274,9 @@ def write_csv_output(run_id, questions, responses, output_dir, validations=None)
     return str(path)
 
 
-PROJECT = DEFAULT_BQ_PROJECT
-SURVEILLANCE_DATASET = DEFAULT_SURVEILLANCE_DATASET
-
-
-def get_client() -> bigquery.Client:
+def _get_client() -> bigquery.Client:
     credentials, _ = default()
-    return bigquery.Client(credentials=credentials, project=PROJECT)
+    return bigquery.Client(credentials=credentials, project=DEFAULT_BQ_PROJECT)
 
 
 def query_bq(
@@ -291,7 +287,7 @@ def query_bq(
 ) -> pd.DataFrame:
     """Run a query without requiring the BigQuery Storage Read API."""
     timeout_s = float(os.environ.get("LEAP_BQ_TIMEOUT", "120"))
-    client = get_client()
+    client = _get_client()
     job_config = None
     if query_parameters:
         job_config = bigquery.QueryJobConfig(query_parameters=list(query_parameters))
@@ -300,7 +296,7 @@ def query_bq(
     return job.to_dataframe(create_bqstorage_client=use_bqstorage, timeout=timeout_s)
 
 
-def merge_bq(
+def _merge_bq(
     df: pd.DataFrame,
     pk: str,
     dataset: str,
@@ -321,9 +317,9 @@ def merge_bq(
         df = df.copy()
         df[clock_col] = datetime.now(timezone.utc)
 
-    client = get_client()
-    target = f"{PROJECT}.{dataset}.{table}"
-    temp = f"{PROJECT}.{dataset}.{table}_staging_{uuid4().hex}"
+    client = _get_client()
+    target = f"{DEFAULT_BQ_PROJECT}.{dataset}.{table}"
+    temp = f"{DEFAULT_BQ_PROJECT}.{dataset}.{table}_staging_{uuid4().hex}"
 
     if create_target_if_missing:
         try:
@@ -388,7 +384,7 @@ def merge_bq(
             pass
 
 
-def try_merge_bigquery_rows(
+def _try_merge_bigquery_rows(
     label: str,
     rows: list[dict],
     *,
@@ -409,7 +405,7 @@ def try_merge_bigquery_rows(
                 df[col] = df[col].astype(dtype)
 
     try:
-        return merge_bq(
+        return _merge_bq(
             df,
             pk=pk,
             dataset=dataset,
@@ -443,7 +439,7 @@ def write_surveillance_to_bigquery(run_data: dict) -> dict:
                 forecast.get("dimension"),
                 forecast.get("quantile"),
             )
-            row = forecast_output_row(
+            row = _forecast_output_row(
                 q_id=q_id,
                 q_name=question.get("name"),
                 forecast=forecast,
@@ -520,7 +516,6 @@ def write_surveillance_to_bigquery(run_data: dict) -> dict:
                 "ingestion_timestamp": datetime.now(timezone.utc),
             })
 
-    # Use the same summary block as stdout and local artifacts.
     summary = run_data.get("summary") or {}
     run_rows = [{
         "run_id": run_id,
@@ -550,40 +545,33 @@ def write_surveillance_to_bigquery(run_data: dict) -> dict:
     }
 
     return {
-        "results": try_merge_bigquery_rows(
+        "results": _try_merge_bigquery_rows(
             "BigQuery results", result_rows,
-            pk="result_id", dataset=SURVEILLANCE_DATASET, table="surveillance_result",
+            pk="result_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_result",
             clock_col="ingestion_timestamp", dtypes=result_dtypes,
         ),
-        "evidence": try_merge_bigquery_rows(
+        "evidence": _try_merge_bigquery_rows(
             "BigQuery evidence", evidence_rows,
-            pk="evidence_id", dataset=SURVEILLANCE_DATASET, table="surveillance_evidence",
+            pk="evidence_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_evidence",
             clock_col="ingestion_timestamp",
         ),
-        "runs": try_merge_bigquery_rows(
+        "runs": _try_merge_bigquery_rows(
             "BigQuery run", run_rows,
-            pk="run_id", dataset=SURVEILLANCE_DATASET, table="surveillance_run",
+            pk="run_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_run",
             clock_col="ingestion_timestamp",
         ),
     }
 
 
-def get_existing_result_ids_for_groups(group_ids: list[str]) -> dict[str, list[tuple[str, int]]]:
-    """Find all surveillance_result rows whose result_id begins with one of the group prefixes.
-
-    Returns {group_id: [(result_id, quantile), ...]}. Reads directly from BQ rather than
-    synthesizing IDs from the surveillance pipeline's FULL_QUANTILES convention. This lets sync
-    work correctly for every question type (probability writes only q=50, quantile/when write 7)
-    without phantom-skip warnings, and adapts automatically if the pipeline's expected quantile
-    set ever changes.
-    """
+def _get_existing_result_ids_for_groups(group_ids: list[str]) -> dict[str, list[tuple[str, int]]]:
+    """Find existing result rows for reviewed Sheet groups."""
     if not group_ids:
         return {}
 
     prefixes = [f"{g}_" for g in group_ids]
     query = f"""
     SELECT result_id
-    FROM `{PROJECT}.{SURVEILLANCE_DATASET}.surveillance_result`
+    FROM `{DEFAULT_BQ_PROJECT}.{DEFAULT_SURVEILLANCE_DATASET}.surveillance_result`
     WHERE EXISTS (
         SELECT 1
         FROM UNNEST(@prefixes) AS prefix
@@ -618,7 +606,7 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
     reviewed_at = datetime.now(timezone.utc)
 
     unique_groups = list({item.get("group_id", "") for item in reviewed_items if item.get("group_id")})
-    existing_by_group = get_existing_result_ids_for_groups(unique_groups)
+    existing_by_group = _get_existing_result_ids_for_groups(unique_groups)
 
     pending_rows = []
     missing_groups: list[str] = []
@@ -679,9 +667,9 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
         return {"results": None, "skipped": skipped}
 
     return {
-        "results": try_merge_bigquery_rows(
+        "results": _try_merge_bigquery_rows(
             "BigQuery results (review update)", rows,
-            pk="result_id", dataset=SURVEILLANCE_DATASET, table="surveillance_result",
+            pk="result_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_result",
             clock_col="ingestion_timestamp",
         ),
         "skipped": skipped,

@@ -20,7 +20,7 @@ from .storage import (
     write_surveillance_to_bigquery,
 )
 from .sheets import (
-    _run_tab_name,
+    run_tab_name,
     get_reviewed_items,
     publish_to_sheet,
     setup_sheet,
@@ -279,7 +279,7 @@ def cmd_run(args):
     if not args.no_sheet:
         try:
             n = publish_to_sheet(run_data, DEFAULT_SHEET_ID)
-            print(f"Published {n} rows to Sheet tab '{_run_tab_name(run_id)}'")
+            print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}'")
         except Exception as e:
             print(f"Sheet publishing failed: {e}")
 
