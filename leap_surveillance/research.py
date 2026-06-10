@@ -56,8 +56,8 @@ DEFAULT_REASONING_EFFORT = "high"
 
 BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
 MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
-BROWSER_EVIDENCE_LIMIT = 4000
-RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 300.0)
+BROWSER_EVIDENCE_LIMIT = _env_int("LEAP_BROWSER_EVIDENCE_LIMIT", 4000)
+RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 600.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 1)
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
@@ -73,7 +73,9 @@ _BROWSER_SEMAPHORE = threading.Semaphore(1)
 QUANTILE_INTERPRETATION_FULL = """Quantile interpretation:
 Return exactly seven forecast entries for each date/dimension: q0, q5, q25, q50, q75, q95, and q100.
 
-Use q0 and q100 as feasibility bounds, not ordinary probabilistic quantiles. q0 is the lowest coherent value given current constraints; q100 is the highest coherent value. For bounded metrics, use natural bounds where appropriate. For cumulative metrics, q0 should not be below the latest known value.
+q0 and q100 are feasibility bounds, not ordinary probabilistic quantiles.
+- q0 is the lowest value still possible given current constraints. Use the natural unit lower bound (e.g., 0 for a percent or count). For a cumulative or never-decreasing metric, use the latest known value as the floor.
+- q100 is the highest value still possible given current constraints. Use the natural unit upper bound if one exists (e.g., 100 for a percent). If there is no natural upper bound, use a high but coherent practical-tail value (a 99.99th-percentile scenario).
 
 Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
 
@@ -81,40 +83,48 @@ Do not return all -999 values because the future is uncertain. Use -999 only whe
 
 
 QUANTILE_INTERPRETATION_BRIEF = """Quantile interpretation:
-You must return exactly seven forecast entries for each date/dimension combination, one for each quantile: 0, 5, 25, 50, 75, 95, and 100.
+Return exactly seven forecast entries for each date/dimension combination, one for each quantile: 0, 5, 25, 50, 75, 95, and 100.
 
 All seven quantile forecast values must be valid numbers and non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by feasibility bounds or high confidence.
 
 Quantile meanings:
-- q=0: Absolute minimum feasible value (physical bound, or current value for a cumulative metric)
-- q=5, 25, 50, 75, 95: Probability distribution (q=50 is your median/best estimate)
-- q=100: Absolute maximum feasible value (natural upper bound or practical limit)"""
+- q=0: Lowest value still possible. Use the natural unit lower bound, or the latest known value for a cumulative metric that cannot decrease.
+- q=5, 25, 50, 75, 95: Probability distribution (q=50 is your median/best estimate).
+- q=100: Highest value still possible. Use the natural unit upper bound, or a 99.99th-percentile scenario if no natural bound exists.
+
+Use -999 only when no reasonable estimate is possible for a specific value."""
 
 
 COLOR_CODE_SYSTEM_FULL = """Color coding:
 Assign one color_code per date/dimension combination, using the same color for all quantiles in that group.
 
-- black: resolved - an authoritative value for this date/dimension is available, or a development definitively resolves it. A past date alone does not make a group black; if the date has passed but no authoritative value exists yet (never measured, not published, or only later sources), use the non-black color that reflects your remaining uncertainty.
+- black: resolved - use only when the group has a source-backed value in resolution_values, or a development definitively resolves it. A past date alone is not enough; if no authoritative value exists yet, use the non-black color that reflects your remaining uncertainty.
 - dark gray: new evidence changes the feasible range; some previously possible values are now impossible
 - light gray: the full natural range is still feasible, but monotonic change makes part of it implausible for the interior quantiles
 - white: the full natural range remains feasible and there is not enough information to narrow it
 
-Color reflects how much uncertainty has collapsed, not whether the date is past or future. Use black only when the row has a resolved value. If color_code is black for a date/dimension group, all quantile values in that group must be identical.
+Color reflects how much uncertainty has collapsed, not whether the date is past or future. If color_code is black for a date/dimension group, all quantile values in that group must be identical.
 
-Explain the color choice in the rationale."""
+Use the same gray shade across non-black future dates unless a physical or definitional reason restricts an earlier date that does not apply to later ones.
+
+Explain the color choice in the rationale. For dark gray or light gray, name the specific report, data point, or finding that justifies the choice."""
 
 
 COLOR_CODE_SYSTEM_BRIEF = """Color coding:
-- black: resolved - authoritative value available (a past date alone is not enough)
+- black: resolved - authoritative value available in resolution_values (a past date alone is not enough)
 - dark gray: feasible range changed; part of the previous range is now impossible
 - light gray: full range remains feasible, but part is implausible because of monotonic expectations
-- white: full natural range remains feasible; no monotonicity assumptions"""
+- white: full natural range remains feasible; no monotonicity assumptions
+
+For dark gray or light gray, name the specific report, data point, or finding in the rationale."""
 
 
 RESEARCH_PRINCIPLES = """Research principles:
 - Match the period. When a value is tied to a specific date or period, find the value as of that period and prefer sources from that period; include the period in your searches. Do not substitute a value from a different time than the one asked about.
 - Use central estimates. Report a point estimate or stated central value, not an interval bound or range endpoint. If a source gives a range or confidence interval, use its midpoint or stated central value, and say which you used in your rationale.
+- Match the unit. Report all values in the question's stated unit. If units are percent, report percentages (e.g. 58.3), not decimals (0.583). For dollar metrics, respect the denomination - USD ($), USD ($ Millions), or USD ($ Billions).
 - Respect scope. If the metric is limited to a particular category, track, subset, or population, confirm each source matches that scope, and note in your rationale what you included and excluded.
+- Use base rates where available. When the metric has historical data or a clear reference class, use it as an anchor for the forecast. If your forecast departs materially from that history or reference class, say why.
 - Build aggregates exactly as the question defines them. If the metric is an average, sum, or index over components, gather each component and compute it yourself rather than copying a headline figure; list the components used. Combine them using the method the question's resolution criteria specifies; impose no default weighting of your own. When the component structure is ambiguous (e.g., a benchmark reports multiple sub-scores or tiers and the criteria doesn't say how they roll up), state the assumption you made and flag it explicitly in your rationale.
 - Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer -999 (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
 
@@ -146,7 +156,9 @@ def _extract_text_from_response(response) -> str:
             for content in content_list:
                 content_type = content.get("type") if isinstance(content, dict) else getattr(content, "type", None)
                 if content_type == "output_text":
-                    return content.get("text") if isinstance(content, dict) else content.text
+                    text = content.get("text") if isinstance(content, dict) else content.text
+                    if text:
+                        return text
     raise RuntimeError("No text output found in response")
 
 
@@ -159,7 +171,7 @@ def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
 
 def _resolution_guidance(question: QuestionSpec) -> str:
     if not any(f.value_type == "resolution" for f in question.expected_forecasts):
-        return "No requested forecast rows are past resolution dates. Return resolution_values as an empty list."
+        return "No requested forecast rows are past resolution dates. Return an empty resolution_values list unless a future target date has already resolved early."
 
     return """Resolution value guidance:
 Some requested rows have value_type="resolution": their target date has passed, so try to find the metric's authoritative value as of that exact target date. A past date does not guarantee that a resolved value exists.
@@ -189,7 +201,10 @@ Return exactly seven forecast entries for each expected row: quantiles 0, 5, 25,
 
 All seven timing quantiles must be present, non-null, and non-decreasing. If the event has not yet occurred, q=0 should usually be the current year as the earliest feasible occurrence year.
 
-If you believe the event could literally never occur (p(never) ≥ 5%), use 9999 as the q100 year — it is a sentinel meaning "never", not a literal year. For events that are long-tail-but-finite (likely beyond 2100 but plausible eventually), use a real far-future year such as 2200, 2300, or 2500. Do not reach for 9999 as a default upper bound; only use it when you genuinely believe the event might never occur. Multiple upper quantiles can be 9999 only if they truly all represent the "never" judgment and strict monotonicity is preserved (e.g., q95=9999 only if q100=9999 too).
+If p(never) is at least 5%, use 9999 as the q100 year. 9999 is a sentinel meaning "never", not a literal year.
+For events that are long-tail-but-finite, use a real far-future year such as 2200, 2300, or 2500.
+Do not use 9999 as a default upper bound. Use it only when the event might never occur.
+Multiple upper quantiles can be 9999 only if they all represent that same "never" judgment and monotonicity is preserved (e.g., q95=9999 only if q100=9999 too).
 
 Latest official values and current estimates are not applicable for this question type. For those value fields, use -999 and set confidence=0.
 
@@ -207,7 +222,7 @@ def _research_schema(question: QuestionSpec) -> dict:
     )
 
 
-def research(
+def research_question(
     question: QuestionSpec,
     model: str = DEFAULT_MODEL,
     retry_on_truncation: bool = True,
@@ -216,6 +231,9 @@ def research(
     test_mode: bool = False,
     costs: RunCost | None = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    if test_mode:
+        model = TEST_MODEL
+
     run_date = datetime.now(timezone.utc).date().isoformat()
     prompt = f"""You are a research analyst. Use web search to find the relevant evidence, then produce a structured forecast.
 
@@ -230,10 +248,10 @@ Expected forecast rows:
 {_expected_forecast_lines(question.expected_forecasts)}
 
 Task:
-1. Find the latest official value for the metric, including date and source.
-2. Estimate the current value as of the run date. This may differ from the latest official value if the metric has changed.
+1. Find the latest official value for the metric, including date and source. Do not guess. If no exact official value exists, use the closest quasi-official value that the background or resolution criteria clearly point to, and say so in the rationale.
+2. Estimate the current value as of the run date: if the question resolved today, what value would you score the forecast against? This may differ from the latest official value and can combine the latest data point, current reporting, and reasonable extrapolation.
 3. For past target dates, report a resolution value only when an authoritative source supports it. If no such value exists, leave it unresolved rather than guessing one.
-4. Generate forecast rows for every expected date/quantile listed above.
+4. Generate forecast rows for every expected date/dimension/quantile listed above.
 5. Provide structured sources with url, title, and snippet.
 
 {RESEARCH_PRINCIPLES}
@@ -253,7 +271,7 @@ Requirements:
 - Quantile forecasts must be non-decreasing.
 - If unit bounds are provided, forecast values must respect them unless the question text explicitly overrides them.
 - For each source: include url, title, and a key snippet.
-- Do not anchor on existing LEAP forecasts; form independent estimates."""
+- Do not anchor on existing LEAP forecasts. If LEAP forecasts or analyses appear in web search results, do not review or copy them; form your estimates independently."""
 
     schema = _research_schema(question)
 
@@ -297,11 +315,11 @@ Requirements:
     text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
 
     try:
-        strict_response = StrictSurveillanceResponse.model_validate_json(text)
+        return strict_to_regular_response(text, question.expected_forecasts)
     except Exception as e:
         if retry_on_truncation and attempt < 3 and "EOF while parsing" in str(e):
             print(f"    truncation retry {attempt + 1}/3 ({len(text)} chars)...")
-            return research(
+            return research_question(
                 question,
                 model,
                 retry_on_truncation,
@@ -311,8 +329,6 @@ Requirements:
             )
         print(f"    validation error (raw text[:500]): {text[:500]}")
         raise
-
-    return strict_to_regular_response(strict_response, question.expected_forecasts)
 
 
 def _format_evidence_for_judge(evidence: list[EvidenceItem]) -> str:
@@ -405,7 +421,9 @@ def evaluate_adequacy(
     forecasts_summary = _format_forecasts_for_judge(response)
     context_values_summary = _format_context_values_for_judge(response)
 
-    prompt = f"""Evaluate whether this surveillance response is adequate for review.
+    prompt = f"""Find concrete problems with this surveillance response.
+
+Do not give a general quality rating. Look for specific review-blocking issues. If you find a problem, add a concise item to issues[] naming the failure mode and the affected value, source, date, or forecast row. If you find no concrete problems, leave issues[] empty.
 
 Question: {question.name}
 Question details:
@@ -426,32 +444,30 @@ Generated forecasts:
 Sources:
 {sources_summary}
 
-Resolution rows (value_type=resolution) have two valid outcomes:
-- Resolved: an authoritative value for the target date was found. The group should be color_code=black with all quantiles equal to that value. Do not flag identical black quantiles as a problem.
-- Unresolved: no authoritative as-of-date value exists because the metric was never measured, is not yet published, or only post-target-date sources exist. A non-black estimate distribution with no resolution value is acceptable.
+Look for these failure modes:
+1. STALE DATA: The cited source value is older than the source's own update cadence. Compare the source's date against how often that source updates, not against the question's resolution date. Examples: monthly data last reported 12+ months ago, quarterly data last reported a year ago, a live leaderboard cited from an old archive snapshot, or an annual figure where the newer year's value has already been released. Do not flag a value as stale simply because it is recent, or because the resolution date is far in the future. Do not flag annual data merely because the latest year has not been published yet.
+2. EXTRACTION FAILURE: The rationale says a specific dashboard, page, leaderboard, table, or live source could not be read, rendered, retrieved, or extracted, and no adequate alternative source gives the same metric, period, and scope. Treat varied wording as evidence of this problem, including "JavaScript-rendered", "not directly retrievable", "returned 404", "would not load", "could not retrieve", "could not see", "did not expose", "not visible", or "used an archive snapshot instead".
+3. SCOPE MISMATCH: A cited source reports a different period, category, benchmark split, population, geography, unit, or subset than the question asks for.
+4. UNSUPPORTED CLAIM: A specific numeric claim in the rationale is not supported by the source snippets or listed evidence.
+5. STRUCTURAL DEFECT: Expected forecast rows are missing, quantiles are non-monotonic, probability values are not on a 0-100 scale, unit bounds are violated, or the response changes the requested dates/dimensions/quantiles. By design, q0 and q100 are feasibility bounds, not credible-interval extremes — q0 at the natural unit floor (e.g., 0 for a percent or count), q100 at the natural unit ceiling (e.g., 100 for a percent), and q100=9999 for timing questions (the "never" sentinel) are all expected and must not be flagged.
+6. RESOLUTION DEFECT: A past target-date row is black/resolved without an authoritative as-of-date value, uses a post-target-date value as if it were the target-date value, or fabricates a resolution. If no authoritative as-of-date value exists, a non-black estimate distribution is acceptable.
 
-Flag a resolution row when it is black but unsupported, fabricated, based on a post-target-date source, or otherwise appears wrong.
+Adequacy rule:
+- Set adequate=false if issues[] is non-empty.
+- Set adequate=true only if issues[] is empty.
 
-Evaluation criteria:
-- Are the sources authoritative and appropriate for this question?
-- Do the cited sources report the value for the period and scope the question asks about? A relevant source is not enough if it reports a different time period, category, or subset.
-- Do the source snippets actually support the specific claims in the rationale?
-- Are the unit, scale, and bounds correct? Probabilities must be on a 0-100 scale.
-- Is the rationale well-grounded in the cited evidence (not just plausible-sounding)?
-- If the rationale says a specific dashboard or page did not expose needed values, did the response use an adequate alternative source for the same metric, period, and scope? If not, treat it as a data gap.
-- Are all expected forecast rows present (no missing date/dimension/quantile combinations)?
-- For forecast rows: are quantiles non-decreasing and internally consistent across time horizons?
-- Are there material data gaps?
+Confidence (0-100) is how sure you are about your own review, not about whether the forecast will come true. Start at 90 for a clean response with authoritative sources and lower it for each of:
+- The staleness or scope call required judgment (no clear update cadence, ambiguous geography or subset) — lower by 10-15.
+- Only some of the rationale's numeric claims are traceable to listed sources — lower by 10-20.
+- Sources are sparse (one or two), or you cannot tell whether a cited dashboard was actually read — lower by 10-15.
+- The metric is fuzzy or the question's resolution criteria leave room for interpretation — lower by 5-10.
+Use the full 0-100 range. Identical numbers across questions suggest you are not actually distinguishing them.
 
-Confidence means confidence in the response's evidence, interpretation, row completeness, and methodology. It is not confidence that a future forecast will come true. A well-supported long-range forecast can have high methodology confidence even though the future outcome is uncertain.
-
-Set adequate=true only if the response meets the criteria above. Set adequate=false if any criterion fails. Base confidence on whether the evidence and rationale substantiate the method and values well enough for review, not on the mere presence of sources or inherent future uncertainty. If methodology/evidence confidence is below {MIN_ADEQUATE_CONFIDENCE}, set adequate=false even when the answer is structurally complete.
-
-List ONLY concrete problems in issues[] — gaps, errors, contradictions, missing data, wrong scope, fabricated values, unsupported claims. Do NOT include affirmative observations like "sources are authoritative", "forecasts are complete", "rationale is well-grounded", "correctly cited", or "transparent methodology". If there are no problems, leave issues[] empty. Provide a brief reason for the overall judgment in `reason`."""
+Put only concrete problems in issues[]. Keep each issue to one sentence. Do not include praise or affirmative observations such as "sources are authoritative", "forecasts are complete", or "rationale is well-grounded". Provide a brief reason explaining the issue list and adequacy decision."""
 
     eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
     try:
-        return _call_structured_judge(prompt, AdequacyAssessment, eval_model, 1500, "judge_stage1", costs)
+        return _call_structured_judge(prompt, AdequacyAssessment, eval_model, 6000, "judge_stage1", costs)
     except Exception as e:
         # On evaluator failure, mark inadequate so a human reviewer is alerted.
         return AdequacyAssessment(
@@ -505,10 +521,8 @@ Browser automation is not useful for:
 
 Decide:
 - Set browser_would_help=true only if browser scraping a specific URL would plausibly fix the identified issue.
-- If yes, propose a specific browser_url (not a search engine, not a private/local IP) and a concrete browser_objective ("Extract the X value from the Y table").
-- If no, set browser_would_help=false and leave browser_url empty. Explain briefly in reason.
-
-Do not propose search engines (google.com, bing.com, etc.), localhost, or private/internal IPs. These are blocked by the pipeline's URL safety filter."""
+- If yes, propose a specific browser_url and a concrete browser_objective ("Extract the X value from the Y table").
+- If no, set browser_would_help=false and leave browser_url empty. Explain briefly in reason."""
 
     eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
     try:
@@ -518,7 +532,7 @@ Do not propose search engines (google.com, bing.com, etc.), localhost, or privat
             if not url:
                 return BrowserDecision(
                     browser_would_help=False,
-                    reason=f"Browser was recommended but no URL was provided. Original reason: {decision.reason}",
+                    reason=f"Browser recommended but no URL provided (judge said: {decision.reason})",
                 )
             safe, reason = is_safe_url(url)
             if not safe:
@@ -526,7 +540,7 @@ Do not propose search engines (google.com, bing.com, etc.), localhost, or privat
                     browser_would_help=False,
                     browser_url=url,
                     browser_objective=decision.browser_objective,
-                    reason=f"Browser URL rejected by safety filter ({reason}). Original reason: {decision.reason}",
+                    reason=f"Browser URL rejected by safety filter ({reason}); judge had said: {decision.reason}",
                 )
         return decision
     except Exception as e:
@@ -536,47 +550,16 @@ Do not propose search engines (google.com, bing.com, etc.), localhost, or privat
         )
 
 
-_AFFIRMATIVE_ISSUE_MARKERS = (
-    "sources are authoritative",
-    "all expected forecast rows",
-    "well-grounded",
-    "transparent and",
-    "rationale is well",
-    "correctly cited",
-    "are present with consistent",
-    "appropriate authoritative",
-    "are authoritative and relevant",
-)
-
-
-def _filter_affirmative_issues(issues: list[str]) -> list[str]:
-    """Drop affirmative observations the judge wrote into issues[] against instruction."""
-    filtered = []
-    for item in issues or []:
-        if not isinstance(item, str):
-            filtered.append(item)
-            continue
-        lowered = item.lower()
-        if any(marker in lowered for marker in _AFFIRMATIVE_ISSUE_MARKERS):
-            continue
-        filtered.append(item)
-    return filtered
-
-
-def evaluate_response_quality(
+def judge_response(
     response: SurveillanceResponse,
     question: QuestionSpec,
     evidence: list[EvidenceItem],
     test_mode: bool = False,
     costs: RunCost | None = None,
+    propose_browser: bool = True,
 ) -> ResearchQualityReport:
+    # Pass propose_browser=False on a re-judge to skip the second judge call.
     adequacy = evaluate_adequacy(response, question, evidence, test_mode=test_mode, costs=costs)
-    adequacy = AdequacyAssessment(
-        adequate=adequacy.adequate,
-        confidence=adequacy.confidence,
-        issues=_filter_affirmative_issues(adequacy.issues),
-        reason=adequacy.reason,
-    )
 
     if adequacy.adequate and adequacy.confidence < MIN_ADEQUATE_CONFIDENCE:
         adequacy = AdequacyAssessment(
@@ -592,9 +575,9 @@ def evaluate_response_quality(
             ),
         )
 
-    if adequacy.adequate:
+    if adequacy.adequate or not propose_browser:
         return ResearchQualityReport(
-            adequate=True,
+            adequate=adequacy.adequate,
             confidence=adequacy.confidence,
             missing_data=adequacy.issues,
             browser_would_help=False,
@@ -667,7 +650,11 @@ Expected forecast rows: {_expected_forecast_lines(question.expected_forecasts)}
 {COLOR_CODE_SYSTEM_BRIEF}
 
 Instructions:
-Integrate the new browser data to improve the forecasts and resolution values. Preserve original values unless the browser data is more relevant or contradicts them. If the browser data only shows that a dashboard does not expose the needed value, say that in the rationale and keep the original forecast distribution unless the original was directly contradicted. Return exactly the expected rows. The system assigns value_type from those rows. Use -999 only when no defensible estimate is possible.
+- Use the browser data when it is more relevant than, or directly contradicts, the original response.
+- Preserve original values when the browser data does not address them.
+- If the browser data only shows that a dashboard does not expose the needed value, say so in the rationale and keep the original forecast distribution unless it was directly contradicted.
+- Return exactly the expected rows. The system assigns value_type from those rows.
+- Use -999 only when no defensible estimate is possible.
 
 {RATIONALE_REQUIREMENTS}"""
 
@@ -697,8 +684,7 @@ Integrate the new browser data to improve the forecasts and resolution values. P
             costs.refinement += _response_cost(response, model)
         text = _extract_text_from_response(response)
         text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
-        strict_resp = StrictSurveillanceResponse.model_validate_json(text)
-        refined_response, _ = strict_to_regular_response(strict_resp, question.expected_forecasts)
+        refined_response, _ = strict_to_regular_response(text, question.expected_forecasts)
         return refined_response
     except Exception as e:
         print(f"  Refinement failed, keeping original: {e}")
@@ -799,6 +785,7 @@ def browser_extract(
         # Prefer final result; full histories include transient errors.
         extracted = getattr(result, "final_result", lambda: None)() or ""
 
+        # browser-use sometimes returns its own error text instead of raising.
         failure_markers = [
             "Invalid schema for response_format",
             "Stopping due to 3 consecutive failures",

@@ -15,10 +15,9 @@ Required in `.env`:
 
 ```text
 OPENAI_API_KEY
-OPENAI_SAFETY_IDENTIFIER
 ```
 
-Optional config (sheet ID, BQ project, model overrides) is documented in `.env.example`.
+Optional config (safety identifier, sheet ID, BQ project, model overrides) is documented in `.env.example`.
 
 ## Run
 

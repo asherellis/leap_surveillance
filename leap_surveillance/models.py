@@ -152,6 +152,8 @@ class SurveillanceResponse(BaseModel):
     sources: list[str]
 
 
+# Strict* models describe the LLM JSON output. The runtime models above use
+# nullable values, flattened source URLs, and system-assigned forecast value_type.
 class StrictOfficialValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
@@ -253,9 +255,12 @@ def _convert_sentinel_value(v: float) -> Optional[float]:
 
 
 def strict_to_regular_response(
-    strict: StrictSurveillanceResponse,
+    strict: StrictSurveillanceResponse | str,
     expected_forecasts: Optional[list[ExpectedForecast]] = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    if isinstance(strict, str):
+        strict = StrictSurveillanceResponse.model_validate_json(strict)
+
     evidence = [
         EvidenceItem(source_type="web_search", url=s.url, title=s.title, snippet=s.snippet)
         for s in strict.sources
@@ -268,10 +273,9 @@ def strict_to_regular_response(
         (rv.forecast_date, rv.dimension): _convert_sentinel_value(rv.value)
         for rv in strict.resolution_values
     }
-    expected_resolution_keys = {
+    expected_date_dim_keys = {
         (e.forecast_date, e.dimension)
         for e in expected_forecasts or []
-        if e.value_type == "resolution"
     }
 
     forecasts = []
@@ -325,7 +329,7 @@ def strict_to_regular_response(
             )
             for rv in strict.resolution_values
             if expected_forecasts is None
-            or (rv.forecast_date, rv.dimension) in expected_resolution_keys
+            or (rv.forecast_date, rv.dimension) in expected_date_dim_keys
         ],
         forecasts=forecasts,
         rationale=strict.rationale,
@@ -404,16 +408,28 @@ def validate_response(
                 issues.append(f"quantiles_not_increasing_{key[0]}_{key[1]}")
                 break
 
+    resolution_keys = {
+        (r.forecast_date, r.dimension)
+        for r in response.resolution_values
+        if r.value is not None and r.source
+    }
     black_groups = defaultdict(list)
+    black_color_groups = set()
     group_colors = defaultdict(set)
     for f in response.forecasts:
         group_colors[(f.forecast_date, f.dimension)].add(f.color_code.value)
-        if f.color_code.value == "black" and f.forecast_value is not None:
-            black_groups[(f.forecast_date, f.dimension)].append(f.forecast_value)
+        if f.color_code.value == "black":
+            key = (f.forecast_date, f.dimension)
+            black_color_groups.add(key)
+            if f.forecast_value is not None:
+                black_groups[key].append(f.forecast_value)
 
     for key, values in black_groups.items():
         if len({round(v, 12) for v in values}) > 1:
             issues.append(f"black_quantiles_differ_{key[0]}_{key[1]}")
+    for key in black_color_groups:
+        if key not in resolution_keys:
+            issues.append(f"black_without_resolution_value_{key[0]}_{key[1]}")
     for key, colors in group_colors.items():
         if len(colors) > 1:
             issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")

@@ -102,7 +102,21 @@ def _expected_forecasts(
     ]
 
 
-def load_questions(limit=None) -> list[QuestionSpec]:
+DEV_QUESTION_IDS = (
+    "b08de26c49ee71b135534e09057cc8323168477d0383c505fac80f50504345c3",  # LiveCodeBench Pro (quantile, browser)
+    "5010797e20c65f4635321a01a81fe08e297b15c0abaddc5a4be474824a435856",  # Labor Share (quantile, big grid)
+    "6bf9bae3e8b4d3c1a5fe0c48af99b1941bbf1aa61f2173e75e4b6f2db0e3a9ef",  # U.S. and China Military Agreement (probability)
+    "147346ac17bb49d1d0ae6b0894f1d96b803ed5d1d315f7dddb5130799cb52714",  # Coffee Test (when / timing)
+    "10a514657ba6e075f831ef8d5e4635ffd9003f24e0f6a2e4db8f95999c98bfeb",  # U.S. versus China Polarity (multi-dim)
+)
+
+
+def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
+
+    dev_filter = ""
+    if dev:
+        ids = ", ".join(f'"{qid}"' for qid in DEV_QUESTION_IDS)
+        dev_filter = f"AND qg.question_group_id IN ({ids})"
 
     query = f"""
     WITH forecast_groups AS (
@@ -111,6 +125,7 @@ def load_questions(limit=None) -> list[QuestionSpec]:
         JOIN `{DEFAULT_BQ_PROJECT}.dim.dim_question` q
             ON qg.question_group_id = q.question_group_id
         WHERE q.project_id = 'leap' AND q.question_type = 'forecast'
+        {dev_filter}
         GROUP BY qg.question_group_id, qg.question_group_name
         ORDER BY qg.question_group_name
         {"LIMIT " + str(limit) if limit else ""}
