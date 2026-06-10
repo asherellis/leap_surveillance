@@ -69,9 +69,7 @@ def _forecast_output_row(
     official_value = official.get(dim) or official.get("Overall") or {}
     current_value = current.get(dim) or current.get("Overall") or {}
     resolution_value = resolution.get((forecast_date, dim)) or resolution.get((forecast_date, "Overall")) or {}
-    # Route the value by whether the row actually resolved (black), not by the date-based
-    # value_type: a past-dated "due_unresolved" row is a gray estimate, so its quantiles are
-    # captured as forecast values.
+    # Route by whether the row resolved (black), not by date — past-dated unresolved rows are still gray estimates.
     color = forecast.get("color_code", "")
     is_resolved = getattr(color, "value", color) == "black"
     target_value_type = "resolution" if is_resolved else "forecast"
@@ -125,6 +123,7 @@ def build_run_data(
     quality_reports,
     costs_list=None,
     browser_useds=None,
+    browser_statuses=None,
     errors_list=None,
 ) -> dict:
     expected_len = len(questions)
@@ -135,6 +134,7 @@ def build_run_data(
         "quality_reports": quality_reports,
         "costs_list": costs_list,
         "browser_useds": browser_useds,
+        "browser_statuses": browser_statuses,
         "errors_list": errors_list,
     }
     for name, values in by_name.items():
@@ -143,10 +143,11 @@ def build_run_data(
 
     costs_iter = costs_list or [None] * len(questions)
     browser_iter = browser_useds or [None] * len(questions)
+    status_iter = browser_statuses or ["not_proposed"] * len(questions)
     errors_iter = errors_list or [None] * len(questions)
     results = []
-    for q, resp, val, ev, qr, costs, browser_used, error in zip(
-        questions, responses, validations, evidences, quality_reports, costs_iter, browser_iter, errors_iter
+    for q, resp, val, ev, qr, costs, browser_used, browser_status, error in zip(
+        questions, responses, validations, evidences, quality_reports, costs_iter, browser_iter, status_iter, errors_iter
     ):
         result = {
             "id": q.id,
@@ -159,6 +160,7 @@ def build_run_data(
             "resolution_criteria": q.resolution_criteria,
             "background_info": q.background_info,
             "browser_used": bool(browser_used),
+            "browser_status": browser_status or "not_proposed",
             "response": resp.model_dump(mode="json") if resp is not None else None,
         }
         if error:
@@ -220,6 +222,9 @@ def _summarize_run(results: list[dict], responses: list, costs_iter: list) -> di
     return {
         "question_count": len(results),
         "ok_count": sum(1 for r in results if (r.get("validation") or {}).get("ok")),
+        "quality_issue_count": sum(
+            1 for r in results if (r.get("quality") or {}).get("adequate") is False
+        ),
         "error_count": sum(1 for r in results if r.get("error")),
         "browser_count": sum(1 for r in results if r.get("browser_used")),
         "due_unresolved_count": due_unresolved,
@@ -667,7 +672,11 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
     rows = pending_rows
     skipped = len(missing_groups)
     if skipped > 0:
-        print(f"  warning: {skipped} reviewed group(s) had no rows in surveillance_result; skipped: {missing_groups[:3]}{'...' if skipped > 3 else ''}")
+        preview = f"{missing_groups[:3]}{'...' if skipped > 3 else ''}"
+        print(
+            f"  warning: {skipped} reviewed group(s) had no rows in "
+            f"surveillance_result; skipped: {preview}"
+        )
 
     if not rows:
         return {"results": None, "skipped": skipped}

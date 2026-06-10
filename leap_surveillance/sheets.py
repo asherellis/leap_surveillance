@@ -21,14 +21,15 @@ CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
 REVIEW_HEADERS = [
     "question_name",
-    "question_text",
-    "resolution_criteria",
+    "status",
     "target_date",
     "dimension",
-    "status",
+    "question_text",
+    "resolution_criteria",
     "question_type",
     "unit",
     "llm_answer",
+    "llm_color",
     "q0",
     "q5",
     "q25",
@@ -36,20 +37,19 @@ REVIEW_HEADERS = [
     "q95",
     "q100",
     "judge_confidence",
+    "browser_status",
+    "missing_data",
     "judge_reason",
     "validation_issues",
-    "missing_data",
-    "browser_used",
-    "rationale",
-    "all_sources",
-    "resolution_source",
-    "resolution_source_date",
     "latest_official_value",
     "latest_official_date",
     "latest_official_source",
     "current_estimate",
     "current_estimate_confidence",
-    "llm_color",
+    "rationale",
+    "all_sources",
+    "resolution_source",
+    "resolution_source_date",
     "review_verdict",
     "review_value",
     "review_source",
@@ -67,12 +67,12 @@ COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
 INSTRUCTIONS_CONTENT = [
     ["LEAP Surveillance Review"],
     ["Use this sheet to review the results from each LEAP surveillance run."],
-    ["Each run gets its own run_<run_id> tab. Each row is one question result for a target date and dimension."],
+    ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
     [""],
     ["How to review"],
     ["Open the newest run tab."],
-    ["Read the question, resolution criteria, answer, rationale, sources, and any validation issues."],
-    ["Fill review_verdict for each row you review."],
+    ["Read the question and resolution criteria. Check the answer, rationale, and sources."],
+    ["Set review_verdict on every row."],
     ["If you change the answer, fill review_value and review_source."],
     ["Tick reviewed when the row is done."],
     ["When finished, run leap-surveillance sync. To preview first, run leap-surveillance sync --no-bq."],
@@ -80,17 +80,21 @@ INSTRUCTIONS_CONTENT = [
     ["Column groups"],
     ["A-H", "Question, resolution criteria, target date, status, type, and unit."],
     ["I-AD", "The LLM's answer, the full forecast distribution, judge evaluation, rationale, and cited sources."],
-    ["AE-AJ", "Your review."],
-    ["AK-AM", "Sync identifiers — do not edit."],
+    ["AE-AJ", "Reviewer columns. Fill these in."],
+    ["AK-AM", "Sync IDs - leave alone."],
     [""],
     ["Key columns"],
-    ["status", "What the row needs: resolved (verify), due_unresolved (find the value), forecast (usually leave alone), resolved_early (verify)."],
+    ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
     ["llm_answer", "The value to review. For forecast rows, this is q50."],
-    ["current_estimate", "The LLM's value as of today — not the same as llm_answer (which is at the target date). Quantile questions only; blank for probability and timing questions by design."],
+    [
+        "current_estimate",
+        "The LLM's value as of today. Not the same as llm_answer, which is at the target date.",
+    ],
     ["q25 / q75", "50% confidence interval (IQR) around q50. Forecast rows only."],
     ["judge_confidence", "Confidence in the research, not confidence that the forecast will happen."],
     ["validation_issues", "Problems to check before approving."],
-    ["missing_data", "The judge's specific list of gaps or weak spots in the response."],
+    ["missing_data", "Gaps the judge flagged."],
+    ["browser_status", "not_proposed / proposed_no_url / extract_failed / refinement_rejected / accepted."],
     ["review_verdict", "correct / close / wrong / confidently wrong."],
     ["reviewed", "Only reviewed rows are synced."],
 ]
@@ -196,7 +200,7 @@ def build_review_rows(run_data: dict) -> list[list]:
         confidence_reason = safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT]
         validation_issues = ", ".join(validation.get("issues", []) or [])[:SHEET_TEXT_LIMIT]
         missing_data = ", ".join(quality.get("missing_data", []) or [])[:SHEET_TEXT_LIMIT]
-        browser_used_str = "TRUE" if question.get("browser_used") else "FALSE"
+        browser_status = question.get("browser_status") or ("accepted" if question.get("browser_used") else "not_proposed")
         rationale = safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT]
         sources = ", ".join(response.get("sources", []))[:SHEET_TEXT_LIMIT]
 
@@ -280,7 +284,7 @@ def build_review_rows(run_data: dict) -> list[list]:
                 "judge_confidence": confidence,
                 "validation_issues": validation_issues,
                 "missing_data": missing_data,
-                "browser_used": browser_used_str,
+                "browser_status": browser_status,
                 "review_value": "",
                 "review_source": "",
                 "review_verdict": "",
@@ -434,13 +438,16 @@ def _format_instructions(sheet, ws) -> None:
     sheet.batch_update({"requests": reqs})
 
 
+# Three column-width buckets: narrow (N=80), medium (M=140), wide (W=210).
+_N, _M, _W = 80, 140, 210
 _REVIEW_COL_WIDTHS = [
-    180, 260, 260, 85, 120, 115, 95, 90,
-    90, 55, 55, 55, 55, 55, 55,
-    80, 200, 170, 170, 70, 220, 160,
-    150, 130, 100, 110, 150, 100, 90, 80,
-    110, 90, 150, 90, 180, 75,
-    140, 110, 110,
+    _M, _M, _M, _M, _M, _M, _M, _M,
+    _M, _N, _N, _N, _N, _N, _N, _N,
+    _N, _M, _W, _W, _W,
+    _M, _M, _W, _M, _N,
+    _W, _W, _W, _M,
+    _M, _M, _M, _M, _W, _N,
+    _M, _M, _M,
 ]
 
 

@@ -5,13 +5,16 @@ import os
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 
 from .common import DEFAULT_MODEL, DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, TEST_MODEL, safe_str
 from .models import (
     EvidenceItem,
     QuestionSpec,
+    ResearchQualityReport,
     RunCost,
+    SurveillanceResponse,
     validate_response,
 )
 from .storage import (
@@ -30,10 +33,21 @@ from .sheets import (
 from .questions import load_questions
 from .research import (
     browser_extract,
-    evaluate_response_quality,
+    judge_response,
     refine_with_browser,
-    research,
+    research_question,
 )
+
+
+@dataclass
+class QuestionRunResult:
+    response: SurveillanceResponse
+    evidence: list[EvidenceItem]
+    validation: dict
+    quality: ResearchQualityReport
+    costs: RunCost
+    browser_used: bool = False
+    browser_status: str = "not_proposed"
 
 
 def _read_requested_question_ids(raw: str) -> list[str]:
@@ -72,6 +86,7 @@ def _should_accept_browser_refinement(
     original_quality,
     refined_quality,
 ) -> tuple[bool, str]:
+    # Reject only when the refinement is mechanically worse; the judge's verdict is noisy.
     if not refined_validation.get("usable_for_scoring", False):
         return False, "refined response is not usable for scoring"
 
@@ -79,72 +94,85 @@ def _should_accept_browser_refinement(
         issues = ", ".join(refined_validation.get("issues", []) or [])
         return False, f"refinement introduced validation issues: {issues}"
 
-    if refined_validation.get("ok", False):
-        if not original_validation.get("ok", False):
-            return True, "refinement fixed deterministic validation issues"
-        if refined_quality.adequate:
-            return True, "refinement passed validation and quality review"
-        if refined_quality.confidence >= original_quality.confidence:
-            return True, "refinement preserved validation and improved confidence"
-        return False, "refinement did not improve quality confidence"
+    if _validation_score(refined_validation) > _validation_score(original_validation):
+        return False, "refinement increased deterministic validation issues"
 
-    if _validation_score(refined_validation) < _validation_score(original_validation):
-        return True, "refinement reduced deterministic validation issues"
-
-    return False, "refinement did not improve deterministic validation"
+    return True, "refinement validation OK; quality warnings preserved"
 
 
-def _try_browser_repair(
+def _try_browser_refinement(
     q: QuestionSpec,
-    response,
-    evidence,
-    validation: dict,
-    quality,
-    costs: RunCost,
+    result: QuestionRunResult,
     *,
     test_mode: bool = False,
-):
-    print(f"  -> Browser: {quality.browser_url}", flush=True)
+) -> QuestionRunResult:
+    print(f"  -> Browser: {result.quality.browser_url}", flush=True)
     browser_result = browser_extract(
-        quality.browser_url,
-        quality.browser_objective or "Extract data",
+        result.quality.browser_url,
+        result.quality.browser_objective or "Extract data",
         test_mode=test_mode,
     )
     if not browser_result.success:
-        print(f"  -> Browser failed: {browser_result.error}")
-        return response, evidence, validation, quality, False
+        err = browser_result.error or "no error message returned"
+        print(f"  -> Browser failed: {err}")
+        result.browser_status = "extract_failed"
+        return result
 
     browser_evidence = EvidenceItem(
         source_type="browser",
         url=browser_result.url,
+        title=f"Browser extraction: {browser_result.objective}",
         full_text=browser_result.extracted_text,
     )
-    evidence = [*evidence, browser_evidence]
+    evidence = [*result.evidence, browser_evidence]
 
     refined_response = refine_with_browser(
         q,
-        response,
+        result.response,
         browser_result,
         evidence=evidence,
         test_mode=test_mode,
-        costs=costs,
+        costs=result.costs,
     )
-    refined_quality = evaluate_response_quality(
-        refined_response, q, evidence, test_mode=test_mode, costs=costs
+    refined_quality = judge_response(
+        refined_response, q, evidence,
+        test_mode=test_mode, costs=result.costs, propose_browser=False,
     )
     refined_validation = validate_response(refined_response, q.expected_forecasts)
     accept_refinement, accept_reason = _should_accept_browser_refinement(
-        validation,
+        result.validation,
         refined_validation,
-        quality,
+        result.quality,
         refined_quality,
     )
     if accept_refinement:
-        print(f"  -> Refined with browser data ({refined_quality.confidence}% confidence)")
-        return refined_response, evidence, refined_validation, refined_quality, True
+        status = "ok" if refined_quality.adequate else "flagged for review"
+        print(
+            f"  -> Refined with browser data "
+            f"({refined_quality.confidence}% confidence, {status}) — {accept_reason}"
+        )
+        return QuestionRunResult(
+            response=refined_response,
+            evidence=evidence,
+            validation=refined_validation,
+            quality=refined_quality,
+            costs=result.costs,
+            browser_used=True,
+            browser_status="accepted",
+        )
 
     print(f"  -> Browser data kept as evidence; original response retained ({accept_reason})")
-    return response, evidence, validation, quality, True
+    for issue in (refined_quality.missing_data or [])[:3]:
+        print(f"     refined issue: {issue[:160]}")
+    return QuestionRunResult(
+        response=result.response,
+        evidence=evidence,
+        validation=result.validation,
+        quality=result.quality,
+        costs=result.costs,
+        browser_used=True,
+        browser_status="refinement_rejected",
+    )
 
 
 def process_question(
@@ -152,37 +180,40 @@ def process_question(
 ):
     costs = RunCost()
     print("  -> Researching with web search...", flush=True)
-    response, evidence = research(q, model=model, test_mode=test_mode, costs=costs)
+    response, evidence = research_question(q, model=model, test_mode=test_mode, costs=costs)
     print(f"  Research: {len(evidence)} sources, {len(response.forecasts)} forecasts", flush=True)
 
     print("  -> Evaluating quality...", flush=True)
-    quality = evaluate_response_quality(response, q, evidence, test_mode=test_mode, costs=costs)
+    quality = judge_response(response, q, evidence, test_mode=test_mode, costs=costs)
     validation = validate_response(response, q.expected_forecasts)
-    browser_used = False
+    result = QuestionRunResult(
+        response=response,
+        evidence=evidence,
+        validation=validation,
+        quality=quality,
+        costs=costs,
+    )
 
-    if not quality.adequate:
+    if not result.quality.adequate:
         if not use_browser:
-            print(f"  -> Browser skipped: disabled ({quality.confidence}% confidence)")
-        elif not quality.browser_would_help:
-            print(f"  -> Browser skipped: not useful ({quality.confidence}% confidence)")
-        elif not quality.browser_url:
-            print(f"  -> Browser skipped: no URL proposed ({quality.confidence}% confidence)")
+            print(f"  -> Browser skipped: disabled ({result.quality.confidence}% confidence)")
+        elif not result.quality.browser_would_help:
+            print(f"  -> Browser skipped: not useful ({result.quality.confidence}% confidence)")
+        elif not result.quality.browser_url:
+            print(f"  -> Browser skipped: no URL proposed ({result.quality.confidence}% confidence)")
+            result.browser_status = "proposed_no_url"
         else:
-            response, evidence, validation, quality, browser_used = _try_browser_repair(
+            result = _try_browser_refinement(
                 q,
-                response,
-                evidence,
-                validation,
-                quality,
-                costs,
+                result,
                 test_mode=test_mode,
             )
     else:
-        print(f"  -> Quality: {quality.confidence}% confidence")
+        print(f"  -> Quality: {result.quality.confidence}% confidence")
 
-    color = response.forecasts[0].color_code.value if response.forecasts else "N/A"
-    print(f"  -> {color} | {'ok' if validation['ok'] else 'warning'}", flush=True)
-    return response, evidence, validation, quality, browser_used, costs
+    color = result.response.forecasts[0].color_code.value if result.response.forecasts else "N/A"
+    print(f"  -> {color} | {'ok' if result.validation['ok'] else 'warning'}", flush=True)
+    return result
 
 
 def cmd_run(args):
@@ -196,7 +227,7 @@ def cmd_run(args):
             return
 
     print("Loading questions from BigQuery...")
-    questions = load_questions(None if args.questions else args.limit)
+    questions = load_questions(None if args.questions else args.limit, dev=args.dev)
 
     if args.questions:
         requested_ids = _read_requested_question_ids(args.questions)
@@ -223,6 +254,7 @@ def cmd_run(args):
     quality_reports = [None] * n
     costs_list = [None] * n
     browser_useds = [False] * n
+    browser_statuses = ["not_proposed"] * n
     errors_list = [None] * n
 
     workers = max(1, min(args.workers, n))
@@ -256,13 +288,13 @@ def cmd_run(args):
             if err:
                 errors_list[i] = err
             else:
-                response, evidence, validation, quality, browser_used, costs = result
-                responses[i] = response
-                evidences[i] = evidence
-                validations[i] = validation
-                quality_reports[i] = quality
-                costs_list[i] = costs
-                browser_useds[i] = browser_used
+                responses[i] = result.response
+                evidences[i] = result.evidence
+                validations[i] = result.validation
+                quality_reports[i] = result.quality
+                costs_list[i] = result.costs
+                browser_useds[i] = result.browser_used
+                browser_statuses[i] = result.browser_status
 
     run_data = build_run_data(
         run_id,
@@ -274,13 +306,18 @@ def cmd_run(args):
         quality_reports,
         costs_list=costs_list,
         browser_useds=browser_useds,
+        browser_statuses=browser_statuses,
         errors_list=errors_list,
     )
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     write_csv_output(run_id, questions, responses, DEFAULT_OUTPUT_DIR, validations=validations)
     s = run_data["summary"]
     print(f"\nSaved: {json_path}")
-    print(f"Summary: {s['ok_count']}/{s['question_count']} OK, {s['error_count']} errors, {s['browser_count']} browser extractions")
+    print(
+        f"Summary: {s['ok_count']}/{s['question_count']} validation OK, "
+        f"{s['quality_issue_count']} quality issues, "
+        f"{s['error_count']} errors, {s['browser_count']} browser extractions"
+    )
     print(f"Due/unresolved (past-dated, no authoritative value found): {s['due_unresolved_count']}")
     print(f"Estimated cost: ${s['total_cost']:.4f}")
 
@@ -351,7 +388,7 @@ def cmd_setup(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="leap-surveillance",
-        description="LEAP Surveillance - LLM forecasts for expert panel questions",
+        description="LEAP Surveillance - forecasts for expert panel questions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -381,7 +418,18 @@ Examples:
         help="Skip browser extraction (faster; may miss dashboard-only data)",
     )
     run_parser.add_argument("--test-mode", "-t", action="store_true", help="Use lower-cost test models")
-    run_parser.add_argument("--workers", "-w", type=int, default=1, help="Parallel question workers (default 1, recommended 5)")
+    run_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Load only the canonical dev question set (LCB Pro, Labor Share, US-China Military)",
+    )
+    run_parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=1,
+        help="Parallel question workers (default 1, recommended 5)",
+    )
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
     sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from a run tab to BigQuery")
