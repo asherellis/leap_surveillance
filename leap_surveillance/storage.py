@@ -168,14 +168,7 @@ def build_run_data(
     consensus_blocks=None,
     errors_list=None,
 ) -> dict:
-    """Build the run JSON. Symmetric per_model shape — both models siblings.
-
-    Args:
-        mode: "gpt", "claude", or "both" — which pipeline(s) ran.
-        models: dict like {"gpt": "openai/gpt-5.5", "claude": "anthropic/claude-sonnet-4-6"}.
-                Only includes the models that actually ran.
-        per_model_lists: list[dict[str, ModelRunResult] | None], aligned with questions.
-    """
+    """Build the run JSON with symmetric per_model blocks for each model that ran."""
     models = models or {}
     expected_len = len(questions)
     by_name = {
@@ -721,7 +714,6 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
 
             pending_rows.append(row)
 
-    rows = pending_rows
     skipped = len(missing_groups)
     if skipped > 0:
         preview = f"{missing_groups[:3]}{'...' if skipped > 3 else ''}"
@@ -730,12 +722,12 @@ def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
             f"surveillance_result; skipped: {preview}"
         )
 
-    if not rows:
+    if not pending_rows:
         return {"results": None, "skipped": skipped}
 
     return {
         "results": _try_merge_bigquery_rows(
-            "BigQuery results (review update)", rows,
+            "BigQuery results (review update)", pending_rows,
             pk="result_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_result",
             clock_col="ingestion_timestamp",
         ),

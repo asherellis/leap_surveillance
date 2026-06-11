@@ -47,19 +47,12 @@ def _interleaved_model_cols() -> list[str]:
 
 
 def _review_headers(mode: str) -> list[str]:
-    """Return the column list for a given run mode.
-
-    --both: 65 cols (8 metadata + 44 interleaved gpt/claude pairs + 4 consensus + 6 reviewer + 3 sync)
-    --gpt / --claude: 39 cols (8 metadata + 22 single-model cols + 6 reviewer + 3 sync, no consensus)
-    """
+    """65-col interleaved layout for --both; 39-col single-model layout for --gpt/--claude."""
     if mode == "both":
         return [*_METADATA_COLS, *_interleaved_model_cols(), *_CONSENSUS_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
     tag = "gpt" if mode == "gpt" else "claude"
     return [*_METADATA_COLS, *[f"{tag}_{f}" for f in _MODEL_FIELDS], *_REVIEWER_COLS, *_SYNC_COLS]
 
-
-# Full dual-model header list, kept for backward compat with external callers.
-REVIEW_HEADERS = _review_headers("both")
 
 VERDICT_OPTIONS = ["correct", "close", "wrong", "confidently wrong"]
 COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
@@ -292,12 +285,7 @@ def _row_fields_for_model(view: dict, fdate: str, dim: str, q_type: str) -> dict
 
 
 def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
-    """Collapse raw forecast rows into human-review rows.
-
-    Returns (rows, headers). Headers match the run's mode:
-    --both produces 65-col interleaved gpt_*/claude_* pairs with consensus;
-    --gpt / --claude produces 39-col single-model layout without consensus.
-    """
+    """Build Sheet rows from run_data; returns (rows, headers) matched to the run's mode."""
     mode = run_data.get("mode", "both")
     headers = _review_headers(mode)
     run_id = run_data.get("run_id", "unknown")
@@ -715,7 +703,7 @@ def get_reviewed_items(
     else:
         ws = _latest_run_tab(sheet)
         if ws is None:
-            print(f"  warning: no run_* tabs found in sheet")
+            print("  warning: no run_* tabs found in sheet")
             return [], []
         print(f"  reading reviewed rows from '{ws.title}'")
 

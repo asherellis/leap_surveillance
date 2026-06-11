@@ -1,16 +1,4 @@
-"""Chromium navigation via the browser-use library.
-
-This module owns the actual page-fetching path: URL safety checks, the LLM-driven
-browser agent (one Chromium instance at a time via the shared semaphore), and the
-BrowserEvidence return shape.
-
-It deliberately does NOT own:
-  - decide_browser (judge-side prompt that proposes a URL)
-  - refine_with_browser (LLM call that integrates the extracted text)
-  - the orchestration that chains those together
-Those stay in research.py / run_surveillance.py because they're LLM calls, not
-Chromium calls.
-"""
+"""Chromium navigation via browser-use: URL safety checks and page extraction."""
 
 import asyncio
 import ipaddress

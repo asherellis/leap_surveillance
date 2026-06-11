@@ -1,8 +1,4 @@
-"""LLM research, judge, and browser-refinement prompt orchestration.
-
-Chromium navigation and URL safety live in `browser.py`; this module is purely
-about LLM calls (research, evaluate_adequacy, decide_browser, refine_with_browser).
-"""
+"""LLM calls: research, adequacy judge, browser decision, and refinement."""
 
 import os
 import re

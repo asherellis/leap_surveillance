@@ -94,11 +94,7 @@ class ModelRunResult:
 
 @dataclass
 class QuestionRunResult:
-    """Question-level outcome. Both models live as siblings in per_model.
-
-    `per_model` keys are model tags ("gpt", "claude"); values are ModelRunResult.
-    Single-model runs (e.g. --gpt) have only one key; --both has both.
-    """
+    """Question-level outcome: per_model dict keyed by tag ("gpt"/"claude"), plus costs and consensus."""
     per_model: dict[str, ModelRunResult]
     costs: RunCost
     consensus: dict | None = None
@@ -293,11 +289,7 @@ def process_question(
     *,
     mode: str = "gpt",
 ) -> QuestionRunResult:
-    """Run the surveillance pipeline for a question.
-
-    mode: "gpt", "claude", or "both" (default from the CLI).
-    `model` arg overrides the GPT research model when provided.
-    """
+    """Run the surveillance pipeline for one question across the selected model(s)."""
     costs = RunCost()
     gpt_stack, claude_stack = _build_stacks(test_mode)
     if model is not None:

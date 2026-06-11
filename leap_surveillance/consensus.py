@@ -1,13 +1,4 @@
-"""Compute agreement between GPT and Claude model outputs.
-
-The auto-accept rule (when both models pass adequacy):
-- Same color_code on every (forecast_date, dimension) row, AND
-- For black rows: q50 must match exactly
-- For non-black rows: q50 must be within 10% relative-to-mean
-  (`abs(a-b) / ((|a|+|b|)/2) <= 0.10`)
-
-q50 comparison only — not all 7 quantiles.
-"""
+"""GPT vs Claude q50 + color agreement, with 10% relative-to-mean tolerance for non-black rows."""
 
 from collections import defaultdict
 from typing import Any
@@ -20,10 +11,7 @@ _Q50_TOLERANCE = 0.10  # 10% relative-to-mean
 
 
 def _extract_q50_by_row(forecasts) -> dict[tuple[str, str], dict[str, Any]]:
-    """Index forecasts by (forecast_date, dimension), keeping the q50 row.
-
-    Returns: {(date, dim): {"q50": float | None, "color": str | None}}.
-    """
+    """Index forecasts by (forecast_date, dimension) → {"q50", "color"} dict."""
     by_row: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"q50": None, "color": None})
     for f in forecasts or []:
         # `f` may be a Pydantic Forecast object or a plain dict (when reading from JSON).
@@ -77,11 +65,7 @@ def _row_match(gpt_row: dict, claude_row: dict) -> tuple[bool, bool, bool, float
 
 
 def compute_consensus(per_model: dict) -> dict:
-    """Compare gpt vs claude ModelRunResult outputs and return the agreement block.
-
-    `per_model` is a dict with keys like {"gpt": ModelRunResult, "claude": ModelRunResult}.
-    A model that errored has `.error` set and may have `response=None`.
-    """
+    """Compare gpt vs claude outputs; return status, color/q50 agreement, and per-row diffs."""
     gpt = per_model.get("gpt")
     claude = per_model.get("claude")
 
