@@ -56,6 +56,7 @@ def _forecast_output_row(
     *,
     q_id: str,
     q_name: str,
+    model_id: str,
     forecast: dict,
     response: dict,
     validation: dict | None = None,
@@ -83,6 +84,7 @@ def _forecast_output_row(
         resolution_target_value = ""
 
     row = {
+        "model_id": model_id,
         "question_id": q_id,
         "question_name": q_name,
         "target_value_type": target_value_type,
@@ -113,28 +115,73 @@ def _forecast_output_row(
     return row
 
 
+def _serialize_model_result(model_result) -> dict | None:
+    """Serialize a ModelRunResult into the JSON-friendly dict shape used in per_model blocks."""
+    if model_result is None:
+        return None
+    out: dict = {}
+    if model_result.response is not None:
+        out["response"] = model_result.response.model_dump(mode="json")
+    if model_result.evidence:
+        out["evidence"] = [
+            {
+                "source_type": e.source_type,
+                "url": e.url,
+                "title": e.title,
+                "snippet": e.snippet,
+                "full_text": e.full_text,
+            }
+            for e in model_result.evidence
+        ]
+    if model_result.validation:
+        out["validation"] = {
+            "ok": model_result.validation.get("ok"),
+            "usable_for_scoring": model_result.validation.get("usable_for_scoring"),
+            "issues": model_result.validation.get("issues", []),
+        }
+    if model_result.quality is not None:
+        qr = model_result.quality
+        out["quality"] = {
+            "confidence": qr.confidence,
+            "adequate": qr.adequate,
+            "missing_data": qr.missing_data,
+            "browser_would_help": qr.browser_would_help,
+            "browser_url": qr.browser_url,
+            "browser_objective": qr.browser_objective,
+            "reason": qr.reason,
+        }
+    out["browser_used"] = bool(model_result.browser_used)
+    out["browser_status"] = model_result.browser_status or "not_proposed"
+    if model_result.error:
+        out["error"] = model_result.error
+    return out
+
+
 def build_run_data(
     run_id,
-    model,
     questions,
-    responses,
-    validations,
-    evidences,
-    quality_reports,
+    per_model_lists,
+    *,
+    mode: str = "gpt",
+    models: dict | None = None,
     costs_list=None,
-    browser_useds=None,
-    browser_statuses=None,
+    consensus_blocks=None,
     errors_list=None,
 ) -> dict:
+    """Build the run JSON. Symmetric per_model shape — both models siblings.
+
+    Args:
+        mode: "gpt", "claude", or "both" — which pipeline(s) ran.
+        models: dict like {"gpt": "openai/gpt-5.5", "claude": "anthropic/claude-sonnet-4-6"}.
+                Only includes the models that actually ran.
+        per_model_lists: list[dict[str, ModelRunResult] | None], aligned with questions.
+    """
+    models = models or {}
     expected_len = len(questions)
     by_name = {
-        "responses": responses,
-        "validations": validations,
-        "evidences": evidences,
-        "quality_reports": quality_reports,
+        "per_model_lists": per_model_lists,
         "costs_list": costs_list,
-        "browser_useds": browser_useds,
-        "browser_statuses": browser_statuses,
+        "consensus_blocks": consensus_blocks,
         "errors_list": errors_list,
     }
     for name, values in by_name.items():
@@ -142,12 +189,11 @@ def build_run_data(
             raise ValueError(f"{name} length {len(values)} does not match questions length {expected_len}")
 
     costs_iter = costs_list or [None] * len(questions)
-    browser_iter = browser_useds or [None] * len(questions)
-    status_iter = browser_statuses or ["not_proposed"] * len(questions)
+    consensus_iter = consensus_blocks or [None] * len(questions)
     errors_iter = errors_list or [None] * len(questions)
     results = []
-    for q, resp, val, ev, qr, costs, browser_used, browser_status, error in zip(
-        questions, responses, validations, evidences, quality_reports, costs_iter, browser_iter, status_iter, errors_iter
+    for q, per_model, costs, consensus, error in zip(
+        questions, per_model_lists, costs_iter, consensus_iter, errors_iter,
     ):
         result = {
             "id": q.id,
@@ -159,39 +205,17 @@ def build_run_data(
             "question_text": q.question_text,
             "resolution_criteria": q.resolution_criteria,
             "background_info": q.background_info,
-            "browser_used": bool(browser_used),
-            "browser_status": browser_status or "not_proposed",
-            "response": resp.model_dump(mode="json") if resp is not None else None,
         }
         if error:
             result["error"] = error
-        if val:
-            result["validation"] = {
-                "ok": val["ok"],
-                "usable_for_scoring": val["usable_for_scoring"],
-                "issues": val.get("issues", []),
-            }
-        if ev:
-            result["evidence"] = [
-                {
-                    "source_type": e.source_type,
-                    "url": e.url,
-                    "title": e.title,
-                    "snippet": e.snippet,
-                    "full_text": e.full_text,
-                }
-                for e in ev
-            ]
-        if qr:
-            result["quality"] = {
-                "confidence": qr.confidence,
-                "adequate": qr.adequate,
-                "missing_data": qr.missing_data,
-                "browser_would_help": qr.browser_would_help,
-                "browser_url": qr.browser_url,
-                "browser_objective": qr.browser_objective,
-                "reason": qr.reason,
-            }
+        # Per-model block (symmetric — gpt and claude are siblings)
+        per_model_block = {}
+        for tag, model_result in (per_model or {}).items():
+            per_model_block[tag] = _serialize_model_result(model_result) or {}
+        if per_model_block:
+            result["per_model"] = per_model_block
+        if consensus is not None:
+            result["consensus"] = consensus
         if costs is not None:
             result["cost"] = costs.as_dict()
         results.append(result)
@@ -199,34 +223,47 @@ def build_run_data(
     return {
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "model": model,
-        "summary": _summarize_run(results, responses, costs_iter),
+        "mode": mode,
+        "models": models,
+        "summary": _summarize_run(per_model_lists, costs_iter, errors_iter),
         "questions": results,
     }
 
 
-def _summarize_run(results: list[dict], responses: list, costs_iter: list) -> dict:
-    """Return the run-level counts shared by stdout, JSON, and BQ."""
+def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
+    """Question-level run counts. Prefers GPT when both models ran; falls back to Claude."""
+    ok_count = 0
+    quality_issue_count = 0
+    browser_count = 0
     due_unresolved = 0
-    for resp in responses:
-        if resp is None:
+
+    for per_model in per_model_lists:
+        # Question-level summary uses whichever model produced output (GPT preferred for stable counts).
+        primary = (per_model or {}).get("gpt") or (per_model or {}).get("claude")
+        if primary is None:
             continue
-        seen: set[tuple[str, str]] = set()
-        for f in resp.forecasts:
-            key = (f.forecast_date, f.dimension)
-            if key in seen:
-                continue
-            seen.add(key)
-            if resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
-                due_unresolved += 1
+        if (primary.validation or {}).get("ok"):
+            ok_count += 1
+        if primary.quality is not None and primary.quality.adequate is False:
+            quality_issue_count += 1
+        if primary.browser_used:
+            browser_count += 1
+        if primary.response is not None:
+            seen: set[tuple[str, str]] = set()
+            for f in primary.response.forecasts:
+                key = (f.forecast_date, f.dimension)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
+                    due_unresolved += 1
+
     return {
-        "question_count": len(results),
-        "ok_count": sum(1 for r in results if (r.get("validation") or {}).get("ok")),
-        "quality_issue_count": sum(
-            1 for r in results if (r.get("quality") or {}).get("adequate") is False
-        ),
-        "error_count": sum(1 for r in results if r.get("error")),
-        "browser_count": sum(1 for r in results if r.get("browser_used")),
+        "question_count": len(per_model_lists),
+        "ok_count": ok_count,
+        "quality_issue_count": quality_issue_count,
+        "error_count": sum(1 for e in errors_iter if e),
+        "browser_count": browser_count,
         "due_unresolved_count": due_unresolved,
         "total_cost": sum((c.total if c is not None else 0.0) for c in costs_iter),
     }
@@ -240,33 +277,35 @@ def write_json_output(run_data: dict, output_dir: str) -> str:
     return str(path)
 
 
-def write_csv_output(run_id, questions, responses, output_dir, validations=None):
+def write_csv_output(run_id, questions, per_model_lists, output_dir):
+    """One CSV per run with model_id as the first column. Both models' rows live as siblings."""
     expected_len = len(questions)
-    if len(responses) != expected_len:
-        raise ValueError(f"responses length {len(responses)} does not match questions length {expected_len}")
-    if validations is not None and len(validations) != expected_len:
-        raise ValueError(f"validations length {len(validations)} does not match questions length {expected_len}")
+    if len(per_model_lists) != expected_len:
+        raise ValueError(f"per_model_lists length {len(per_model_lists)} does not match questions length {expected_len}")
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     rows = []
-    val_iter = validations or [None] * len(questions)
-    for q, resp, val in zip(questions, responses, val_iter):
-        if resp is not None:
-            response = resp.model_dump(mode="json")
+    for q, per_model in zip(questions, per_model_lists):
+        for model_id, model_result in (per_model or {}).items():
+            if model_result is None or model_result.response is None:
+                continue
+            response = model_result.response.model_dump(mode="json")
+            validation = model_result.validation
             for forecast in response.get("forecasts", []):
                 row = _forecast_output_row(
                     q_id=q.id,
                     q_name=q.name,
+                    model_id=model_id,
                     forecast=forecast,
                     response=response,
-                    validation=val,
+                    validation=validation,
                 )
                 row.update({
                     "question_type": q.question_type,
                     "unit": q.unit,
                     "unit_min": q.unit_min,
                     "unit_max": q.unit_max,
-                    "validation_issues": ", ".join((val or {}).get("issues", [])),
+                    "validation_issues": ", ".join((validation or {}).get("issues", [])),
                 })
                 rows.append(row)
     if not rows:
@@ -432,106 +471,115 @@ def _try_merge_bigquery_rows(
 def write_surveillance_to_bigquery(run_data: dict) -> dict:
     run_id = run_data.get("run_id")
     created_at = run_data.get("created_at")
-    model = run_data.get("model")
+    mode = run_data.get("mode", "gpt")
+    models = run_data.get("models") or {}
 
     result_rows = []
-    for question in run_data.get("questions", []):
-        validation = question.get("validation") or {}
-        response = question.get("response") or {}
-        quality = question.get("quality") or {}
-        q_id = question.get("id")
-
-        for forecast in response.get("forecasts", []):
-            color = forecast.get("color_code")
-            result_id = make_result_id(
-                run_id,
-                q_id,
-                forecast.get("forecast_date"),
-                forecast.get("dimension"),
-                forecast.get("quantile"),
-            )
-            row = _forecast_output_row(
-                q_id=q_id,
-                q_name=question.get("name"),
-                forecast=forecast,
-                response=response,
-                validation=validation,
-                run_id=run_id,
-                created_at=created_at,
-                result_id=result_id,
-            )
-            result_rows.append({
-                "result_id": result_id,
-                "run_id": run_id,
-                "model": model,
-                "question_id": q_id,
-                "question_name": question.get("name"),
-                "question_type": question.get("question_type"),
-                "unit": question.get("unit"),
-                "unit_min": question.get("unit_min"),
-                "unit_max": question.get("unit_max"),
-                # target_value_type chooses the numeric value column; resolution_status is the
-                # human review status derived from date + color. Related, but not interchangeable.
-                "target_value_type": row.get("target_value_type"),
-                "target_date": row.get("target_date"),
-                "dimension": forecast.get("dimension"),
-                "quantile": forecast.get("quantile"),
-                "forecast_target_value": _none_if_empty(row.get("forecast_target_value")),
-                "resolution_target_value": _none_if_empty(row.get("resolution_target_value")),
-                "color_code": color,
-                "resolution_status": row.get("resolution_status"),
-                "resolution_source_date": row.get("resolution_source_date") or None,
-                "resolution_source": row.get("resolution_source") or None,
-                "current_estimate_value": _none_if_empty(row.get("current_estimate_value")),
-                "current_estimate_confidence": _none_if_empty(row.get("current_estimate_confidence")),
-                "latest_official_value": _none_if_empty(row.get("latest_official_value")),
-                "latest_official_date": row.get("latest_official_date") or None,
-                "latest_official_source": row.get("latest_official_source") or None,
-                "rationale": (response.get("rationale") or "")[:2000],
-                "sources": ", ".join(response.get("sources") or [])[:1000],
-                "validation_ok": validation.get("ok", False),
-                "validation_issues": ", ".join(validation.get("issues") or [])[:1000] or None,
-                "usable_for_scoring": validation.get("usable_for_scoring", False),
-                "quality_confidence": quality.get("confidence"),
-                "quality_adequate": quality.get("adequate"),
-                "quality_missing_data": "; ".join(quality.get("missing_data") or [])[:1000] or None,
-                "quality_reason": (quality.get("reason") or "")[:2000] or None,
-                "browser_would_help": quality.get("browser_would_help"),
-                "browser_url": quality.get("browser_url") or None,
-                "browser_objective": quality.get("browser_objective") or None,
-                "browser_used": bool(question.get("browser_used")),
-                "review_status": None,
-                "override_value": None,
-                "override_color": None,
-                "final_value": _first_non_empty(row.get("forecast_target_value"), row.get("resolution_target_value")),
-                "final_color": color,
-                "notes": None,
-                "reviewed_at": None,
-                "created_at": created_at,
-                "ingestion_timestamp": datetime.now(timezone.utc),
-            })
-
     evidence_rows = []
     for question in run_data.get("questions", []):
-        for i, ev in enumerate(question.get("evidence") or []):
-            evidence_rows.append({
-                "evidence_id": f"{run_id}_{question.get('id')}_{i}",
-                "run_id": run_id,
-                "question_id": question.get("id"),
-                "source_type": ev.get("source_type"),
-                "url": ev.get("url"),
-                "title": ev.get("title"),
-                "snippet": (ev.get("snippet") or "")[:1000],
-                "full_text": (ev.get("full_text") or "")[:5000],
-                "created_at": created_at,
-                "ingestion_timestamp": datetime.now(timezone.utc),
-            })
+        q_id = question.get("id")
+        per_model = question.get("per_model") or {}
+        for model_id, model_block in per_model.items():
+            if not model_block:
+                continue
+            validation = model_block.get("validation") or {}
+            response = model_block.get("response") or {}
+            quality = model_block.get("quality") or {}
+
+            for forecast in response.get("forecasts", []):
+                color = forecast.get("color_code")
+                result_id = make_result_id(
+                    run_id,
+                    q_id,
+                    forecast.get("forecast_date"),
+                    forecast.get("dimension"),
+                    forecast.get("quantile"),
+                    model_id,
+                )
+                row = _forecast_output_row(
+                    q_id=q_id,
+                    q_name=question.get("name"),
+                    model_id=model_id,
+                    forecast=forecast,
+                    response=response,
+                    validation=validation,
+                    run_id=run_id,
+                    created_at=created_at,
+                    result_id=result_id,
+                )
+                result_rows.append({
+                    "result_id": result_id,
+                    "run_id": run_id,
+                    "model_id": model_id,
+                    "question_id": q_id,
+                    "question_name": question.get("name"),
+                    "question_type": question.get("question_type"),
+                    "unit": question.get("unit"),
+                    "unit_min": question.get("unit_min"),
+                    "unit_max": question.get("unit_max"),
+                    # target_value_type chooses the numeric value column; resolution_status is the
+                    # human review status derived from date + color. Related, but not interchangeable.
+                    "target_value_type": row.get("target_value_type"),
+                    "target_date": row.get("target_date"),
+                    "dimension": forecast.get("dimension"),
+                    "quantile": forecast.get("quantile"),
+                    "forecast_target_value": _none_if_empty(row.get("forecast_target_value")),
+                    "resolution_target_value": _none_if_empty(row.get("resolution_target_value")),
+                    "color_code": color,
+                    "resolution_status": row.get("resolution_status"),
+                    "resolution_source_date": row.get("resolution_source_date") or None,
+                    "resolution_source": row.get("resolution_source") or None,
+                    "current_estimate_value": _none_if_empty(row.get("current_estimate_value")),
+                    "current_estimate_confidence": _none_if_empty(row.get("current_estimate_confidence")),
+                    "latest_official_value": _none_if_empty(row.get("latest_official_value")),
+                    "latest_official_date": row.get("latest_official_date") or None,
+                    "latest_official_source": row.get("latest_official_source") or None,
+                    "rationale": (response.get("rationale") or "")[:2000],
+                    "sources": ", ".join(response.get("sources") or [])[:1000],
+                    "validation_ok": validation.get("ok", False),
+                    "validation_issues": ", ".join(validation.get("issues") or [])[:1000] or None,
+                    "usable_for_scoring": validation.get("usable_for_scoring", False),
+                    "quality_confidence": quality.get("confidence"),
+                    "quality_adequate": quality.get("adequate"),
+                    "quality_missing_data": "; ".join(quality.get("missing_data") or [])[:1000] or None,
+                    "quality_reason": (quality.get("reason") or "")[:2000] or None,
+                    "browser_would_help": quality.get("browser_would_help"),
+                    "browser_url": quality.get("browser_url") or None,
+                    "browser_objective": quality.get("browser_objective") or None,
+                    "browser_used": bool(model_block.get("browser_used")),
+                    "review_status": None,
+                    "override_value": None,
+                    "override_color": None,
+                    "final_value": _first_non_empty(row.get("forecast_target_value"), row.get("resolution_target_value")),
+                    "final_color": color,
+                    "notes": None,
+                    "reviewed_at": None,
+                    "created_at": created_at,
+                    "ingestion_timestamp": datetime.now(timezone.utc),
+                })
+
+            for i, ev in enumerate(model_block.get("evidence") or []):
+                evidence_rows.append({
+                    "evidence_id": f"{run_id}_{q_id}_{model_id}_{i}",
+                    "run_id": run_id,
+                    "model_id": model_id,
+                    "question_id": q_id,
+                    "source_type": ev.get("source_type"),
+                    "url": ev.get("url"),
+                    "title": ev.get("title"),
+                    "snippet": (ev.get("snippet") or "")[:1000],
+                    "full_text": (ev.get("full_text") or "")[:5000],
+                    "created_at": created_at,
+                    "ingestion_timestamp": datetime.now(timezone.utc),
+                })
 
     summary = run_data.get("summary") or {}
     run_rows = [{
         "run_id": run_id,
         "created_at": created_at,
-        "model": model,
+        "mode": mode,
+        "gpt_model": models.get("gpt"),
+        "claude_model": models.get("claude"),
         "question_count": summary.get("question_count", 0),
         "success_count": summary.get("ok_count", 0),
         "error_count": summary.get("error_count", 0),
@@ -602,11 +650,15 @@ def _get_existing_result_ids_for_groups(group_ids: list[str]) -> dict[str, list[
         return by_group
 
     for rid in df["result_id"].tolist():
-        head, _, q_str = rid.rpartition("_")
-        if not q_str.isdigit():
+        # Result IDs are {group_id}_{quantile}_{model_id}. If the trailing segment is
+        # non-numeric, peel it off as the model_id and re-parse for {group_id}_{quantile}.
+        head, _, tail = rid.rpartition("_")
+        if not tail.isdigit():
+            head, _, tail = head.rpartition("_")
+        if not tail.isdigit():
             continue
         if head in by_group:
-            by_group[head].append((rid, int(q_str)))
+            by_group[head].append((rid, int(tail)))
     return by_group
 
 

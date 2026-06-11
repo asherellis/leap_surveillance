@@ -16,8 +16,35 @@ DEFAULT_SHEET_ID = (
 DEFAULT_MODEL = os.environ.get("LEAP_MODEL") or "openai/gpt-5.5"
 DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "openai/gpt-4.1-mini"
 DEFAULT_BROWSER_MODEL = os.environ.get("LEAP_BROWSER_MODEL") or "openai/gpt-4o"
+CLAUDE_RESEARCH_MODEL = os.environ.get("LEAP_CLAUDE_MODEL") or "anthropic/claude-sonnet-4-6"
+CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_CLAUDE_EVALUATOR_MODEL") or "anthropic/claude-haiku-4-5"
+TEST_CLAUDE_MODEL = os.environ.get("LEAP_TEST_CLAUDE_MODEL") or "anthropic/claude-haiku-4-5"
+TEST_CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_CLAUDE_EVALUATOR_MODEL") or "anthropic/claude-haiku-4-5"
 TEST_MODEL = os.environ.get("LEAP_TEST_MODEL") or "openai/gpt-4o-mini"
 TEST_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_EVALUATOR_MODEL") or "openai/gpt-4o-mini"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        return float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def provider_for_model(model: str) -> str:
+    """Infer provider from a LiteLLM-style model string ("openai/..." or "anthropic/...")."""
+    return "anthropic" if model.startswith("anthropic/") else "openai"
+
+
 SHEET_TEXT_LIMIT = 10000
 FULL_QUANTILES = [0, 5, 25, 50, 75, 95, 100]
 TIMING_FORECAST_DATE = "event_occurrence"
@@ -93,5 +120,6 @@ def make_result_id(
     forecast_date: str,
     dimension: str,
     quantile: int,
+    model_id: str,
 ) -> str:
-    return f"{make_review_group_id(run_id, question_id, forecast_date, dimension)}_{quantile}"
+    return f"{make_review_group_id(run_id, question_id, forecast_date, dimension)}_{quantile}_{model_id}"

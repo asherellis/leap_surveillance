@@ -5,10 +5,23 @@ import os
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from datetime import datetime
 
-from .common import DEFAULT_MODEL, DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, TEST_MODEL, safe_str
+from .common import (
+    CLAUDE_EVALUATOR_MODEL,
+    CLAUDE_RESEARCH_MODEL,
+    DEFAULT_BROWSER_MODEL,
+    DEFAULT_EVALUATOR_MODEL,
+    DEFAULT_MODEL,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_SHEET_ID,
+    TEST_CLAUDE_EVALUATOR_MODEL,
+    TEST_CLAUDE_MODEL,
+    TEST_EVALUATOR_MODEL,
+    TEST_MODEL,
+    safe_str,
+)
 from .models import (
     EvidenceItem,
     QuestionSpec,
@@ -31,23 +44,64 @@ from .sheets import (
     setup_sheet,
 )
 from .questions import load_questions
+from .browser import browser_extract
 from .research import (
-    browser_extract,
     judge_response,
     refine_with_browser,
     research_question,
 )
+from .consensus import compute_consensus
+
+
+@dataclass(frozen=True)
+class ModelStack:
+    """Per-provider model selection. tag is the cost-bucket prefix ("gpt" -> "", "claude" -> "claude_")."""
+    tag: str
+    research_model: str
+    eval_model: str
+    browser_navigator: str
+
+    def cost_bucket(self, stage: str) -> str:
+        """stage in {'research', 'judge_stage1', 'judge_stage2', 'refinement'}."""
+        prefix = "" if self.tag == "gpt" else f"{self.tag}_"
+        return f"{prefix}{stage}"
+
+
+def _build_stacks(test_mode: bool) -> tuple[ModelStack, ModelStack]:
+    if test_mode:
+        gpt = ModelStack("gpt", TEST_MODEL, TEST_EVALUATOR_MODEL, TEST_MODEL)
+        # Haiku fails browser-use's AgentOutput schema at step 12+; use gpt-4o-mini for test browser too.
+        claude = ModelStack("claude", TEST_CLAUDE_MODEL, TEST_CLAUDE_EVALUATOR_MODEL, TEST_MODEL)
+    else:
+        gpt = ModelStack("gpt", DEFAULT_MODEL, DEFAULT_EVALUATOR_MODEL, DEFAULT_BROWSER_MODEL)
+        # gpt-4o drives browser for both paths — Haiku and Sonnet both have intermittent AgentOutput schema
+        # failures in the full browser-use agent loop; gpt-4o is the proven reliable navigator.
+        claude = ModelStack("claude", CLAUDE_RESEARCH_MODEL, CLAUDE_EVALUATOR_MODEL, DEFAULT_BROWSER_MODEL)
+    return gpt, claude
+
+
+@dataclass
+class ModelRunResult:
+    """One model's full pipeline outcome: research + judge + maybe browser refinement."""
+    response: SurveillanceResponse | None
+    evidence: list[EvidenceItem]
+    validation: dict
+    quality: ResearchQualityReport | None
+    browser_used: bool = False
+    browser_status: str = "not_proposed"
+    error: dict | None = None  # {type, message, traceback[-2000:]} if this model errored
 
 
 @dataclass
 class QuestionRunResult:
-    response: SurveillanceResponse
-    evidence: list[EvidenceItem]
-    validation: dict
-    quality: ResearchQualityReport
+    """Question-level outcome. Both models live as siblings in per_model.
+
+    `per_model` keys are model tags ("gpt", "claude"); values are ModelRunResult.
+    Single-model runs (e.g. --gpt) have only one key; --both has both.
+    """
+    per_model: dict[str, ModelRunResult]
     costs: RunCost
-    browser_used: bool = False
-    browser_status: str = "not_proposed"
+    consensus: dict | None = None
 
 
 def _read_requested_question_ids(raw: str) -> list[str]:
@@ -100,21 +154,24 @@ def _should_accept_browser_refinement(
     return True, "refinement validation OK; quality warnings preserved"
 
 
-def _try_browser_refinement(
+def _try_browser_refinement_for_model(
     q: QuestionSpec,
-    result: QuestionRunResult,
+    result: ModelRunResult,
     *,
+    stack: ModelStack,
+    costs: RunCost,
     test_mode: bool = False,
-) -> QuestionRunResult:
-    print(f"  -> Browser: {result.quality.browser_url}", flush=True)
+) -> ModelRunResult:
+    print(f"  [{stack.tag}] Browser: {result.quality.browser_url}", flush=True)
     browser_result = browser_extract(
         result.quality.browser_url,
         result.quality.browser_objective or "Extract data",
         test_mode=test_mode,
+        model_override=stack.browser_navigator,
     )
     if not browser_result.success:
         err = browser_result.error or "no error message returned"
-        print(f"  -> Browser failed: {err}")
+        print(f"  [{stack.tag}] Browser failed: {err}")
         result.browser_status = "extract_failed"
         return result
 
@@ -132,11 +189,15 @@ def _try_browser_refinement(
         browser_result,
         evidence=evidence,
         test_mode=test_mode,
-        costs=result.costs,
+        costs=costs,
+        model=stack.research_model,
+        cost_bucket=stack.cost_bucket("refinement"),
     )
     refined_quality = judge_response(
         refined_response, q, evidence,
-        test_mode=test_mode, costs=result.costs, propose_browser=False,
+        test_mode=test_mode, costs=costs, propose_browser=False,
+        eval_model=stack.eval_model,
+        cost_bucket_stage1=stack.cost_bucket("judge_stage1"),
     )
     refined_validation = validate_response(refined_response, q.expected_forecasts)
     accept_refinement, accept_reason = _should_accept_browser_refinement(
@@ -148,78 +209,158 @@ def _try_browser_refinement(
     if accept_refinement:
         status = "ok" if refined_quality.adequate else "flagged for review"
         print(
-            f"  -> Refined with browser data "
+            f"  [{stack.tag}] Refined with browser data "
             f"({refined_quality.confidence}% confidence, {status}) — {accept_reason}"
         )
-        return QuestionRunResult(
+        return ModelRunResult(
             response=refined_response,
             evidence=evidence,
             validation=refined_validation,
             quality=refined_quality,
-            costs=result.costs,
             browser_used=True,
             browser_status="accepted",
         )
 
-    print(f"  -> Browser data kept as evidence; original response retained ({accept_reason})")
+    print(f"  [{stack.tag}] Browser data kept as evidence; original response retained ({accept_reason})")
     for issue in (refined_quality.missing_data or [])[:3]:
         print(f"     refined issue: {issue[:160]}")
-    return QuestionRunResult(
+    return ModelRunResult(
         response=result.response,
         evidence=evidence,
         validation=result.validation,
         quality=result.quality,
-        costs=result.costs,
         browser_used=True,
         browser_status="refinement_rejected",
     )
 
 
-def process_question(
-    q: QuestionSpec, model: str, use_browser: bool = True, test_mode: bool = False
-):
-    costs = RunCost()
-    print("  -> Researching with web search...", flush=True)
-    response, evidence = research_question(q, model=model, test_mode=test_mode, costs=costs)
-    print(f"  Research: {len(evidence)} sources, {len(response.forecasts)} forecasts", flush=True)
+def _run_single_model_pipeline(
+    q: QuestionSpec,
+    *,
+    stack: ModelStack,
+    costs: RunCost,
+    use_browser: bool,
+    test_mode: bool,
+) -> ModelRunResult:
+    """One model's full pipeline: research -> judge -> maybe browser -> maybe refine."""
+    print(f"  [{stack.tag}] Researching with web search...", flush=True)
+    response, evidence = research_question(
+        q, model=stack.research_model, test_mode=test_mode, costs=costs,
+        cost_bucket=stack.cost_bucket("research"),
+    )
+    print(f"  [{stack.tag}] Research: {len(evidence)} sources, {len(response.forecasts)} forecasts", flush=True)
 
-    print("  -> Evaluating quality...", flush=True)
-    quality = judge_response(response, q, evidence, test_mode=test_mode, costs=costs)
+    print(f"  [{stack.tag}] Evaluating quality...", flush=True)
+    quality = judge_response(
+        response, q, evidence, test_mode=test_mode, costs=costs,
+        eval_model=stack.eval_model,
+        cost_bucket_stage1=stack.cost_bucket("judge_stage1"),
+        cost_bucket_stage2=stack.cost_bucket("judge_stage2"),
+    )
     validation = validate_response(response, q.expected_forecasts)
-    result = QuestionRunResult(
+    result = ModelRunResult(
         response=response,
         evidence=evidence,
         validation=validation,
         quality=quality,
-        costs=costs,
     )
 
-    if not result.quality.adequate:
+    if not quality.adequate:
         if not use_browser:
-            print(f"  -> Browser skipped: disabled ({result.quality.confidence}% confidence)")
-        elif not result.quality.browser_would_help:
-            print(f"  -> Browser skipped: not useful ({result.quality.confidence}% confidence)")
-        elif not result.quality.browser_url:
-            print(f"  -> Browser skipped: no URL proposed ({result.quality.confidence}% confidence)")
+            print(f"  [{stack.tag}] Browser skipped: disabled ({quality.confidence}% confidence)")
+        elif not quality.browser_would_help:
+            print(f"  [{stack.tag}] Browser skipped: not useful ({quality.confidence}% confidence)")
+        elif not quality.browser_url:
+            print(f"  [{stack.tag}] Browser skipped: no URL proposed ({quality.confidence}% confidence)")
             result.browser_status = "proposed_no_url"
         else:
-            result = _try_browser_refinement(
-                q,
-                result,
-                test_mode=test_mode,
+            result = _try_browser_refinement_for_model(
+                q, result, stack=stack, costs=costs, test_mode=test_mode,
             )
     else:
-        print(f"  -> Quality: {result.quality.confidence}% confidence")
+        print(f"  [{stack.tag}] Quality: {quality.confidence}% confidence")
 
     color = result.response.forecasts[0].color_code.value if result.response.forecasts else "N/A"
-    print(f"  -> {color} | {'ok' if result.validation['ok'] else 'warning'}", flush=True)
+    print(f"  [{stack.tag}] {color} | {'ok' if result.validation['ok'] else 'warning'}", flush=True)
     return result
+
+
+def process_question(
+    q: QuestionSpec,
+    model: str | None = None,
+    use_browser: bool = True,
+    test_mode: bool = False,
+    *,
+    mode: str = "gpt",
+) -> QuestionRunResult:
+    """Run the surveillance pipeline for a question.
+
+    mode: "gpt", "claude", or "both" (default from the CLI).
+    `model` arg overrides the GPT research model when provided.
+    """
+    costs = RunCost()
+    gpt_stack, claude_stack = _build_stacks(test_mode)
+    if model is not None:
+        gpt_stack = _dc_replace(gpt_stack, research_model=model)
+    selected = {}
+    if mode in ("gpt", "both"):
+        selected["gpt"] = gpt_stack
+    if mode in ("claude", "both"):
+        selected["claude"] = claude_stack
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = {
+            tag: ex.submit(_run_single_model_pipeline, q,
+                           stack=stack, costs=costs,
+                           use_browser=use_browser, test_mode=test_mode)
+            for tag, stack in selected.items()
+        }
+        per_model: dict[str, ModelRunResult] = {}
+        for tag, fut in futures.items():
+            try:
+                per_model[tag] = fut.result()
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"  [{tag}] pipeline error: {type(e).__name__}: {e}", flush=True)
+                per_model[tag] = ModelRunResult(
+                    response=None, evidence=[],
+                    validation={"ok": False, "usable_for_scoring": False, "issues": ["model_errored"]},
+                    quality=None,
+                    error={"type": type(e).__name__, "message": str(e)[:500], "traceback": tb[-2000:]},
+                )
+
+    consensus = compute_consensus(per_model) if len(per_model) >= 2 else None
+    return QuestionRunResult(per_model=per_model, costs=costs, consensus=consensus)
+
+
+def _resolve_mode_flag(args) -> str:
+    """Pick run mode from --gpt/--claude/--both. Default = both."""
+    return getattr(args, "mode_flag", None) or "both"
 
 
 def cmd_run(args):
     active_model = TEST_MODEL if args.test_mode else DEFAULT_MODEL
+    active_claude = TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL
+    mode = _resolve_mode_flag(args)
+    # Run-level metadata reflects which models actually ran.
+    run_models = {}
+    if mode in ("gpt", "both"):
+        run_models["gpt"] = active_model
+    if mode in ("claude", "both"):
+        run_models["claude"] = active_claude
+    if mode in ("gpt", "both") and not os.environ.get("OPENAI_API_KEY"):
+        print("Error: OPENAI_API_KEY not set; required for --gpt and --both modes. Rerun with --claude to skip GPT.")
+        return 2
+    if mode in ("claude", "both") and not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY not set; required for --claude and --both modes. Rerun with --gpt to skip Claude.")
+        return 2
     if not args.yes:
-        print(f"Model: {active_model}")
+        active_models = {
+            "gpt": active_model,
+            "claude": TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL,
+            "both": f"{active_model} + {TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL}",
+        }[mode]
+        print(f"Mode: {mode} ({active_models})")
         print(f"Limit: {args.limit or 'all'}")
         print(f"BigQuery writes: {'skip' if args.no_bq else 'yes'}")
         print(f"Sheet: {'skip' if args.no_sheet else 'yes'}")
@@ -248,13 +389,9 @@ def cmd_run(args):
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     n = len(questions)
-    responses = [None] * n
-    evidences = [None] * n
-    validations = [None] * n
-    quality_reports = [None] * n
+    per_model_lists: list[dict | None] = [None] * n
     costs_list = [None] * n
-    browser_useds = [False] * n
-    browser_statuses = ["not_proposed"] * n
+    consensus_blocks = [None] * n
     errors_list = [None] * n
 
     workers = max(1, min(args.workers, n))
@@ -265,7 +402,8 @@ def cmd_run(args):
             print(f"[{i + 1}/{n}] {q.name} - starting", flush=True)
         try:
             result = process_question(
-                q, active_model, use_browser=not args.no_browser, test_mode=args.test_mode
+                q, use_browser=not args.no_browser, test_mode=args.test_mode,
+                mode=mode,
             )
             with print_lock:
                 print(f"[{i + 1}/{n}] {q.name} - done", flush=True)
@@ -288,29 +426,23 @@ def cmd_run(args):
             if err:
                 errors_list[i] = err
             else:
-                responses[i] = result.response
-                evidences[i] = result.evidence
-                validations[i] = result.validation
-                quality_reports[i] = result.quality
+                per_model_lists[i] = result.per_model
                 costs_list[i] = result.costs
-                browser_useds[i] = result.browser_used
-                browser_statuses[i] = result.browser_status
+                consensus_blocks[i] = result.consensus
 
     run_data = build_run_data(
         run_id,
-        active_model,
         questions,
-        responses,
-        validations,
-        evidences,
-        quality_reports,
+        mode=mode,
+        models=run_models,
+        per_model_lists=per_model_lists,
         costs_list=costs_list,
-        browser_useds=browser_useds,
-        browser_statuses=browser_statuses,
+        consensus_blocks=consensus_blocks,
         errors_list=errors_list,
     )
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
-    write_csv_output(run_id, questions, responses, DEFAULT_OUTPUT_DIR, validations=validations)
+    # CSV has model_id as the first column; both models go in as siblings.
+    write_csv_output(run_id, questions, per_model_lists, DEFAULT_OUTPUT_DIR)
     s = run_data["summary"]
     print(f"\nSaved: {json_path}")
     print(
@@ -431,6 +563,14 @@ Examples:
         help="Parallel question workers (default 1, recommended 5)",
     )
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
+    model_group = run_parser.add_mutually_exclusive_group()
+    model_group.add_argument("--gpt", dest="mode_flag", action="store_const", const="gpt",
+                              help="Run GPT-5.5 only")
+    model_group.add_argument("--claude", dest="mode_flag", action="store_const", const="claude",
+                              help="Run Claude Sonnet only")
+    model_group.add_argument("--both", dest="mode_flag", action="store_const", const="both",
+                              help="Run both GPT and Claude in parallel (default)")
 
     sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from a run tab to BigQuery")
     sync_parser.add_argument("--no-bq", action="store_true", help="Dry-run: print what would be synced; no write")

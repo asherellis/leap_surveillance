@@ -1,22 +1,25 @@
-"""LLM research, quality checks, and browser-use."""
+"""LLM research, judge, and browser-refinement prompt orchestration.
 
-import asyncio
-import ipaddress
+Chromium navigation and URL safety live in `browser.py`; this module is purely
+about LLM calls (research, evaluate_adequacy, decide_browser, refine_with_browser).
+"""
+
 import os
 import re
-import threading
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 import litellm
 from dotenv import load_dotenv
 
+from .browser import BROWSER_EVIDENCE_LIMIT, is_safe_url
 from .common import (
-    DEFAULT_BROWSER_MODEL,
     DEFAULT_EVALUATOR_MODEL,
     DEFAULT_MODEL,
     TEST_EVALUATOR_MODEL,
     TEST_MODEL,
+    _env_float,
+    _env_int,
+    provider_for_model,
 )
 from .models import (
     AdequacyAssessment,
@@ -38,36 +41,26 @@ load_dotenv()
 OPENAI_SAFETY_IDENTIFIER = os.environ.get("OPENAI_SAFETY_IDENTIFIER", "")
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        return default
-    return float(raw)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw in (None, ""):
-        return default
-    return int(raw)
-
-
 DEFAULT_REASONING_EFFORT = "high"
 
-BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
-MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
-BROWSER_EVIDENCE_LIMIT = _env_int("LEAP_BROWSER_EVIDENCE_LIMIT", 4000)
 RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 600.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 1)
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
+CLAUDE_THINKING_BUDGET = _env_int("LEAP_CLAUDE_THINKING_BUDGET", 5000)
+
+
+def _reasoning_params(model: str, test_mode: bool) -> dict:
+    """Return provider-specific reasoning param. Empty dict for test_mode (cheap models don't support it)."""
+    if test_mode:
+        return {}
+    if provider_for_model(model) == "anthropic":
+        return {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}}
+    return {"reasoning_effort": DEFAULT_REASONING_EFFORT}
+
 
 # Collapse degenerate LLM floats (0.000000...0) that bloat JSON past token limit.
 _COLLAPSE_FLOATS_RE = re.compile(r'(\d+\.\d{4})\d{4,}')
-
-# Limit browser-use Agent invocations to one at a time across worker threads.
-# Each Agent spawns a Chromium process; running >1 concurrently risks resource contention.
-_BROWSER_SEMAPHORE = threading.Semaphore(1)
 
 
 QUANTILE_INTERPRETATION_FULL = """Quantile interpretation:
@@ -230,9 +223,11 @@ def research_question(
     attempt: int = 1,
     test_mode: bool = False,
     costs: RunCost | None = None,
+    cost_bucket: str = "research",
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     if test_mode:
-        model = TEST_MODEL
+        from .common import provider_for_model, TEST_CLAUDE_MODEL
+        model = TEST_CLAUDE_MODEL if provider_for_model(model) == "anthropic" else TEST_MODEL
 
     run_date = datetime.now(timezone.utc).date().isoformat()
     prompt = f"""You are a research analyst. Use web search to find the relevant evidence, then produce a structured forecast.
@@ -293,10 +288,8 @@ Requirements:
                 "max_output_tokens": 30000,
                 "timeout": RESEARCH_TIMEOUT,
                 "safety_identifier": OPENAI_SAFETY_IDENTIFIER or None,
+                **_reasoning_params(model, test_mode),
             }
-            # Some lower-cost test models do not support reasoning_effort.
-            if not test_mode:
-                params["reasoning_effort"] = DEFAULT_REASONING_EFFORT
             response = litellm.responses(**params)
             break
         except Exception as e:
@@ -309,7 +302,7 @@ Requirements:
             raise
 
     if costs is not None:
-        costs.research += _response_cost(response, model)
+        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(response, model))
 
     text = _extract_text_from_response(response)
     text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
@@ -326,6 +319,7 @@ Requirements:
                 attempt=attempt + 1,
                 test_mode=test_mode,
                 costs=costs,
+                cost_bucket=cost_bucket,
             )
         print(f"    validation error (raw text[:500]): {text[:500]}")
         raise
@@ -415,6 +409,8 @@ def evaluate_adequacy(
     evidence: list[EvidenceItem],
     test_mode: bool = False,
     costs: RunCost | None = None,
+    eval_model: str | None = None,
+    cost_bucket: str = "judge_stage1",
 ) -> AdequacyAssessment:
     expected_summary = _format_expected_for_judge(question.expected_forecasts)
     sources_summary = _format_evidence_for_judge(evidence)
@@ -465,9 +461,10 @@ Use the full 0-100 range. Identical numbers across questions suggest you are not
 
 Put only concrete problems in issues[]. Keep each issue to one sentence. Do not include praise or affirmative observations such as "sources are authoritative", "forecasts are complete", or "rationale is well-grounded". Provide a brief reason explaining the issue list and adequacy decision."""
 
-    eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
+    if eval_model is None:
+        eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
     try:
-        return _call_structured_judge(prompt, AdequacyAssessment, eval_model, 6000, "judge_stage1", costs)
+        return _call_structured_judge(prompt, AdequacyAssessment, eval_model, 6000, cost_bucket, costs)
     except Exception as e:
         # On evaluator failure, mark inadequate so a human reviewer is alerted.
         return AdequacyAssessment(
@@ -485,6 +482,8 @@ def decide_browser(
     adequacy: AdequacyAssessment,
     test_mode: bool = False,
     costs: RunCost | None = None,
+    eval_model: str | None = None,
+    cost_bucket: str = "judge_stage2",
 ) -> BrowserDecision:
     sources_summary = _format_evidence_for_judge(evidence)
     issues_list = "\n".join(f"- {i}" for i in adequacy.issues) or "- (no specific issues listed)"
@@ -524,9 +523,10 @@ Decide:
 - If yes, propose a specific browser_url and a concrete browser_objective ("Extract the X value from the Y table").
 - If no, set browser_would_help=false and leave browser_url empty. Explain briefly in reason."""
 
-    eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
+    if eval_model is None:
+        eval_model = TEST_EVALUATOR_MODEL if test_mode else DEFAULT_EVALUATOR_MODEL
     try:
-        decision = _call_structured_judge(prompt, BrowserDecision, eval_model, 800, "judge_stage2", costs)
+        decision = _call_structured_judge(prompt, BrowserDecision, eval_model, 800, cost_bucket, costs)
         if decision.browser_would_help:
             url = decision.browser_url.strip()
             if not url:
@@ -557,9 +557,15 @@ def judge_response(
     test_mode: bool = False,
     costs: RunCost | None = None,
     propose_browser: bool = True,
+    eval_model: str | None = None,
+    cost_bucket_stage1: str = "judge_stage1",
+    cost_bucket_stage2: str = "judge_stage2",
 ) -> ResearchQualityReport:
     # Pass propose_browser=False on a re-judge to skip the second judge call.
-    adequacy = evaluate_adequacy(response, question, evidence, test_mode=test_mode, costs=costs)
+    adequacy = evaluate_adequacy(
+        response, question, evidence, test_mode=test_mode, costs=costs,
+        eval_model=eval_model, cost_bucket=cost_bucket_stage1,
+    )
 
     if adequacy.adequate and adequacy.confidence < MIN_ADEQUATE_CONFIDENCE:
         adequacy = AdequacyAssessment(
@@ -587,7 +593,8 @@ def judge_response(
         )
 
     browser_dec = decide_browser(
-        response, question, evidence, adequacy, test_mode=test_mode, costs=costs
+        response, question, evidence, adequacy, test_mode=test_mode, costs=costs,
+        eval_model=eval_model, cost_bucket=cost_bucket_stage2,
     )
     combined_reason = adequacy.reason
     if browser_dec.reason:
@@ -610,6 +617,8 @@ def refine_with_browser(
     evidence: list[EvidenceItem] | None = None,
     test_mode: bool = False,
     costs: RunCost | None = None,
+    model: str | None = None,
+    cost_bucket: str = "refinement",
 ) -> SurveillanceResponse:
     original_sources = [e for e in (evidence or []) if e.source_type != "browser"]
     sources_block = (
@@ -661,7 +670,8 @@ Instructions:
     schema = _research_schema(question)
 
     try:
-        model = TEST_MODEL if test_mode else DEFAULT_MODEL
+        if model is None:
+            model = TEST_MODEL if test_mode else DEFAULT_MODEL
         params = {
             "model": model,
             "input": [{"role": "user", "content": prompt}],
@@ -676,12 +686,11 @@ Instructions:
             "max_output_tokens": 30000,
             "timeout": RESEARCH_TIMEOUT,
             "safety_identifier": OPENAI_SAFETY_IDENTIFIER or None,
+            **_reasoning_params(model, test_mode),
         }
-        if not test_mode:
-            params["reasoning_effort"] = DEFAULT_REASONING_EFFORT
         response = litellm.responses(**params)
         if costs is not None:
-            costs.refinement += _response_cost(response, model)
+            setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(response, model))
         text = _extract_text_from_response(response)
         text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
         refined_response, _ = strict_to_regular_response(text, question.expected_forecasts)
@@ -689,133 +698,3 @@ Instructions:
     except Exception as e:
         print(f"  Refinement failed, keeping original: {e}")
         return original_response
-
-
-def is_safe_url(url: str) -> tuple[bool, str]:
-    try:
-        parsed = urlparse(url)
-
-        if parsed.scheme not in ("http", "https"):
-            return False, f"Invalid scheme: {parsed.scheme}"
-
-        host = parsed.hostname or ""
-
-        # Avoid letting the agent wander into search engines / CAPTCHA loops.
-        search_domains = (
-            "google.com",
-            "googleusercontent.com",
-            "bing.com",
-            "duckduckgo.com",
-            "yahoo.com",
-            "baidu.com",
-            "yandex.com",
-            "search.brave.com",
-        )
-        if any(host == d or host.endswith(f".{d}") for d in search_domains):
-            return False, "Search engine domain blocked"
-
-        if host in ("localhost", "127.0.0.1", "::1"):
-            return False, "Localhost blocked"
-
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
-                return False, f"Private/reserved IP blocked: {host}"
-        except ValueError:
-            pass
-
-        if host == "metadata.google.internal":
-            return False, "Metadata endpoint blocked"
-
-        return True, ""
-    except Exception as e:
-        return False, f"URL parse error: {e}"
-
-
-def _get_browser_llm(model: str):
-    from browser_use.llm.openai.chat import ChatOpenAI as BrowserChatOpenAI
-    bare_model = model.split("/", 1)[-1] if "/" in model else model
-    return BrowserChatOpenAI(model=bare_model, api_key=os.environ.get("OPENAI_API_KEY"))
-
-
-def browser_extract(
-    url: str, objective: str, test_mode: bool = False, model_override: str | None = None
-) -> BrowserEvidence:
-    # PDF viewers make browser-use extraction unreliable.
-    if url.lower().endswith(".pdf"):
-        return BrowserEvidence(
-            url=url,
-            objective=objective,
-            extracted_text="",
-            success=False,
-            error="PDF URL not supported by browser_extract (use web_search evidence instead)",
-        )
-
-    safe, reason = is_safe_url(url)
-    if not safe:
-        return BrowserEvidence(
-            url=url,
-            objective=objective,
-            extracted_text="",
-            success=False,
-            error=f"Unsafe URL: {reason}",
-        )
-
-    async def _extract():
-        from browser_use import Agent, Browser
-
-        model = model_override or (TEST_MODEL if test_mode else DEFAULT_BROWSER_MODEL)
-        llm = _get_browser_llm(model)
-        browser = Browser(headless=True)
-        try:
-            agent = Agent(
-                task=f"Go to {url} and {objective}. Return only the extracted data.",
-                llm=llm,
-                browser=browser,
-            )
-            return await asyncio.wait_for(
-                agent.run(max_steps=MAX_BROWSER_STEPS), timeout=BROWSER_TIMEOUT
-            )
-        finally:
-            await browser.stop()
-
-    try:
-        with _BROWSER_SEMAPHORE:
-            result = asyncio.run(_extract())
-        # Prefer final result; full histories include transient errors.
-        extracted = getattr(result, "final_result", lambda: None)() or ""
-
-        # browser-use sometimes returns its own error text instead of raising.
-        failure_markers = [
-            "Invalid schema for response_format",
-            "Stopping due to 3 consecutive failures",
-            "LLM API call failed",
-            '"error":',
-            "was not successful",
-            "Unfinished",
-            "CAPTCHA",
-            "recaptcha",
-            "ERR_CERT",
-        ]
-        if not extracted or any(m in extracted for m in failure_markers):
-            return BrowserEvidence(
-                url=url,
-                objective=objective,
-                extracted_text="",
-                success=False,
-                error="browser-use run failed (see logs)",
-            )
-
-        return BrowserEvidence(url=url, objective=objective, extracted_text=extracted, success=True)
-    except ImportError:
-        return BrowserEvidence(
-            url=url,
-            objective=objective,
-            extracted_text="",
-            success=False,
-            error="browser-use not installed",
-        )
-    except Exception as e:
-        return BrowserEvidence(
-            url=url, objective=objective, extracted_text="", success=False, error=str(e)
-        )

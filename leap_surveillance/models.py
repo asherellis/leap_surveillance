@@ -49,10 +49,18 @@ class RunCost:
     judge_stage1: float = 0.0
     judge_stage2: float = 0.0
     refinement: float = 0.0
+    # Claude path (dual-model mode).
+    claude_research: float = 0.0
+    claude_judge_stage1: float = 0.0
+    claude_judge_stage2: float = 0.0
+    claude_refinement: float = 0.0
 
     @property
     def total(self) -> float:
-        return self.research + self.judge_stage1 + self.judge_stage2 + self.refinement
+        return (
+            self.research + self.judge_stage1 + self.judge_stage2 + self.refinement
+            + self.claude_research + self.claude_judge_stage1 + self.claude_judge_stage2 + self.claude_refinement
+        )
 
     def as_dict(self) -> dict:
         return {
@@ -60,6 +68,10 @@ class RunCost:
             "judge_stage1": self.judge_stage1,
             "judge_stage2": self.judge_stage2,
             "refinement": self.refinement,
+            "claude_research": self.claude_research,
+            "claude_judge_stage1": self.claude_judge_stage1,
+            "claude_judge_stage2": self.claude_judge_stage2,
+            "claude_refinement": self.claude_refinement,
             "total": self.total,
         }
 

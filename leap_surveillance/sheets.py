@@ -19,47 +19,47 @@ SHEET_SCOPES = [
 ]
 CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
-REVIEW_HEADERS = [
-    "question_name",
-    "status",
-    "target_date",
-    "dimension",
-    "question_text",
-    "resolution_criteria",
-    "question_type",
-    "unit",
-    "llm_answer",
-    "llm_color",
-    "q0",
-    "q5",
-    "q25",
-    "q75",
-    "q95",
-    "q100",
-    "judge_confidence",
-    "browser_status",
-    "missing_data",
-    "judge_reason",
-    "validation_issues",
-    "latest_official_value",
-    "latest_official_date",
-    "latest_official_source",
-    "current_estimate",
-    "current_estimate_confidence",
-    "rationale",
-    "all_sources",
-    "resolution_source",
-    "resolution_source_date",
-    "review_verdict",
-    "review_value",
-    "review_source",
-    "review_color",
-    "review_notes",
-    "reviewed",
-    "group_id",
-    "question_id",
-    "run_id",
+_MODEL_FIELDS = [
+    "answer", "color",
+    "q0", "q5", "q25", "q75", "q95", "q100",
+    "judge_confidence", "browser_status",
+    "missing_data", "judge_reason", "validation_issues",
+    "latest_official_value", "latest_official_date", "latest_official_source",
+    "current_estimate", "current_estimate_confidence",
+    "rationale", "sources",
+    "resolution_source", "resolution_source_date",
 ]
+
+_METADATA_COLS = ["question_name", "status", "target_date", "dimension",
+                  "question_text", "resolution_criteria", "question_type", "unit"]
+_CONSENSUS_COLS = ["consensus_status", "consensus_color_match", "consensus_q50_match", "consensus_q50_delta_pct"]
+_REVIEWER_COLS = ["review_verdict", "review_value", "review_source", "review_color", "review_notes", "reviewed"]
+_SYNC_COLS = ["group_id", "question_id", "run_id"]
+
+
+def _interleaved_model_cols() -> list[str]:
+    """Generate (gpt_X, claude_X) interleaved pairs for every per-model field."""
+    cols = []
+    for f in _MODEL_FIELDS:
+        cols.append(f"gpt_{f}")
+        cols.append(f"claude_{f}")
+    return cols
+
+
+def _review_headers(mode: str) -> list[str]:
+    """Return the column list for a given run mode.
+
+    --both: 65 cols (8 metadata + 44 interleaved gpt/claude pairs + 4 consensus + 6 reviewer + 3 sync)
+    --gpt / --claude: 39 cols (8 metadata + 22 single-model cols + 6 reviewer + 3 sync, no consensus)
+    """
+    if mode == "both":
+        return [*_METADATA_COLS, *_interleaved_model_cols(), *_CONSENSUS_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
+    tag = "gpt" if mode == "gpt" else "claude"
+    return [*_METADATA_COLS, *[f"{tag}_{f}" for f in _MODEL_FIELDS], *_REVIEWER_COLS, *_SYNC_COLS]
+
+
+# Full dual-model header list, kept for backward compat with external callers.
+REVIEW_HEADERS = _review_headers("both")
 
 VERDICT_OPTIONS = ["correct", "close", "wrong", "confidently wrong"]
 COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
@@ -72,29 +72,32 @@ INSTRUCTIONS_CONTENT = [
     ["How to review"],
     ["Open the newest run tab."],
     ["Read the question and resolution criteria. Check the answer, rationale, and sources."],
-    ["Set review_verdict on every row."],
-    ["If you change the answer, fill review_value and review_source."],
-    ["Tick reviewed when the row is done."],
+    ["For rows you review: set review_verdict, fill review_value and review_source if you change the answer, and tick reviewed."],
+    ["Skip rows you don't review - they stay untouched."],
     ["When finished, run leap-surveillance sync. To preview first, run leap-surveillance sync --no-bq."],
     [""],
     ["Column groups"],
     ["A-H", "Question, resolution criteria, target date, status, type, and unit."],
-    ["I-AD", "The LLM's answer, the full forecast distribution, judge evaluation, rationale, and cited sources."],
-    ["AE-AJ", "Reviewer columns. Fill these in."],
-    ["AK-AM", "Sync IDs - leave alone."],
+    ["I-AZ", "GPT and Claude interleaved pairs (--both mode only): gpt_answer next to claude_answer, gpt_color next to claude_color, etc. In --gpt or --claude only mode, the tab has 39 columns (only that model's 22 output columns, no consensus block)."],
+    ["BA-BD", "Consensus block (--both mode only). Auto-accepted only if both models adequate AND every row agrees on color + q50."],
+    ["BE-BJ", "Reviewer columns. Fill these in."],
+    ["BK-BM", "Sync IDs - leave alone."],
     [""],
     ["Key columns"],
     ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
-    ["llm_answer", "The value to review. For forecast rows, this is q50."],
+    ["gpt_answer", "GPT's value at the target date. For forecast rows, this is q50."],
+    ["claude_answer", "Claude's value at the target date. Compare to gpt_answer."],
     [
-        "current_estimate",
-        "The LLM's value as of today. Not the same as llm_answer, which is at the target date.",
+        "gpt_current_estimate / claude_current_estimate",
+        "The model's value as of today. Not the same as gpt_answer/claude_answer, which is at the target date.",
     ],
-    ["q25 / q75", "50% confidence interval (IQR) around q50. Forecast rows only."],
-    ["judge_confidence", "Confidence in the research, not confidence that the forecast will happen."],
-    ["validation_issues", "Problems to check before approving."],
-    ["missing_data", "Gaps the judge flagged."],
-    ["browser_status", "not_proposed / proposed_no_url / extract_failed / refinement_rejected / accepted."],
+    ["gpt_q25 / gpt_q75", "50% confidence interval (IQR) around gpt_answer. Same for Claude side."],
+    ["gpt_judge_confidence", "Judge's confidence in its review of GPT's research. Same for Claude side."],
+    ["gpt_validation_issues / claude_validation_issues", "Deterministic-validator findings per model."],
+    ["gpt_missing_data / claude_missing_data", "Gaps the per-model judge flagged."],
+    ["gpt_browser_status / claude_browser_status", "not_proposed / proposed_no_url / extract_failed / refinement_rejected / accepted."],
+    ["consensus_status", "auto_accepted / disagreement / single_model_only / both_failed."],
+    ["consensus_q50_delta_pct", "|gpt - claude| / mean. <0.10 means models agree on the value (non-black rows)."],
     ["review_verdict", "correct / close / wrong / confidently wrong."],
     ["reviewed", "Only reviewed rows are synced."],
 ]
@@ -181,8 +184,122 @@ def _render_when_year(value: str) -> str:
     return value
 
 
-def build_review_rows(run_data: dict) -> list[list]:
-    """Collapse raw forecast rows into human-review rows ordered by REVIEW_HEADERS."""
+def _extract_model_view(model_block: dict, q_type: str) -> dict:
+    """Extract everything one model contributes to a Sheet row, ready for per-row indexing."""
+    if not model_block:
+        return {
+            "quality_confidence": "", "missing_data": "", "judge_reason": "",
+            "browser_status": "", "rationale": "", "sources": "",
+            "validation_issues": "",
+            "groups": {}, "official_map": {}, "current_map": {}, "resolution_map": {},
+            "absent": True,
+        }
+    response = model_block.get("response") or {}
+    quality = model_block.get("quality") or {}
+    validation = model_block.get("validation") or {}
+
+    groups: dict[tuple, dict] = defaultdict(dict)
+    for forecast in response.get("forecasts", []) or []:
+        fdate = forecast.get("forecast_date", "")
+        dim = forecast.get("dimension", "Overall")
+        q = forecast.get("quantile")
+        groups[(fdate, dim)][q] = forecast
+
+    official_map, current_map, resolution_map = context_maps(response)
+
+    return {
+        "quality_confidence": safe_str(quality.get("confidence", "")),
+        "missing_data": ", ".join(quality.get("missing_data", []) or [])[:SHEET_TEXT_LIMIT],
+        "judge_reason": safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT],
+        "browser_status": model_block.get("browser_status") or (
+            "accepted" if model_block.get("browser_used") else "not_proposed"
+        ),
+        "rationale": safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT],
+        "sources": ", ".join(response.get("sources", []) or [])[:SHEET_TEXT_LIMIT],
+        "validation_issues": ", ".join(validation.get("issues", []) or [])[:SHEET_TEXT_LIMIT],
+        "groups": dict(groups),
+        "official_map": official_map,
+        "current_map": current_map,
+        "resolution_map": resolution_map,
+        "absent": False,
+    }
+
+
+def _row_fields_for_model(view: dict, fdate: str, dim: str, q_type: str) -> dict:
+    """Compute the per-row fields for one model (answer, color, distribution, official values, etc)."""
+    if view.get("absent"):
+        return {k: "" for k in (
+            "answer", "color",
+            "q0", "q5", "q25", "q75", "q95", "q100",
+            "latest_official_value", "latest_official_date", "latest_official_source",
+            "current_estimate", "current_estimate_confidence",
+            "resolution_source", "resolution_source_date",
+        )}
+
+    quants = view["groups"].get((fdate, dim)) or {}
+    display_forecast = quants.get(50) or (next(iter(quants.values())) if quants else {})
+    color_code = display_forecast.get("color_code", "") if display_forecast else ""
+    if isinstance(color_code, dict):
+        color_code = color_code.get("value", "")
+    row_type = "resolved" if color_code == "black" else "forecast"
+
+    res_val = view["resolution_map"].get((fdate, dim)) or view["resolution_map"].get((fdate, "Overall")) or {}
+
+    if row_type == "resolved":
+        td_val = safe_str(display_forecast.get("forecast_value", ""))
+        if not td_val:
+            td_val = safe_str(res_val.get("value", ""))
+        q0_val = q5_val = q25_val = q75_val = q95_val = q100_val = ""
+        res_source_date = safe_str(res_val.get("source_date", ""))
+        res_source = safe_str(res_val.get("source", ""))[:SHEET_TEXT_LIMIT]
+    else:
+        td_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
+        q0_val = safe_str(quants.get(0, {}).get("forecast_value", ""))
+        q5_val = safe_str(quants.get(5, {}).get("forecast_value", ""))
+        q25_val = safe_str(quants.get(25, {}).get("forecast_value", ""))
+        q75_val = safe_str(quants.get(75, {}).get("forecast_value", ""))
+        q95_val = safe_str(quants.get(95, {}).get("forecast_value", ""))
+        q100_val = safe_str(quants.get(100, {}).get("forecast_value", ""))
+        res_source_date = ""
+        res_source = ""
+        if q_type == "when":
+            td_val = _render_when_year(td_val)
+            q0_val = _render_when_year(q0_val)
+            q5_val = _render_when_year(q5_val)
+            q25_val = _render_when_year(q25_val)
+            q75_val = _render_when_year(q75_val)
+            q95_val = _render_when_year(q95_val)
+            q100_val = _render_when_year(q100_val)
+
+    cur_val_obj = view["current_map"].get(dim) or view["current_map"].get("Overall") or {}
+    cur_val = safe_str(cur_val_obj.get("value", ""))
+    cur_conf = safe_str(cur_val_obj.get("confidence", ""))
+
+    off_val_obj = view["official_map"].get(dim) or view["official_map"].get("Overall") or {}
+    off_val = safe_str(off_val_obj.get("value", ""))
+    off_date = safe_str(off_val_obj.get("date", ""))
+    off_source = safe_str(off_val_obj.get("source", ""))[:SHEET_TEXT_LIMIT]
+
+    return {
+        "answer": td_val, "color": color_code,
+        "q0": q0_val, "q5": q5_val, "q25": q25_val,
+        "q75": q75_val, "q95": q95_val, "q100": q100_val,
+        "latest_official_value": off_val, "latest_official_date": off_date,
+        "latest_official_source": off_source,
+        "current_estimate": cur_val, "current_estimate_confidence": cur_conf,
+        "resolution_source": res_source, "resolution_source_date": res_source_date,
+    }
+
+
+def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
+    """Collapse raw forecast rows into human-review rows.
+
+    Returns (rows, headers). Headers match the run's mode:
+    --both produces 65-col interleaved gpt_*/claude_* pairs with consensus;
+    --gpt / --claude produces 39-col single-model layout without consensus.
+    """
+    mode = run_data.get("mode", "both")
+    headers = _review_headers(mode)
     run_id = run_data.get("run_id", "unknown")
     rows: list[list] = []
 
@@ -193,114 +310,108 @@ def build_review_rows(run_data: dict) -> list[list]:
         q_unit = question.get("unit", "")
         q_text = safe_str(question.get("question_text", ""))[:SHEET_TEXT_LIMIT]
         q_criteria = safe_str(question.get("resolution_criteria", ""))[:SHEET_TEXT_LIMIT]
-        response = question.get("response") or {}
-        quality = question.get("quality") or {}
-        validation = question.get("validation") or {}
-        confidence = safe_str(quality.get("confidence", ""))
-        confidence_reason = safe_str(quality.get("reason", ""))[:SHEET_TEXT_LIMIT]
-        validation_issues = ", ".join(validation.get("issues", []) or [])[:SHEET_TEXT_LIMIT]
-        missing_data = ", ".join(quality.get("missing_data", []) or [])[:SHEET_TEXT_LIMIT]
-        browser_status = question.get("browser_status") or ("accepted" if question.get("browser_used") else "not_proposed")
-        rationale = safe_str(response.get("rationale", ""))[:SHEET_TEXT_LIMIT]
-        sources = ", ".join(response.get("sources", []))[:SHEET_TEXT_LIMIT]
+        per_model = question.get("per_model") or {}
 
-        # Group forecasts by (forecast_date, dimension) -> {quantile: forecast}
-        groups: dict[tuple, dict] = defaultdict(dict)
-        for forecast in response.get("forecasts", []):
-            fdate = forecast.get("forecast_date", "")
-            dim = forecast.get("dimension", "Overall")
-            q = forecast.get("quantile")
-            groups[(fdate, dim)][q] = forecast
+        gpt_view = _extract_model_view(per_model.get("gpt") or {}, q_type)
+        claude_view = _extract_model_view(per_model.get("claude") or {}, q_type)
 
-        official_map, current_map, resolution_map = context_maps(response)
+        # Driving set of (date, dim) keys: union of both models' forecast groups.
+        all_keys = set(gpt_view["groups"].keys()) | set(claude_view["groups"].keys())
 
-        for (fdate, dim), quants in groups.items():
+        # Consensus block (whole-question status + per-row diffs)
+        consensus_block = question.get("consensus") or {}
+        consensus_status_val = consensus_block.get("status", "") if consensus_block else ""
+        row_diff_by_key: dict[tuple, dict] = {
+            (rd.get("forecast_date", ""), rd.get("dimension", "Overall")): rd
+            for rd in consensus_block.get("row_diffs", []) or []
+        }
+
+        for (fdate, dim) in sorted(all_keys):
             group_id = make_review_group_id(run_id, q_id, fdate, dim)
-            display_forecast = quants.get(50) or next(iter(quants.values()))
-            color_code = display_forecast.get("color_code", "")
-            row_type = "resolved" if color_code == "black" else "forecast"
 
-            res_val = resolution_map.get((fdate, dim)) or resolution_map.get((fdate, "Overall")) or {}
+            gpt_row = _row_fields_for_model(gpt_view, fdate, dim, q_type)
+            claude_row = _row_fields_for_model(claude_view, fdate, dim, q_type)
 
-            if row_type == "resolved":
-                td_val = safe_str(display_forecast.get("forecast_value", ""))
-                if not td_val:
-                    td_val = safe_str(res_val.get("value", ""))
-                q0_val = q5_val = q25_val = q75_val = q95_val = q100_val = ""
-                res_source_date = safe_str(res_val.get("source_date", ""))
-                res_source = safe_str(res_val.get("source", ""))[:SHEET_TEXT_LIMIT]
-            else:
-                td_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
-                q0_val = safe_str(quants.get(0, {}).get("forecast_value", ""))
-                q5_val = safe_str(quants.get(5, {}).get("forecast_value", ""))
-                q25_val = safe_str(quants.get(25, {}).get("forecast_value", ""))
-                q75_val = safe_str(quants.get(75, {}).get("forecast_value", ""))
-                q95_val = safe_str(quants.get(95, {}).get("forecast_value", ""))
-                q100_val = safe_str(quants.get(100, {}).get("forecast_value", ""))
-                res_source_date = ""
-                res_source = ""
-                if q_type == "when":
-                    td_val = _render_when_year(td_val)
-                    q0_val = _render_when_year(q0_val)
-                    q5_val = _render_when_year(q5_val)
-                    q25_val = _render_when_year(q25_val)
-                    q75_val = _render_when_year(q75_val)
-                    q95_val = _render_when_year(q95_val)
-                    q100_val = _render_when_year(q100_val)
+            # Driving color for the status column: prefer GPT, fall back to Claude.
+            display_color = gpt_row.get("color") or claude_row.get("color") or ""
 
-            cur_val_obj = current_map.get(dim) or current_map.get("Overall") or {}
-            cur_val = safe_str(cur_val_obj.get("value", ""))
-            cur_conf = safe_str(cur_val_obj.get("confidence", ""))
-
-            off_val_obj = official_map.get(dim) or official_map.get("Overall") or {}
-            off_val = safe_str(off_val_obj.get("value", ""))
-            off_date = safe_str(off_val_obj.get("date", ""))
-            off_source = safe_str(off_val_obj.get("source", ""))[:SHEET_TEXT_LIMIT]
+            row_diff = row_diff_by_key.get((fdate, dim)) or {}
+            color_match = row_diff.get("color_match")
+            q50_match = row_diff.get("q50_match")
+            delta_pct = row_diff.get("delta_pct")
+            color_match_str = "" if color_match is None else ("TRUE" if color_match else "FALSE")
+            q50_match_str = "" if q50_match is None else ("TRUE" if q50_match else "FALSE")
+            delta_pct_str = "" if delta_pct is None else f"{delta_pct:.3f}"
 
             row = {
+                # Question metadata
                 "question_name": q_name,
+                "status": resolution_status(fdate, display_color),
                 "target_date": fdate,
                 "dimension": dim,
-                "question_type": q_type,
-                "unit": q_unit,
-                "status": resolution_status(fdate, color_code),
-                "llm_color": color_code,
-                "llm_answer": td_val,
-                "current_estimate": cur_val,
-                "current_estimate_confidence": cur_conf,
-                "q0": q0_val,
-                "q5": q5_val,
-                "q25": q25_val,
-                "q75": q75_val,
-                "q95": q95_val,
-                "q100": q100_val,
-                "resolution_source_date": res_source_date,
-                "resolution_source": res_source,
-                "latest_official_value": off_val,
-                "latest_official_date": off_date,
-                "latest_official_source": off_source,
-                "rationale": rationale,
-                "all_sources": sources,
-                "judge_confidence": confidence,
-                "validation_issues": validation_issues,
-                "missing_data": missing_data,
-                "browser_status": browser_status,
-                "review_value": "",
-                "review_source": "",
-                "review_verdict": "",
-                "review_notes": "",
-                "review_color": "",
-                "reviewed": "",
                 "question_text": q_text,
                 "resolution_criteria": q_criteria,
-                "judge_reason": confidence_reason,
+                "question_type": q_type,
+                "unit": q_unit,
+                # GPT side scalars + per-model judge fields
+                "gpt_judge_confidence": gpt_view["quality_confidence"],
+                "gpt_browser_status": gpt_view["browser_status"],
+                "gpt_missing_data": gpt_view["missing_data"],
+                "gpt_judge_reason": gpt_view["judge_reason"],
+                "gpt_validation_issues": gpt_view["validation_issues"],
+                "gpt_rationale": gpt_view["rationale"],
+                "gpt_sources": gpt_view["sources"],
+                # Claude side scalars
+                "claude_judge_confidence": claude_view["quality_confidence"],
+                "claude_browser_status": claude_view["browser_status"],
+                "claude_missing_data": claude_view["missing_data"],
+                "claude_judge_reason": claude_view["judge_reason"],
+                "claude_validation_issues": claude_view["validation_issues"],
+                "claude_rationale": claude_view["rationale"],
+                "claude_sources": claude_view["sources"],
+                # Per-row per-model fields
+                "gpt_answer": gpt_row["answer"], "claude_answer": claude_row["answer"],
+                "gpt_color": gpt_row["color"], "claude_color": claude_row["color"],
+                "gpt_q0": gpt_row["q0"], "claude_q0": claude_row["q0"],
+                "gpt_q5": gpt_row["q5"], "claude_q5": claude_row["q5"],
+                "gpt_q25": gpt_row["q25"], "claude_q25": claude_row["q25"],
+                "gpt_q75": gpt_row["q75"], "claude_q75": claude_row["q75"],
+                "gpt_q95": gpt_row["q95"], "claude_q95": claude_row["q95"],
+                "gpt_q100": gpt_row["q100"], "claude_q100": claude_row["q100"],
+                "gpt_latest_official_value": gpt_row["latest_official_value"],
+                "claude_latest_official_value": claude_row["latest_official_value"],
+                "gpt_latest_official_date": gpt_row["latest_official_date"],
+                "claude_latest_official_date": claude_row["latest_official_date"],
+                "gpt_latest_official_source": gpt_row["latest_official_source"],
+                "claude_latest_official_source": claude_row["latest_official_source"],
+                "gpt_current_estimate": gpt_row["current_estimate"],
+                "claude_current_estimate": claude_row["current_estimate"],
+                "gpt_current_estimate_confidence": gpt_row["current_estimate_confidence"],
+                "claude_current_estimate_confidence": claude_row["current_estimate_confidence"],
+                "gpt_resolution_source": gpt_row["resolution_source"],
+                "claude_resolution_source": claude_row["resolution_source"],
+                "gpt_resolution_source_date": gpt_row["resolution_source_date"],
+                "claude_resolution_source_date": claude_row["resolution_source_date"],
+                # Consensus
+                "consensus_status": consensus_status_val,
+                "consensus_color_match": color_match_str,
+                "consensus_q50_match": q50_match_str,
+                "consensus_q50_delta_pct": delta_pct_str,
+                # Reviewer (empty for human fill-in)
+                "review_verdict": "",
+                "review_value": "",
+                "review_source": "",
+                "review_color": "",
+                "review_notes": "",
+                "reviewed": "",
+                # Sync IDs
                 "group_id": group_id,
                 "question_id": q_id,
                 "run_id": run_id,
             }
-            rows.append([row.get(h, "") for h in REVIEW_HEADERS])
+            rows.append([row.get(h, "") for h in headers])
 
-    return rows
+    return rows, headers
 
 
 def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
@@ -309,26 +420,26 @@ def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
     sheet = client.open_by_key(sheet_id)
     run_id = run_data.get("run_id", "unknown")
     tab_name = run_tab_name(run_id)
-    ws = _create_run_tab(sheet, tab_name)
-    rows = build_review_rows(run_data)
+    rows, headers = build_review_rows(run_data)
+    ws = _create_run_tab(sheet, tab_name, headers)
 
     if rows:
         start_row = 2
         end_row = start_row + len(rows) - 1
         ws.update(f"A{start_row}", rows, value_input_option="USER_ENTERED")
-        _apply_row_validation(sheet, ws.id, start_row, end_row)
-        _sort_review_rows(sheet, ws.id)
+        _apply_row_validation(sheet, ws.id, start_row, end_row, headers)
+        _sort_review_rows(sheet, ws.id, headers)
 
     _reorder_tabs(sheet)
     return len(rows)
 
 
-def _sort_review_rows(sheet, ws_id: int) -> None:
+def _sort_review_rows(sheet, ws_id: int, headers: list[str]) -> None:
     """Sort review rows (excluding header) by question_name, target_date, dimension."""
     cols = [
-        REVIEW_HEADERS.index("question_name"),
-        REVIEW_HEADERS.index("target_date"),
-        REVIEW_HEADERS.index("dimension"),
+        headers.index("question_name"),
+        headers.index("target_date"),
+        headers.index("dimension"),
     ]
     sheet.batch_update({"requests": [{
         "sortRange": {
@@ -336,16 +447,16 @@ def _sort_review_rows(sheet, ws_id: int) -> None:
                 "sheetId": ws_id,
                 "startRowIndex": 1,
                 "startColumnIndex": 0,
-                "endColumnIndex": len(REVIEW_HEADERS),
+                "endColumnIndex": len(headers),
             },
             "sortSpecs": [{"dimensionIndex": c, "sortOrder": "ASCENDING"} for c in cols],
         }
     }]})
 
 
-def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int) -> None:
+def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int, headers: list[str]) -> None:
     def _val(col_name: str, rule: dict) -> dict:
-        idx = REVIEW_HEADERS.index(col_name)
+        idx = headers.index(col_name)
         return {
             "setDataValidation": {
                 "range": {
@@ -440,19 +551,34 @@ def _format_instructions(sheet, ws) -> None:
 
 # Three column-width buckets: narrow (N=80), medium (M=140), wide (W=210).
 _N, _M, _W = 80, 140, 210
-_REVIEW_COL_WIDTHS = [
-    _M, _M, _M, _M, _M, _M, _M, _M,
-    _M, _N, _N, _N, _N, _N, _N, _N,
-    _N, _M, _W, _W, _W,
-    _M, _M, _W, _M, _N,
-    _W, _W, _W, _M,
-    _M, _M, _M, _M, _W, _N,
-    _M, _M, _M,
-]
+
+# Per-field widths for model output columns (gpt_X / claude_X).
+_FIELD_WIDTH = {
+    "answer": _M, "color": _N,
+    "q0": _N, "q5": _N, "q25": _N, "q75": _N, "q95": _N, "q100": _N,
+    "judge_confidence": _N, "browser_status": _M,
+    "missing_data": _W, "judge_reason": _W, "validation_issues": _W,
+    "latest_official_value": _M, "latest_official_date": _M, "latest_official_source": _W,
+    "current_estimate": _M, "current_estimate_confidence": _N,
+    "rationale": _W, "sources": _W,
+    "resolution_source": _W, "resolution_source_date": _M,
+}
 
 
-def _create_run_tab(sheet, tab_name: str):
-    """Create a per-run review tab."""
+def _header_width(col: str) -> int:
+    """Return pixel width for any review column."""
+    for prefix in ("gpt_", "claude_"):
+        if col.startswith(prefix):
+            return _FIELD_WIDTH.get(col[len(prefix):], _M)
+    if col in ("consensus_color_match", "consensus_q50_match", "consensus_q50_delta_pct", "reviewed"):
+        return _N
+    if col == "review_notes":
+        return _W
+    return _M
+
+
+def _create_run_tab(sheet, tab_name: str, headers: list[str]):
+    """Create a per-run review tab sized and colored for the given header list."""
     import gspread
 
     try:
@@ -460,8 +586,8 @@ def _create_run_tab(sheet, tab_name: str):
         sheet.del_worksheet(existing)
     except gspread.WorksheetNotFound:
         pass
-    ws = sheet.add_worksheet(tab_name, rows=1000, cols=len(REVIEW_HEADERS))
-    ws.update("A1", [REVIEW_HEADERS])
+    ws = sheet.add_worksheet(tab_name, rows=1000, cols=len(headers))
+    ws.update("A1", [headers])
 
     def _header_band(start_col: int, end_col: int, r: float, g: float, b: float) -> dict:
         return {
@@ -480,6 +606,13 @@ def _create_run_tab(sheet, tab_name: str):
                 "fields": "userEnteredFormat(backgroundColor,textFormat)",
             }
         }
+
+    # Compute band boundaries from the actual headers list.
+    meta_end = len(_METADATA_COLS)
+    consensus_start = headers.index("consensus_status") if "consensus_status" in headers else None
+    reviewer_start = headers.index("review_verdict")
+    sync_start = headers.index("group_id")
+    n = len(headers)
 
     format_requests = [
         {
@@ -505,10 +638,14 @@ def _create_run_tab(sheet, tab_name: str):
                 "fields": "pixelSize",
             }
         },
-        _header_band(0, 8, 0.93, 0.93, 0.93),
-        _header_band(8, 30, 0.85, 0.92, 0.98),
-        _header_band(30, 36, 0.86, 0.94, 0.86),
-        _header_band(36, len(REVIEW_HEADERS), 0.96, 0.96, 0.96),
+        _header_band(0, meta_end, 0.93, 0.93, 0.93),                                   # gray   — metadata
+        _header_band(meta_end, consensus_start or reviewer_start, 0.90, 0.92, 0.96),    # blue   — model cols
+    ]
+    if consensus_start is not None:
+        format_requests.append(_header_band(consensus_start, reviewer_start, 0.99, 0.95, 0.80))  # yellow — consensus
+    format_requests += [
+        _header_band(reviewer_start, sync_start, 0.86, 0.94, 0.86),   # green    — reviewer
+        _header_band(sync_start, n, 0.96, 0.96, 0.96),                 # gray-dim — sync IDs
         {
             "setBasicFilter": {
                 "filter": {
@@ -516,20 +653,20 @@ def _create_run_tab(sheet, tab_name: str):
                         "sheetId": ws.id,
                         "startRowIndex": 0,
                         "startColumnIndex": 0,
-                        "endColumnIndex": len(REVIEW_HEADERS),
+                        "endColumnIndex": n,
                     }
                 }
             }
         },
     ]
-    for i, width in enumerate(_REVIEW_COL_WIDTHS):
+    for i, col in enumerate(headers):
         format_requests.append({
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": ws.id, "dimension": "COLUMNS",
                     "startIndex": i, "endIndex": i + 1,
                 },
-                "properties": {"pixelSize": width},
+                "properties": {"pixelSize": _header_width(col)},
                 "fields": "pixelSize",
             }
         })
@@ -616,12 +753,6 @@ def get_reviewed_items(
             "unit": row.get("unit"),
             "type": "resolved" if str(status).strip().lower() in ("resolved", "resolved_early", "due_unresolved") else "forecast",
             "status": status,
-            "judge_confidence": row.get("judge_confidence"),
-            "validation_issues": row.get("validation_issues"),
-            "llm_answer": row.get("llm_answer"),
-            "current_estimate": row.get("current_estimate"),
-            "q25": row.get("q25"),
-            "q75": row.get("q75"),
             "review_value": row.get("review_value"),
             "review_source": row.get("review_source"),
             "review_verdict": row.get("review_verdict"),
