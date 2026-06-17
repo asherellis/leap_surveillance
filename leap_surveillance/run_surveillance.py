@@ -286,7 +286,6 @@ def _run_single_model_pipeline(
 
 def process_question(
     q: QuestionSpec,
-    model: str | None = None,
     use_browser: bool = True,
     test_mode: bool = False,
     *,
@@ -295,8 +294,6 @@ def process_question(
     """Run the surveillance pipeline for one question across the selected model(s)."""
     costs = RunCost()
     gpt_stack, claude_stack = _build_stacks(test_mode)
-    if model is not None:
-        gpt_stack = _dc_replace(gpt_stack, research_model=model)
     selected = {}
     if mode in ("gpt", "both"):
         selected["gpt"] = gpt_stack

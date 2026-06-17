@@ -4,7 +4,10 @@ from datetime import date, datetime, timezone
 import math
 import os
 
+from dotenv import load_dotenv
 import pandas as pd
+
+load_dotenv()
 
 DEFAULT_OUTPUT_DIR = "outputs"
 DEFAULT_BQ_PROJECT = os.environ.get("LEAP_BQ_PROJECT") or "data-warehouse-dev-492608"

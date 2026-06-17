@@ -30,7 +30,7 @@ def _infer_surveillance_question_type(
         return "when"
 
     asks_probability = bool(
-        re.search(r"\bprobability\b|\bprobabilit(y|ies)\b|\bwill\b", text)
+        re.search(r"\bprobabilit(y|ies)\b|\bwill\b", text)
     )
     probability_unit = "probability" in unit_lower
     scalar_probability = pct_set == {50} and (

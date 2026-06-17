@@ -94,7 +94,7 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_missing_data / claude_missing_data", "Gaps the per-model judge flagged."],
     ["gpt_browser_status / claude_browser_status", "not_proposed / proposed_no_url / extract_failed / refinement_rejected / accepted."],
     ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Cross-model agreement within this run."],
-    ["consensus_q50_delta_pct", "|gpt - claude| / mean(gpt, claude). <0.10 = models agree on value (non-black rows)."],
+    ["consensus_q50_delta_pct", "|gpt - claude| / mean(gpt, claude). <=0.10 = models agree on value (non-black rows)."],
     ["run_stability", "both_stable / one_stable / converging / volatile / new. Cross-run consistency over last 10 production runs."],
     ["confidence_tier", "high = auto_accepted + both_stable. medium = auto_accepted + partially stable. low = everything else."],
     ["review_verdict", "correct / close / wrong / confidently wrong."],
