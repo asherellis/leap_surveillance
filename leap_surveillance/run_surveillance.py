@@ -268,6 +268,7 @@ def _run_single_model_pipeline(
             print(f"  [{stack.tag}] Browser skipped: disabled ({quality.confidence}% confidence)")
         elif not quality.browser_would_help:
             print(f"  [{stack.tag}] Browser skipped: not useful ({quality.confidence}% confidence)")
+            result.browser_status = "not_useful"
         elif not quality.browser_url:
             print(f"  [{stack.tag}] Browser skipped: no URL proposed ({quality.confidence}% confidence)")
             result.browser_status = "proposed_no_url"

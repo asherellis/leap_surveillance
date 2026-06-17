@@ -179,6 +179,8 @@ def _research_schema(question: QuestionSpec) -> dict:
         allowed_dimensions=sorted({f.dimension for f in question.expected_forecasts}),
         allowed_quantiles=sorted({f.quantile for f in question.expected_forecasts if f.quantile is not None}),
         allowed_forecast_dates=sorted({f.forecast_date for f in question.expected_forecasts}),
+        unit_min=question.unit_min,
+        unit_max=question.unit_max,
     )
 
 
@@ -284,7 +286,7 @@ def _gpt_research(
                 input=[{"role": "user", "content": prompt}],
                 tools=[{"type": "web_search"}],
                 text={"format": {"type": "json_schema", "name": "StrictSurveillanceResponse", "schema": schema, "strict": True}},
-                max_output_tokens=30000,
+                max_output_tokens=64000,
                 timeout=RESEARCH_TIMEOUT,
                 safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
                 **extra,
@@ -764,7 +766,7 @@ Instructions:
                 model=model_id,
                 input=[{"role": "user", "content": prompt}],
                 text={"format": {"type": "json_schema", "name": "StrictSurveillanceResponse", "schema": schema, "strict": True}},
-                max_output_tokens=30000,
+                max_output_tokens=64000,
                 timeout=RESEARCH_TIMEOUT,
                 safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
                 **extra,

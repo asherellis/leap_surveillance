@@ -223,6 +223,8 @@ def make_strict_schema(
     allowed_dimensions: Optional[list[str]] = None,
     allowed_quantiles: Optional[list[int]] = None,
     allowed_forecast_dates: Optional[list[str]] = None,
+    unit_min: Optional[float] = None,
+    unit_max: Optional[float] = None,
 ) -> dict:
     schema = model.model_json_schema()
 
@@ -260,6 +262,12 @@ def make_strict_schema(
         resolution_properties["forecast_date"]["enum"] = allowed_forecast_dates
     if allowed_dimensions and "dimension" in resolution_properties:
         resolution_properties["dimension"]["enum"] = allowed_dimensions
+    if unit_min is not None or unit_max is not None:
+        fv_prop = properties.get("forecast_value", {})
+        if unit_min is not None:
+            fv_prop["minimum"] = unit_min
+        if unit_max is not None:
+            fv_prop["maximum"] = unit_max
     return schema
 
 
@@ -407,6 +415,17 @@ def validate_response(
             if target_date and source_date and source_date > target_date:
                 issues.append(f"resolution_source_after_target_{r.forecast_date}_{r.dimension}")
 
+        expected_resolution_keys = {
+            (e.forecast_date, e.dimension) for e in expected if e.value_type == "resolution"
+        }
+        if expected_resolution_keys:
+            returned_resolution_keys = {
+                (r.forecast_date, r.dimension) for r in response.resolution_values if r.value is not None
+            }
+            missing_resolutions = expected_resolution_keys - returned_resolution_keys
+            if missing_resolutions:
+                issues.append(f"missing_{len(missing_resolutions)}_resolution_values")
+
     null_count = sum(1 for f in response.forecasts if f.forecast_value is None)
     if null_count > len(response.forecasts) // 2:
         issues.append(f"{null_count}_null_values")
@@ -459,6 +478,10 @@ def validate_response(
     for key, colors in group_colors.items():
         if len(colors) > 1:
             issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")
+
+    for f in response.forecasts:
+        if getattr(f.value_type, "value", f.value_type) == "resolution" and f.color_code.value != "black":
+            issues.append(f"resolution_not_black_{f.forecast_date}_{f.dimension}")
 
     if expected_has_q50:
         usable_for_scoring = any(
