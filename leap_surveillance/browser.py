@@ -6,7 +6,7 @@ import os
 import threading
 from urllib.parse import urlparse
 
-from .common import DEFAULT_BROWSER_MODEL, TEST_MODEL, _env_float, _env_int, provider_for_model
+from .common import DEFAULT_BROWSER_MODEL, TEST_MODEL, _env_float, _env_int, provider_for_model, strip_provider_prefix
 from .models import BrowserEvidence
 
 
@@ -61,7 +61,7 @@ def is_safe_url(url: str) -> tuple[bool, str]:
 
 
 def _get_browser_llm(model: str):
-    bare_model = model.split("/", 1)[-1] if "/" in model else model
+    bare_model = strip_provider_prefix(model)
     if provider_for_model(model) == "anthropic":
         from browser_use.llm.anthropic.chat import ChatAnthropic as BrowserChatAnthropic
         return BrowserChatAnthropic(model=bare_model, api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -73,14 +73,14 @@ def browser_extract(
     url: str, objective: str, test_mode: bool = False, model_override: str | None = None
 ) -> BrowserEvidence:
     """Drive Chromium via browser-use to extract `objective` from `url`."""
-    # PDF viewers make browser-use extraction unreliable.
-    if url.lower().endswith(".pdf"):
+    # Download files can't be navigated or read by the browser agent.
+    if any(url.lower().endswith(ext) for ext in (".pdf", ".zip", ".xlsx", ".xls", ".csv")):
         return BrowserEvidence(
             url=url,
             objective=objective,
             extracted_text="",
             success=False,
-            error="PDF URL not supported by browser_extract (use web_search evidence instead)",
+            error="Download URL not supported by browser_extract (use web_search evidence instead)",
         )
 
     safe, reason = is_safe_url(url)

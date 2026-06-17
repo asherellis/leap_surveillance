@@ -1,7 +1,8 @@
 """Local file and BigQuery storage for LEAP surveillance."""
 
 import csv
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,10 @@ from google.cloud.bigquery import DmlStats
 from .common import (
     DEFAULT_BQ_PROJECT,
     DEFAULT_SURVEILLANCE_DATASET,
+    NEAR_ZERO_SUM,
+    Q50_TOLERANCE,
+    TIMING_FORECAST_DATE,
     is_empty,
-    make_result_id,
     resolution_status,
     safe_str,
     to_float,
@@ -198,10 +201,10 @@ def build_run_data(
             "question_text": q.question_text,
             "resolution_criteria": q.resolution_criteria,
             "background_info": q.background_info,
+            "dim_question_map": q.dim_question_map,
         }
         if error:
             result["error"] = error
-        # Per-model block (symmetric — gpt and claude are siblings)
         per_model_block = {}
         for tag, model_result in (per_model or {}).items():
             per_model_block[tag] = _serialize_model_result(model_result) or {}
@@ -223,12 +226,142 @@ def build_run_data(
     }
 
 
+_STABILITY_MAX_RUNS = 10   # prior production runs to consider
+_STABILITY_SCAN_CAP = 40   # files to scan looking for them (most are legacy/test runs)
+_WHEN_TOLERANCE_YR = 2     # ±years for non-black when-type rows
+
+
+def _stable_pair(a: float | None, b: float | None, color: str | None, q_type: str) -> bool:
+    """Two q50s agree: exact for resolved (black) rows, tolerance band otherwise."""
+    if a is None or b is None:
+        return False
+    if color == "black":
+        return a == b
+    if q_type == "when":
+        return abs(a - b) <= _WHEN_TOLERANCE_YR
+    s = abs(a) + abs(b)
+    return s < NEAR_ZERO_SUM or abs(a - b) / (s / 2) <= Q50_TOLERANCE
+
+
+def _classify_sequence(points: list[tuple], q_type: str) -> str:
+    """points = [(q50, color), ...] oldest→newest. Tolerance uses the newer point's color."""
+    pts = [p for p in points if p[0] is not None]
+    if len(pts) <= 1:
+        return "new"
+    consistent = all(_stable_pair(pts[i][0], pts[i + 1][0], pts[i + 1][1], q_type) for i in range(len(pts) - 1))
+    if not consistent:
+        return "volatile"
+    return "converging" if len(pts) == 2 else "stable"
+
+
+def _worst_stability(labels: list[str]) -> str:
+    """Roll a model's per-row stability up to one label — worst wins; new only if no data."""
+    non_new = [label for label in labels if label != "new"]
+    if not non_new:
+        return "new"
+    if "volatile" in non_new:
+        return "volatile"
+    if "converging" in non_new:
+        return "converging"
+    return "stable"
+
+
+def _combine_stability(gpt_stab: str, claude_stab: str) -> str:
+    if gpt_stab == "stable" and claude_stab == "stable":
+        return "both_stable"
+    if gpt_stab == "new" and claude_stab == "new":
+        return "new"
+    if "volatile" in (gpt_stab, claude_stab):
+        return "volatile"
+    if gpt_stab in ("stable", "converging") and claude_stab in ("stable", "converging"):
+        return "converging"
+    return "one_stable"
+
+
+def _adequate_q50s(model_block: dict):
+    """Yield (fdate, dim, q50, color) for each adequate q50 forecast in a model block."""
+    if not model_block or model_block.get("error"):
+        return
+    if not (model_block.get("quality") or {}).get("adequate", False):
+        return
+    for fc in (model_block.get("response") or {}).get("forecasts", []):
+        if fc.get("quantile") == 50 and fc.get("forecast_value") is not None:
+            color = fc.get("color_code")
+            color = color.get("value", color) if isinstance(color, dict) else color
+            yield fc.get("forecast_date", ""), fc.get("dimension", "Overall"), fc.get("forecast_value"), color
+
+
+def _read_production_history(output_dir: str, current_models: dict, current_run_id: str) -> list[dict]:
+    """Most-recent prior runs whose models match the current production models, oldest→newest."""
+    files = sorted(Path(output_dir).glob("run_*.json"), reverse=True)
+    runs: list[dict] = []
+    for path in files[:_STABILITY_SCAN_CAP]:
+        if len(runs) >= _STABILITY_MAX_RUNS:
+            break
+        if "_partial" in path.stem:
+            continue
+        if path.stem[len("run_"):] == current_run_id:
+            continue
+        try:
+            run = json.loads(path.read_text())
+        except Exception:
+            continue
+        models = run.get("models") or {}
+        if any(m and models.get(tag) == m for tag, m in current_models.items()):
+            runs.append(run)
+    runs.reverse()
+    return runs
+
+
+def enrich_with_run_stability(run_data: dict, output_dir: str) -> dict:
+    """Annotate each question with cross-run stability, scanning prior production runs once."""
+    current_models = run_data.get("models") or {}
+    current_run_id = run_data.get("run_id", "")
+    q_types = {q.get("id", ""): q.get("question_type", "quantile") for q in run_data.get("questions", [])}
+
+    seq: dict[tuple, list] = defaultdict(list)   # (qid, tag, fdate, dim) -> [(q50, color), ...] oldest→newest
+    runs_seen: dict[str, set] = defaultdict(set)  # qid -> {run_id, ...}
+
+    def ingest(run: dict) -> None:
+        rid = run.get("run_id", "")
+        models = run.get("models") or {}
+        for q in run.get("questions", []):
+            qid = q.get("id", "")
+            for tag, model_block in (q.get("per_model") or {}).items():
+                if models.get(tag) != current_models.get(tag):  # only this model's own production history
+                    continue
+                for fdate, dim, q50, color in _adequate_q50s(model_block):
+                    seq[(qid, tag, fdate, dim)].append((q50, color))
+                    runs_seen[qid].add(rid)
+
+    for run in _read_production_history(output_dir, current_models, current_run_id):
+        ingest(run)
+    ingest(run_data)  # current run is the newest point
+
+    per_qtag: dict[tuple, list] = defaultdict(list)  # (qid, tag) -> [row labels]
+    for (qid, tag, _fdate, _dim), points in seq.items():
+        per_qtag[(qid, tag)].append(_classify_sequence(points, q_types.get(qid, "quantile")))
+
+    for q in run_data.get("questions", []):
+        qid = q.get("id", "")
+        gpt_stab = _worst_stability(per_qtag.get((qid, "gpt"), []))
+        claude_stab = _worst_stability(per_qtag.get((qid, "claude"), []))
+        q["run_stability"] = {
+            "gpt_run_stability": gpt_stab,
+            "claude_run_stability": claude_stab,
+            "run_stability": _combine_stability(gpt_stab, claude_stab),
+            "runs_seen": len(runs_seen.get(qid, set())),
+        }
+    return run_data
+
+
 def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
     """Question-level run counts. Prefers GPT when both models ran; falls back to Claude."""
     ok_count = 0
     quality_issue_count = 0
     browser_count = 0
     due_unresolved = 0
+    model_error_count = 0
 
     for per_model in per_model_lists:
         # Question-level summary uses whichever model produced output (GPT preferred for stable counts).
@@ -250,12 +383,16 @@ def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
                 seen.add(key)
                 if resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
                     due_unresolved += 1
+        for model_result in (per_model or {}).values():
+            if model_result is not None and model_result.error:
+                model_error_count += 1
 
     return {
         "question_count": len(per_model_lists),
         "ok_count": ok_count,
         "quality_issue_count": quality_issue_count,
         "error_count": sum(1 for e in errors_iter if e),
+        "model_error_count": model_error_count,
         "browser_count": browser_count,
         "due_unresolved_count": due_unresolved,
         "total_cost": sum((c.total if c is not None else 0.0) for c in costs_iter),
@@ -389,16 +526,13 @@ def _merge_bq(
         non_pk_cols = [col for col in cols if col != pk]
         update_cols = [col for col in (update_cols or non_pk_cols) if col in non_pk_cols]
 
-        def q(col: str) -> str:
-            return f"`{col}`"
-
-        update_assignments = ", ".join([f"{q(col)} = S.{q(col)}" for col in update_cols])
+        update_assignments = ", ".join([f"`{col}` = S.`{col}`" for col in update_cols])
         insert_cols = [pk] + non_pk_cols
-        insert_cols_csv = ", ".join(q(col) for col in insert_cols)
-        insert_vals_csv = ", ".join(f"S.{q(col)}" for col in insert_cols)
+        insert_cols_csv = ", ".join(f"`{col}`" for col in insert_cols)
+        insert_vals_csv = ", ".join(f"S.`{col}`" for col in insert_cols)
 
         matched_clause = (
-            f"WHEN MATCHED AND S.{q(clock_col)} > T.{q(clock_col)} THEN"
+            f"WHEN MATCHED AND S.`{clock_col}` > T.`{clock_col}` THEN"
             if clock_col and clock_col in cols
             else "WHEN MATCHED THEN"
         )
@@ -411,7 +545,7 @@ def _merge_bq(
         merge_sql = f"""
         MERGE `{target}` T
         USING `{temp}` S
-        ON T.{q(pk)} = S.{q(pk)}
+        ON T.`{pk}` = S.`{pk}`
         {update_branch}
         WHEN NOT MATCHED THEN
         INSERT ({insert_cols_csv}) VALUES ({insert_vals_csv})
@@ -434,7 +568,7 @@ def _try_merge_bigquery_rows(
     pk: str,
     dataset: str,
     table: str,
-    clock_col: str,
+    clock_col: str | None = None,
     dtypes: dict | None = None,
 ):
     if not rows:
@@ -461,275 +595,92 @@ def _try_merge_bigquery_rows(
         return None
 
 
-def write_surveillance_to_bigquery(run_data: dict) -> dict:
-    run_id = run_data.get("run_id")
-    created_at = run_data.get("created_at")
-    mode = run_data.get("mode", "gpt")
-    models = run_data.get("models") or {}
+def write_accepted_to_fact_resolution(run_data: dict, reviewed_items: list | None = None):
+    """Write auto-accepted or human-approved forecasts to fact.fact_resolution."""
+    now = datetime.now(timezone.utc)
 
-    result_rows = []
-    evidence_rows = []
-    for question in run_data.get("questions", []):
-        q_id = question.get("id")
-        per_model = question.get("per_model") or {}
-        for model_id, model_block in per_model.items():
-            if not model_block:
+    reviewed_map: dict[tuple, dict] = {}
+    for item in (reviewed_items or []):
+        key = (item.get("question_id", ""), item.get("target_date", ""), item.get("dimension", "Overall") or "Overall")
+        reviewed_map[key] = item
+
+    def q50_values(per_model: dict, fdate: str, dim: str) -> list[float]:
+        vals = []
+        for block in per_model.values():
+            for fc in (block.get("response") or {}).get("forecasts", []):
+                if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
+                    d = fc.get("dimension", "Overall") or "Overall"
+                    v = fc.get("forecast_value")
+                    if d == dim and v is not None:
+                        vals.append(float(v))
+        return vals
+
+    def row_color(per_model: dict, fdate: str, dim: str) -> str | None:
+        for tag in ("gpt", "claude"):
+            for fc in (per_model.get(tag) or {}).get("response", {}).get("forecasts", []):
+                if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
+                    if (fc.get("dimension", "Overall") or "Overall") == dim:
+                        c = fc.get("color_code")
+                        return c.get("value", c) if isinstance(c, dict) else c
+        return None
+
+    rows = []
+    for q in run_data.get("questions", []):
+        group_qid = q.get("id", "")
+        per_model = q.get("per_model") or {}
+        consensus_status = (q.get("consensus") or {}).get("status", "")
+        dim_q_map = q.get("dim_question_map") or {}
+
+        for key, dq_id in dim_q_map.items():
+            fdate, dim = key.split("|", 1)
+            if fdate == TIMING_FORECAST_DATE:
+                continue  # "event_occurrence" is not a real date; fact_resolution.resolution_date is DATE
+            reviewed = reviewed_map.get((group_qid, fdate, dim))
+
+            if reviewed is not None:
+                verdict = (reviewed.get("review_verdict") or "").lower().strip()
+                if verdict not in ("correct", "close"):
+                    continue
+                raw = reviewed.get("review_value", "")
+                if raw not in (None, ""):
+                    try:
+                        value = float(raw)
+                    except (ValueError, TypeError):
+                        continue
+                else:
+                    # require explicit value when models disagreed
+                    if consensus_status != "auto_accepted":
+                        continue
+                    vals = q50_values(per_model, fdate, dim)
+                    if not vals:
+                        continue
+                    value = sum(vals) / len(vals)
+                source = "surveillance_reviewed"
+            elif consensus_status == "auto_accepted":
+                vals = q50_values(per_model, fdate, dim)
+                if not vals:
+                    continue
+                value = sum(vals) / len(vals)
+                source = "surveillance_consensus"
+            else:
                 continue
-            validation = model_block.get("validation") or {}
-            response = model_block.get("response") or {}
-            quality = model_block.get("quality") or {}
 
-            for forecast in response.get("forecasts", []):
-                color = forecast.get("color_code")
-                result_id = make_result_id(
-                    run_id,
-                    q_id,
-                    forecast.get("forecast_date"),
-                    forecast.get("dimension"),
-                    forecast.get("quantile"),
-                    model_id,
-                )
-                row = _forecast_output_row(
-                    q_id=q_id,
-                    q_name=question.get("name"),
-                    model_id=model_id,
-                    forecast=forecast,
-                    response=response,
-                    validation=validation,
-                    run_id=run_id,
-                    created_at=created_at,
-                    result_id=result_id,
-                )
-                result_rows.append({
-                    "result_id": result_id,
-                    "run_id": run_id,
-                    "model_id": model_id,
-                    "question_id": q_id,
-                    "question_name": question.get("name"),
-                    "question_type": question.get("question_type"),
-                    "unit": question.get("unit"),
-                    "unit_min": question.get("unit_min"),
-                    "unit_max": question.get("unit_max"),
-                    # target_value_type chooses the numeric value column; resolution_status is the
-                    # human review status derived from date + color. Related, but not interchangeable.
-                    "target_value_type": row.get("target_value_type"),
-                    "target_date": row.get("target_date"),
-                    "dimension": forecast.get("dimension"),
-                    "quantile": forecast.get("quantile"),
-                    "forecast_target_value": _none_if_empty(row.get("forecast_target_value")),
-                    "resolution_target_value": _none_if_empty(row.get("resolution_target_value")),
-                    "color_code": color,
-                    "resolution_status": row.get("resolution_status"),
-                    "resolution_source_date": row.get("resolution_source_date") or None,
-                    "resolution_source": row.get("resolution_source") or None,
-                    "current_estimate_value": _none_if_empty(row.get("current_estimate_value")),
-                    "current_estimate_confidence": _none_if_empty(row.get("current_estimate_confidence")),
-                    "latest_official_value": _none_if_empty(row.get("latest_official_value")),
-                    "latest_official_date": row.get("latest_official_date") or None,
-                    "latest_official_source": row.get("latest_official_source") or None,
-                    "rationale": (response.get("rationale") or "")[:2000],
-                    "sources": ", ".join(response.get("sources") or [])[:1000],
-                    "validation_ok": validation.get("ok", False),
-                    "validation_issues": ", ".join(validation.get("issues") or [])[:1000] or None,
-                    "usable_for_scoring": validation.get("usable_for_scoring", False),
-                    "quality_confidence": quality.get("confidence"),
-                    "quality_adequate": quality.get("adequate"),
-                    "quality_missing_data": "; ".join(quality.get("missing_data") or [])[:1000] or None,
-                    "quality_reason": (quality.get("reason") or "")[:2000] or None,
-                    "browser_would_help": quality.get("browser_would_help"),
-                    "browser_url": quality.get("browser_url") or None,
-                    "browser_objective": quality.get("browser_objective") or None,
-                    "browser_used": bool(model_block.get("browser_used")),
-                    "review_status": None,
-                    "override_value": None,
-                    "override_color": None,
-                    "final_value": _first_non_empty(row.get("forecast_target_value"), row.get("resolution_target_value")),
-                    "final_color": color,
-                    "notes": None,
-                    "reviewed_at": None,
-                    "created_at": created_at,
-                    "ingestion_timestamp": datetime.now(timezone.utc),
-                })
+            color = row_color(per_model, fdate, dim)
+            is_resolved = color == "black"
+            rows.append({
+                "question_id": dq_id,
+                "resolution_value": value,
+                "resolution_date": date.fromisoformat(fdate),
+                "resolution_source": source,
+                "resolution_status": "resolved" if is_resolved else "projected",
+                "resolved_at": now if is_resolved else None,
+            })
 
-            for i, ev in enumerate(model_block.get("evidence") or []):
-                evidence_rows.append({
-                    "evidence_id": f"{run_id}_{q_id}_{model_id}_{i}",
-                    "run_id": run_id,
-                    "model_id": model_id,
-                    "question_id": q_id,
-                    "source_type": ev.get("source_type"),
-                    "url": ev.get("url"),
-                    "title": ev.get("title"),
-                    "snippet": (ev.get("snippet") or "")[:1000],
-                    "full_text": (ev.get("full_text") or "")[:5000],
-                    "created_at": created_at,
-                    "ingestion_timestamp": datetime.now(timezone.utc),
-                })
-
-    summary = run_data.get("summary") or {}
-    run_rows = [{
-        "run_id": run_id,
-        "created_at": created_at,
-        "mode": mode,
-        "gpt_model": models.get("gpt"),
-        "claude_model": models.get("claude"),
-        "question_count": summary.get("question_count", 0),
-        "success_count": summary.get("ok_count", 0),
-        "error_count": summary.get("error_count", 0),
-        "browser_count": summary.get("browser_count", 0),
-        "total_cost": summary.get("total_cost", 0.0),
-        "ingestion_timestamp": datetime.now(timezone.utc),
-    }]
-
-    result_dtypes = {
-        "override_value": "Float64",
-        "override_color": "string",
-        "review_status": "string",
-        "notes": "string",
-        "quality_confidence": "Int64",
-        "forecast_target_value": "Float64",
-        "resolution_target_value": "Float64",
-        "current_estimate_value": "Float64",
-        "current_estimate_confidence": "Int64",
-        "latest_official_value": "Float64",
-        "unit_min": "Float64",
-        "unit_max": "Float64",
-    }
-
-    return {
-        "results": _try_merge_bigquery_rows(
-            "BigQuery results", result_rows,
-            pk="result_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_result",
-            clock_col="ingestion_timestamp", dtypes=result_dtypes,
-        ),
-        "evidence": _try_merge_bigquery_rows(
-            "BigQuery evidence", evidence_rows,
-            pk="evidence_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_evidence",
-            clock_col="ingestion_timestamp",
-        ),
-        "runs": _try_merge_bigquery_rows(
-            "BigQuery run", run_rows,
-            pk="run_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_run",
-            clock_col="ingestion_timestamp",
-        ),
-    }
-
-
-def _get_existing_result_ids_for_groups(group_ids: list[str]) -> dict[str, list[tuple[str, int]]]:
-    """Find existing result rows for reviewed Sheet groups."""
-    if not group_ids:
-        return {}
-
-    prefixes = [f"{g}_" for g in group_ids]
-    query = f"""
-    SELECT result_id
-    FROM `{DEFAULT_BQ_PROJECT}.{DEFAULT_SURVEILLANCE_DATASET}.surveillance_result`
-    WHERE EXISTS (
-        SELECT 1
-        FROM UNNEST(@prefixes) AS prefix
-        WHERE STARTS_WITH(result_id, prefix)
+    if not rows:
+        return None
+    return _try_merge_bigquery_rows(
+        "fact_resolution", rows,
+        pk="question_id", dataset="fact", table="fact_resolution",
     )
-    """
-    by_group: dict[str, list[tuple[str, int]]] = {g: [] for g in group_ids}
-    try:
-        df = query_bq(
-            query,
-            query_parameters=[
-                bigquery.ArrayQueryParameter("prefixes", "STRING", prefixes)
-            ],
-        )
-    except Exception as e:
-        print(f"  warning: could not read existing result_ids ({e}); no rows will be updated")
-        return by_group
-
-    for rid in df["result_id"].tolist():
-        # Result IDs are {group_id}_{quantile}_{model_id}. If the trailing segment is
-        # non-numeric, peel it off as the model_id and re-parse for {group_id}_{quantile}.
-        head, _, tail = rid.rpartition("_")
-        if not tail.isdigit():
-            head, _, tail = head.rpartition("_")
-        if not tail.isdigit():
-            continue
-        if head in by_group:
-            by_group[head].append((rid, int(tail)))
-    return by_group
 
 
-def sync_reviews_to_bigquery(reviewed_items: list[dict]) -> dict:
-    if not reviewed_items:
-        return {"results": None, "skipped": 0}
-
-    reviewed_at = datetime.now(timezone.utc)
-
-    unique_groups = list({item.get("group_id", "") for item in reviewed_items if item.get("group_id")})
-    existing_by_group = _get_existing_result_ids_for_groups(unique_groups)
-
-    pending_rows = []
-    missing_groups: list[str] = []
-    for item in reviewed_items:
-        group_id = item.get("group_id", "")
-        row_type = item.get("type", "")
-        override_color = item.get("review_color")
-        override_color = _none_if_empty(override_color)
-        free_notes = safe_str(item.get("review_notes")) or ""
-
-        override_val = to_float(item.get("review_value"))
-        if row_type == "resolved":
-            score = safe_str(item.get("review_verdict", ""))
-            note_parts = []
-            if score:
-                note_parts.append(f"score:{score}")
-            if free_notes:
-                note_parts.append(free_notes)
-            notes = " ".join(note_parts) or None
-        else:
-            notes = free_notes or None
-
-        existing = existing_by_group.get(group_id, [])
-        if not existing:
-            missing_groups.append(group_id)
-            continue
-
-        for result_id, q in existing:
-            row = {
-                "result_id": result_id,
-                "review_status": "Reviewed",
-                "usable_for_scoring": True,
-                "notes": notes,
-                "reviewed_at": reviewed_at,
-                "ingestion_timestamp": datetime.now(timezone.utc),
-            }
-
-            if row_type == "resolved" and override_val is not None:
-                row["final_value"] = override_val
-                if q == 50:
-                    row["override_value"] = override_val
-            elif row_type == "forecast" and q == 50 and override_val is not None:
-                row["final_value"] = override_val
-                row["override_value"] = override_val
-
-            if override_color:
-                row["override_color"] = override_color
-                row["final_color"] = override_color
-
-            pending_rows.append(row)
-
-    skipped = len(missing_groups)
-    if skipped > 0:
-        preview = f"{missing_groups[:3]}{'...' if skipped > 3 else ''}"
-        print(
-            f"  warning: {skipped} reviewed group(s) had no rows in "
-            f"surveillance_result; skipped: {preview}"
-        )
-
-    if not pending_rows:
-        return {"results": None, "skipped": skipped}
-
-    return {
-        "results": _try_merge_bigquery_rows(
-            "BigQuery results (review update)", pending_rows,
-            pk="result_id", dataset=DEFAULT_SURVEILLANCE_DATASET, table="surveillance_result",
-            clock_col="ingestion_timestamp",
-        ),
-        "skipped": skipped,
-    }

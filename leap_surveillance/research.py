@@ -1,21 +1,27 @@
 """LLM calls: research, adequacy judge, browser decision, and refinement."""
 
+import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 
-import litellm
+import anthropic
+import openai
 from dotenv import load_dotenv
 
 from .browser import BROWSER_EVIDENCE_LIMIT, is_safe_url
 from .common import (
     DEFAULT_EVALUATOR_MODEL,
     DEFAULT_MODEL,
+    TEST_CLAUDE_MODEL,
     TEST_EVALUATOR_MODEL,
     TEST_MODEL,
     _env_float,
     _env_int,
+    cost_for_tokens,
     provider_for_model,
+    strip_provider_prefix,
 )
 from .models import (
     AdequacyAssessment,
@@ -36,23 +42,13 @@ load_dotenv()
 
 OPENAI_SAFETY_IDENTIFIER = os.environ.get("OPENAI_SAFETY_IDENTIFIER", "")
 
-
 DEFAULT_REASONING_EFFORT = "high"
 
-RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 600.0)
-EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 60.0)
-MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 1)
-MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 50)
-CLAUDE_THINKING_BUDGET = _env_int("LEAP_CLAUDE_THINKING_BUDGET", 5000)
-
-
-def _reasoning_params(model: str, test_mode: bool) -> dict:
-    """Return provider-specific reasoning param. Empty dict for test_mode (cheap models don't support it)."""
-    if test_mode:
-        return {}
-    if provider_for_model(model) == "anthropic":
-        return {"thinking": {"type": "enabled", "budget_tokens": CLAUDE_THINKING_BUDGET}}
-    return {"reasoning_effort": DEFAULT_REASONING_EFFORT}
+RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 1800.0)
+EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 120.0)
+MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 2)
+MAX_SEARCH_ROUNDS = _env_int("LEAP_MAX_SEARCH_ROUNDS", 20)
+MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 65)
 
 
 # Collapse degenerate LLM floats (0.000000...0) that bloat JSON past token limit.
@@ -68,7 +64,7 @@ q0 and q100 are feasibility bounds, not ordinary probabilistic quantiles.
 
 Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
 
-Do not return all -999 values because the future is uncertain. Use -999 only when no reasonable estimate is possible for a specific value."""
+Use -999 only when no reasonable estimate is possible for a specific value."""
 
 
 QUANTILE_INTERPRETATION_BRIEF = """Quantile interpretation:
@@ -126,31 +122,6 @@ RATIONALE_REQUIREMENTS = """Rationale requirements:
 - For forecast rows, explain the q50 and the main drivers of the q25/q75 spread. Do not explain every quantile separately unless q0/q100 need special justification."""
 
 
-def _response_cost(response, model: str) -> float:
-    try:
-        if getattr(getattr(response, "usage", None), "cost", None) is not None:
-            return float(response.usage.cost)
-        return litellm.completion_cost(completion_response=response, model=model) or 0.0
-    except Exception:
-        return 0.0
-
-
-def _extract_text_from_response(response) -> str:
-    if getattr(response, "output_text", None):
-        return response.output_text
-    for item in response.output:
-        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
-        if item_type == "message":
-            content_list = item.get("content") if isinstance(item, dict) else item.content
-            for content in content_list:
-                content_type = content.get("type") if isinstance(content, dict) else getattr(content, "type", None)
-                if content_type == "output_text":
-                    text = content.get("text") if isinstance(content, dict) else content.text
-                    if text:
-                        return text
-    raise RuntimeError("No text output found in response")
-
-
 def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
     return "\n".join(
         f"  - {ef.forecast_date}, {ef.dimension}, q={ef.quantile}, value_type={ef.value_type}"
@@ -166,7 +137,7 @@ def _resolution_guidance(question: QuestionSpec) -> str:
 Some requested rows have value_type="resolution": their target date has passed, so try to find the metric's authoritative value as of that exact target date. A past date does not guarantee that a resolved value exists.
 
 - If you find an authoritative value for the target date: report it in resolution_values (with source and source_date), set all quantiles for that group to that single value, and use color_code="black".
-- If no authoritative value exists for the target date (the metric was never measured for it, the data is not published yet, or only post-target-date sources exist): leave that group out of resolution_values, give your best-estimate distribution across the quantiles, and use the non-black color that reflects your remaining uncertainty. Put your single best guess in current_estimates so the estimate is not lost.
+- If no authoritative value exists for the target date (the metric was never measured for it, the data is not published yet, or only post-target-date sources exist): leave that group out of resolution_values, give your best-estimate distribution across the quantiles, and use the non-black color that reflects your remaining uncertainty. Put your single best guess in current_estimates so the estimate is not lost. A non-black distribution for a past target date where no official value has been published is correct behavior and will not be penalized.
 - resolution_values.source_date = the date the value represents, not the source's publication date.
 - current_estimates reflect today's best guess and must never overwrite or substitute for a past resolution value."""
 
@@ -211,10 +182,144 @@ def _research_schema(question: QuestionSpec) -> dict:
     )
 
 
+def _claude_research(
+    question: QuestionSpec,
+    model: str,
+    prompt: str,
+    *,
+    attempt: int = 1,
+    costs: RunCost | None = None,
+    cost_bucket: str = "research",
+) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    """Research via Anthropic SDK with server-side web search and adaptive thinking."""
+    schema = _research_schema(question)
+    produce_tool = {
+        "name": "produce_forecast",
+        "description": "Output the structured surveillance forecast.",
+        "input_schema": schema,
+    }
+    messages = [{"role": "user", "content": prompt}]
+    model_id = strip_provider_prefix(model)
+
+    timeout_attempt = 0
+    search_round = 0
+    while True:
+        try:
+            thinking = {"thinking": {"type": "adaptive"}} if "haiku" not in model_id else {}
+            response = anthropic.Anthropic().messages.create(
+                model=model_id,
+                max_tokens=64000,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}, produce_tool],
+                messages=messages,
+                timeout=RESEARCH_TIMEOUT,
+                **thinking,
+            )
+        except Exception as e:
+            error_str = str(e).lower()
+            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+                timeout_attempt += 1
+                print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
+                continue
+            if isinstance(e, anthropic.RateLimitError):
+                print("    rate limit; sleeping 60s...")
+                time.sleep(60)
+                continue
+            raise
+
+        if costs is not None:
+            setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
+
+        if response.stop_reason == "pause_turn":
+            search_round += 1
+            if search_round >= MAX_SEARCH_ROUNDS:
+                raise RuntimeError(f"Claude search exceeded {MAX_SEARCH_ROUNDS} rounds without producing a forecast")
+            messages = messages + [{"role": "assistant", "content": [b.model_dump() for b in response.content]}]
+            continue
+
+        tool_input = next(
+            (b.input for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "produce_forecast"),
+            None,
+        )
+        if tool_input is not None:
+            text = json.dumps(tool_input)
+        else:
+            text = next((b.text for b in response.content if getattr(b, "type", None) == "text"), "")
+            text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
+            if text and text[0] != '{':
+                idx = text.find('{')
+                if idx > 0:
+                    text = text[idx:]
+
+        try:
+            return strict_to_regular_response(text, question.expected_forecasts)
+        except Exception as e:
+            retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
+            if attempt < 3 and retryable:
+                print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
+                return _claude_research(question, model, prompt, attempt=attempt + 1, costs=costs, cost_bucket=cost_bucket)
+            print(f"    validation error (raw text[:500]): {text[:500]}")
+            raise
+
+
+def _gpt_research(
+    question: QuestionSpec,
+    model: str,
+    prompt: str,
+    *,
+    attempt: int = 1,
+    test_mode: bool = False,
+    costs: RunCost | None = None,
+    cost_bucket: str = "research",
+) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    """Research via OpenAI Responses API with server-side web search and json_schema output."""
+    schema = _research_schema(question)
+    model_id = strip_provider_prefix(model)
+    extra = {} if test_mode else {"reasoning": {"effort": DEFAULT_REASONING_EFFORT}}
+
+    timeout_attempt = 0
+    while True:
+        try:
+            response = openai.OpenAI().responses.create(
+                model=model_id,
+                input=[{"role": "user", "content": prompt}],
+                tools=[{"type": "web_search"}],
+                text={"format": {"type": "json_schema", "name": "StrictSurveillanceResponse", "schema": schema, "strict": True}},
+                max_output_tokens=30000,
+                timeout=RESEARCH_TIMEOUT,
+                safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
+                **extra,
+            )
+            break
+        except Exception as e:
+            error_str = str(e).lower()
+            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+                timeout_attempt += 1
+                print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
+                continue
+            if isinstance(e, openai.RateLimitError):
+                print("    rate limit; sleeping 60s...")
+                time.sleep(60)
+                continue
+            raise
+
+    if costs is not None:
+        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
+
+    text = _COLLAPSE_FLOATS_RE.sub(r'\1', response.output_text)
+
+    try:
+        return strict_to_regular_response(text, question.expected_forecasts)
+    except Exception as e:
+        if attempt < 3 and "EOF while parsing" in str(e):
+            print(f"    truncation retry {attempt + 1}/3 ({len(text)} chars)...")
+            return _gpt_research(question, model, prompt, attempt=attempt + 1, test_mode=test_mode, costs=costs, cost_bucket=cost_bucket)
+        print(f"    validation error (raw text[:500]): {text[:500]}")
+        raise
+
+
 def research_question(
     question: QuestionSpec,
     model: str = DEFAULT_MODEL,
-    retry_on_truncation: bool = True,
     *,
     attempt: int = 1,
     test_mode: bool = False,
@@ -222,11 +327,10 @@ def research_question(
     cost_bucket: str = "research",
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     if test_mode:
-        from .common import provider_for_model, TEST_CLAUDE_MODEL
         model = TEST_CLAUDE_MODEL if provider_for_model(model) == "anthropic" else TEST_MODEL
 
     run_date = datetime.now(timezone.utc).date().isoformat()
-    prompt = f"""You are a research analyst. Use web search to find the relevant evidence, then produce a structured forecast.
+    prompt = f"""You are a research analyst. Search for evidence and produce a structured forecast.
 
 Question: {question.name}
 Question type: {question.question_type}
@@ -264,61 +368,9 @@ Requirements:
 - For each source: include url, title, and a key snippet.
 - Do not anchor on existing LEAP forecasts. If LEAP forecasts or analyses appear in web search results, do not review or copy them; form your estimates independently."""
 
-    schema = _research_schema(question)
-
-    timeout_attempt = 0
-    while True:
-        try:
-            params = {
-                "model": model,
-                "input": [{"role": "user", "content": prompt}],
-                "tools": [{"type": "web_search"}],
-                "text": {
-                    "format": {
-                        "type": "json_schema",
-                        "name": "StrictSurveillanceResponse",
-                        "schema": schema,
-                        "strict": True,
-                    }
-                },
-                "max_output_tokens": 30000,
-                "timeout": RESEARCH_TIMEOUT,
-                "safety_identifier": OPENAI_SAFETY_IDENTIFIER or None,
-                **_reasoning_params(model, test_mode),
-            }
-            response = litellm.responses(**params)
-            break
-        except Exception as e:
-            error_str = str(e).lower()
-            is_timeout = "timeout" in error_str or "timed out" in error_str
-            if is_timeout and timeout_attempt < MAX_TIMEOUT_RETRIES:
-                timeout_attempt += 1
-                print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
-                continue
-            raise
-
-    if costs is not None:
-        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(response, model))
-
-    text = _extract_text_from_response(response)
-    text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
-
-    try:
-        return strict_to_regular_response(text, question.expected_forecasts)
-    except Exception as e:
-        if retry_on_truncation and attempt < 3 and "EOF while parsing" in str(e):
-            print(f"    truncation retry {attempt + 1}/3 ({len(text)} chars)...")
-            return research_question(
-                question,
-                model,
-                retry_on_truncation,
-                attempt=attempt + 1,
-                test_mode=test_mode,
-                costs=costs,
-                cost_bucket=cost_bucket,
-            )
-        print(f"    validation error (raw text[:500]): {text[:500]}")
-        raise
+    if provider_for_model(model) == "anthropic":
+        return _claude_research(question, model, prompt, attempt=attempt, costs=costs, cost_bucket=cost_bucket)
+    return _gpt_research(question, model, prompt, attempt=attempt, test_mode=test_mode, costs=costs, cost_bucket=cost_bucket)
 
 
 def _format_evidence_for_judge(evidence: list[EvidenceItem]) -> str:
@@ -382,21 +434,42 @@ def _call_structured_judge(
     max_output_tokens: int,
     cost_bucket: str,
     costs: RunCost | None,
+    attempt: int = 1,
 ):
-    """Call a judge LLM with a strict-JSON schema and return the parsed model."""
+    """Call a judge LLM and return the parsed schema. Routes to Anthropic or OpenAI SDK by provider."""
+    from pydantic import ValidationError as PydanticValidationError
     schema = make_strict_schema(schema_class)
-    result = litellm.responses(
-        model=eval_model,
-        input=[{"role": "user", "content": prompt}],
-        text={"format": {"type": "json_schema", "name": schema_class.__name__, "schema": schema, "strict": True}},
-        max_output_tokens=max_output_tokens,
-        timeout=EVALUATION_TIMEOUT,
-        safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
-    )
+    model_id = strip_provider_prefix(eval_model)
+    if provider_for_model(eval_model) == "anthropic":
+        tool_name = "produce_judgment"
+        response = anthropic.Anthropic().messages.create(
+            model=model_id,
+            max_tokens=max_output_tokens,
+            tools=[{"name": tool_name, "description": "Output structured judgment.", "input_schema": schema}],
+            tool_choice={"type": "tool", "name": tool_name},
+            messages=[{"role": "user", "content": prompt}],
+            timeout=EVALUATION_TIMEOUT,
+        )
+        tool_block = next(b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == tool_name)
+        text = json.dumps(tool_block.input)
+    else:
+        response = openai.OpenAI().responses.create(
+            model=model_id,
+            input=[{"role": "user", "content": prompt}],
+            text={"format": {"type": "json_schema", "name": schema_class.__name__, "schema": schema, "strict": True}},
+            max_output_tokens=max_output_tokens,
+            timeout=EVALUATION_TIMEOUT,
+            safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
+        )
+        text = response.output_text
     if costs is not None:
-        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(result, eval_model))
-    text = _extract_text_from_response(result)
-    return schema_class.model_validate_json(text)
+        setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
+    try:
+        return schema_class.model_validate_json(text)
+    except PydanticValidationError:
+        if attempt < 3:
+            return _call_structured_judge(prompt, schema_class, eval_model, max_output_tokens, cost_bucket, costs, attempt=attempt + 1)
+        raise
 
 
 def evaluate_adequacy(
@@ -436,17 +509,19 @@ Generated forecasts:
 Sources:
 {sources_summary}
 
+Data unavailability is not a defect: If the rationale explicitly states that the required value is not published by any authoritative source — and this is plausible given the nature of the metric — do not flag it as STALE DATA or EXTRACTION FAILURE. A response that identifies absent data, explains why, and provides a best-estimate distribution is adequate. Only flag if the model could plausibly have found the data but didn't try.
+
 Look for these failure modes:
 1. STALE DATA: The cited source value is older than the source's own update cadence. Compare the source's date against how often that source updates, not against the question's resolution date. Examples: monthly data last reported 12+ months ago, quarterly data last reported a year ago, a live leaderboard cited from an old archive snapshot, or an annual figure where the newer year's value has already been released. Do not flag a value as stale simply because it is recent, or because the resolution date is far in the future. Do not flag annual data merely because the latest year has not been published yet.
-2. EXTRACTION FAILURE: The rationale says a specific dashboard, page, leaderboard, table, or live source could not be read, rendered, retrieved, or extracted, and no adequate alternative source gives the same metric, period, and scope. Treat varied wording as evidence of this problem, including "JavaScript-rendered", "not directly retrievable", "returned 404", "would not load", "could not retrieve", "could not see", "did not expose", "not visible", or "used an archive snapshot instead".
+2. EXTRACTION FAILURE: The rationale says a specific dashboard, page, leaderboard, table, or live source could not be read, rendered, retrieved, or extracted, and no adequate alternative source gives the same metric, period, and scope. Treat varied wording as evidence of this problem, including "JavaScript-rendered", "not directly retrievable", "returned 404", "would not load", "could not retrieve", "could not see", "did not expose", "not visible", or "used an archive snapshot instead". Do not flag if the rationale failed to retrieve Source A but obtained the same metric, period, and scope from Source B — the extraction succeeded via an alternative.
 3. SCOPE MISMATCH: A cited source reports a different period, category, benchmark split, population, geography, unit, or subset than the question asks for.
 4. UNSUPPORTED CLAIM: A specific numeric claim in the rationale is not supported by the source snippets or listed evidence.
-5. STRUCTURAL DEFECT: Expected forecast rows are missing, quantiles are non-monotonic, probability values are not on a 0-100 scale, unit bounds are violated, or the response changes the requested dates/dimensions/quantiles. By design, q0 and q100 are feasibility bounds, not credible-interval extremes — q0 at the natural unit floor (e.g., 0 for a percent or count), q100 at the natural unit ceiling (e.g., 100 for a percent), and q100=9999 for timing questions (the "never" sentinel) are all expected and must not be flagged.
-6. RESOLUTION DEFECT: A past target-date row is black/resolved without an authoritative as-of-date value, uses a post-target-date value as if it were the target-date value, or fabricates a resolution. If no authoritative as-of-date value exists, a non-black estimate distribution is acceptable.
+5. STRUCTURAL DEFECT: Expected forecast rows are missing, quantiles within the same (date, dimension) group are non-monotonic, probability values are not on a 0-100 scale, unit bounds are violated, or the response changes the requested dates/dimensions/quantiles. By design, q0 and q100 are feasibility bounds, not credible-interval extremes — q0 at the natural unit floor (e.g., 0 for a percent or count), q100 at the natural unit ceiling (e.g., 100 for a percent), and q100=9999 for timing questions (the "never" sentinel) are all expected and must not be flagged.
+6. RESOLUTION DEFECT: A past target-date row is black/resolved without an authoritative as-of-date value, uses a post-target-date value as if it were the target-date value, or fabricates a resolution. If no authoritative as-of-date value exists, a non-black estimate distribution is acceptable — this is not a defect. Example: a target date of 2025-12-31 that has already passed, where no official annual figure has been published yet, should not be flagged merely for being non-black.
 
 Adequacy rule:
-- Set adequate=false if issues[] is non-empty.
-- Set adequate=true only if issues[] is empty.
+- Set adequate=false if and only if issues[] is non-empty. Every problem that makes the response inadequate must appear in issues[] — do not leave issues[] empty and set adequate=false.
+- Set adequate=true if and only if issues[] is empty.
 
 Confidence (0-100) is how sure you are about your own review, not about whether the forecast will come true. Start at 90 for a clean response with authoritative sources and lower it for each of:
 - The staleness or scope call required judgment (no clear update cadence, ambiguous geography or subset) — lower by 10-15.
@@ -516,7 +591,7 @@ Browser automation is not useful for:
 
 Decide:
 - Set browser_would_help=true only if browser scraping a specific URL would plausibly fix the identified issue.
-- If yes, propose a specific browser_url and a concrete browser_objective ("Extract the X value from the Y table").
+- If yes, propose a specific browser_url and a browser_objective that names the exact metric or value, the exact column or section label, and — if the page has multiple tabs — which tab to navigate to. Bad: "Extract data from the leaderboard." Good: "Extract the Pass@1 score from the Hard difficulty column on the Leaderboard tab — not the overall Pass@1 or count columns."
 - If no, set browser_would_help=false and leave browser_url empty. Explain briefly in reason."""
 
     if eval_model is None:
@@ -663,31 +738,40 @@ Instructions:
 
 {RATIONALE_REQUIREMENTS}"""
 
+    if model is None:
+        model = TEST_MODEL if test_mode else DEFAULT_MODEL
     schema = _research_schema(question)
+    model_id = strip_provider_prefix(model)
 
     try:
-        if model is None:
-            model = TEST_MODEL if test_mode else DEFAULT_MODEL
-        params = {
-            "model": model,
-            "input": [{"role": "user", "content": prompt}],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "StrictSurveillanceResponse",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            "max_output_tokens": 30000,
-            "timeout": RESEARCH_TIMEOUT,
-            "safety_identifier": OPENAI_SAFETY_IDENTIFIER or None,
-            **_reasoning_params(model, test_mode),
-        }
-        response = litellm.responses(**params)
-        if costs is not None:
-            setattr(costs, cost_bucket, getattr(costs, cost_bucket) + _response_cost(response, model))
-        text = _extract_text_from_response(response)
+        if provider_for_model(model) == "anthropic":
+            produce_tool = {"name": "produce_forecast", "description": "Output the refined surveillance forecast.", "input_schema": schema}
+            response = anthropic.Anthropic().messages.create(
+                model=model_id,
+                max_tokens=64000,
+                tools=[produce_tool],
+                tool_choice={"type": "tool", "name": "produce_forecast"},
+                messages=[{"role": "user", "content": prompt}],
+                timeout=RESEARCH_TIMEOUT,
+            )
+            tool_block = next(b for b in response.content if getattr(b, "type", None) == "tool_use" and b.name == "produce_forecast")
+            text = json.dumps(tool_block.input)
+            if costs is not None:
+                setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
+        else:
+            extra = {} if test_mode else {"reasoning": {"effort": DEFAULT_REASONING_EFFORT}}
+            response = openai.OpenAI().responses.create(
+                model=model_id,
+                input=[{"role": "user", "content": prompt}],
+                text={"format": {"type": "json_schema", "name": "StrictSurveillanceResponse", "schema": schema, "strict": True}},
+                max_output_tokens=30000,
+                timeout=RESEARCH_TIMEOUT,
+                safety_identifier=OPENAI_SAFETY_IDENTIFIER or None,
+                **extra,
+            )
+            text = response.output_text
+            if costs is not None:
+                setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
         text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
         refined_response, _ = strict_to_regular_response(text, question.expected_forecasts)
         return refined_response

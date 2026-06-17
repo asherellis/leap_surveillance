@@ -13,15 +13,26 @@ DEFAULT_SHEET_ID = (
     os.environ.get("LEAP_SHEET_ID")
     or "1lT7zVfKAsVZU7bKaEALq1AWApfFmWMisprTK42l7RDo"
 )
-DEFAULT_MODEL = os.environ.get("LEAP_MODEL") or "openai/gpt-5.5"
-DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "openai/gpt-4.1-mini"
-DEFAULT_BROWSER_MODEL = os.environ.get("LEAP_BROWSER_MODEL") or "openai/gpt-4o"
-CLAUDE_RESEARCH_MODEL = os.environ.get("LEAP_CLAUDE_MODEL") or "anthropic/claude-sonnet-4-6"
-CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_CLAUDE_EVALUATOR_MODEL") or "anthropic/claude-haiku-4-5"
-TEST_CLAUDE_MODEL = os.environ.get("LEAP_TEST_CLAUDE_MODEL") or "anthropic/claude-haiku-4-5"
-TEST_CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_CLAUDE_EVALUATOR_MODEL") or "anthropic/claude-haiku-4-5"
-TEST_MODEL = os.environ.get("LEAP_TEST_MODEL") or "openai/gpt-4o-mini"
-TEST_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_EVALUATOR_MODEL") or "openai/gpt-4o-mini"
+DEFAULT_MODEL = os.environ.get("LEAP_MODEL") or "gpt-5.5"
+DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "gpt-4.1-mini"
+DEFAULT_BROWSER_MODEL = os.environ.get("LEAP_BROWSER_MODEL") or "gpt-4o"
+CLAUDE_RESEARCH_MODEL = os.environ.get("LEAP_CLAUDE_MODEL") or "claude-opus-4-8"
+CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_CLAUDE_EVALUATOR_MODEL") or "claude-haiku-4-5-20251001"
+TEST_CLAUDE_MODEL = os.environ.get("LEAP_TEST_CLAUDE_MODEL") or "claude-haiku-4-5-20251001"
+TEST_CLAUDE_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_CLAUDE_EVALUATOR_MODEL") or "claude-haiku-4-5-20251001"
+TEST_MODEL = os.environ.get("LEAP_TEST_MODEL") or "gpt-4o-mini"
+TEST_EVALUATOR_MODEL = os.environ.get("LEAP_TEST_EVALUATOR_MODEL") or "gpt-4o-mini"
+
+# Approximate pricing ($/1M tokens) for cost estimates — informational only.
+_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gpt-5.5": (5.00, 30.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5": (0.80, 4.00),
+}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -41,13 +52,32 @@ def _env_int(name: str, default: int) -> int:
 
 
 def provider_for_model(model: str) -> str:
-    """Infer provider from a LiteLLM-style model string ("openai/..." or "anthropic/...")."""
-    return "anthropic" if model.startswith("anthropic/") else "openai"
+    """Return 'anthropic' for Claude models, 'openai' otherwise."""
+    return "anthropic" if strip_provider_prefix(model).startswith("claude") else "openai"
+
+
+def strip_provider_prefix(model: str) -> str:
+    """Strip 'openai/' or 'anthropic/' prefix if present (backwards-compat with old .env files)."""
+    for prefix in ("openai/", "anthropic/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
+def cost_for_tokens(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate cost from token counts using the local price table."""
+    bare = strip_provider_prefix(model)
+    for key, (inp_price, out_price) in _MODEL_PRICES.items():
+        if key in bare:
+            return (input_tokens * inp_price + output_tokens * out_price) / 1_000_000
+    return 0.0
 
 
 SHEET_TEXT_LIMIT = 10000
 FULL_QUANTILES = [0, 5, 25, 50, 75, 95, 100]
 TIMING_FORECAST_DATE = "event_occurrence"
+Q50_TOLERANCE = 0.10   # 10% relative-to-mean tolerance for non-black q50 agreement
+NEAR_ZERO_SUM = 1e-9   # treat |a| + |b| below this as "both effectively zero"
 
 
 def safe_str(val) -> str:

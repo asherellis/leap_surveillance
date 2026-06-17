@@ -32,7 +32,11 @@ _MODEL_FIELDS = [
 
 _METADATA_COLS = ["question_name", "status", "target_date", "dimension",
                   "question_text", "resolution_criteria", "question_type", "unit"]
-_CONSENSUS_COLS = ["consensus_status", "consensus_color_match", "consensus_q50_match", "consensus_q50_delta_pct"]
+_CONSENSUS_COLS = [
+    "model_consensus", "consensus_q50_delta_pct",
+    "run_stability", "gpt_run_stability", "claude_run_stability", "runs_seen",
+    "confidence_tier",
+]
 _REVIEWER_COLS = ["review_verdict", "review_value", "review_source", "review_color", "review_notes", "reviewed"]
 _SYNC_COLS = ["group_id", "question_id", "run_id"]
 
@@ -47,7 +51,7 @@ def _interleaved_model_cols() -> list[str]:
 
 
 def _review_headers(mode: str) -> list[str]:
-    """65-col interleaved layout for --both; 39-col single-model layout for --gpt/--claude."""
+    """68-col interleaved layout for --both; 39-col single-model layout for --gpt/--claude."""
     if mode == "both":
         return [*_METADATA_COLS, *_interleaved_model_cols(), *_CONSENSUS_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
     tag = "gpt" if mode == "gpt" else "claude"
@@ -72,9 +76,9 @@ INSTRUCTIONS_CONTENT = [
     ["Column groups"],
     ["A-H", "Question, resolution criteria, target date, status, type, and unit."],
     ["I-AZ", "GPT and Claude interleaved pairs (--both mode only): gpt_answer next to claude_answer, gpt_color next to claude_color, etc. In --gpt or --claude only mode, the tab has 39 columns (only that model's 22 output columns, no consensus block)."],
-    ["BA-BD", "Consensus block (--both mode only). Auto-accepted only if both models adequate AND every row agrees on color + q50."],
-    ["BE-BJ", "Reviewer columns. Fill these in."],
-    ["BK-BM", "Sync IDs - leave alone."],
+    ["BA-BG", "Consensus + stability block (--both mode only). model_consensus: auto_accepted/disagreement/etc. run_stability: both_stable/volatile/etc. confidence_tier: high/medium/low."],
+    ["BH-BM", "Reviewer columns. Fill these in."],
+    ["BN-BP", "Sync IDs - leave alone."],
     [""],
     ["Key columns"],
     ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
@@ -89,8 +93,10 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_validation_issues / claude_validation_issues", "Deterministic-validator findings per model."],
     ["gpt_missing_data / claude_missing_data", "Gaps the per-model judge flagged."],
     ["gpt_browser_status / claude_browser_status", "not_proposed / proposed_no_url / extract_failed / refinement_rejected / accepted."],
-    ["consensus_status", "auto_accepted / disagreement / single_model_only / both_failed."],
-    ["consensus_q50_delta_pct", "|gpt - claude| / mean. <0.10 means models agree on the value (non-black rows)."],
+    ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Cross-model agreement within this run."],
+    ["consensus_q50_delta_pct", "|gpt - claude| / mean(gpt, claude). <0.10 = models agree on value (non-black rows)."],
+    ["run_stability", "both_stable / one_stable / converging / volatile / new. Cross-run consistency over last 10 production runs."],
+    ["confidence_tier", "high = auto_accepted + both_stable. medium = auto_accepted + partially stable. low = everything else."],
     ["review_verdict", "correct / close / wrong / confidently wrong."],
     ["reviewed", "Only reviewed rows are synced."],
 ]
@@ -177,7 +183,7 @@ def _render_when_year(value: str) -> str:
     return value
 
 
-def _extract_model_view(model_block: dict, q_type: str) -> dict:
+def _extract_model_view(model_block: dict) -> dict:
     """Extract everything one model contributes to a Sheet row, ready for per-row indexing."""
     if not model_block:
         return {
@@ -300,19 +306,23 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
         q_criteria = safe_str(question.get("resolution_criteria", ""))[:SHEET_TEXT_LIMIT]
         per_model = question.get("per_model") or {}
 
-        gpt_view = _extract_model_view(per_model.get("gpt") or {}, q_type)
-        claude_view = _extract_model_view(per_model.get("claude") or {}, q_type)
+        gpt_view = _extract_model_view(per_model.get("gpt") or {})
+        claude_view = _extract_model_view(per_model.get("claude") or {})
 
         # Driving set of (date, dim) keys: union of both models' forecast groups.
         all_keys = set(gpt_view["groups"].keys()) | set(claude_view["groups"].keys())
 
-        # Consensus block (whole-question status + per-row diffs)
         consensus_block = question.get("consensus") or {}
         consensus_status_val = consensus_block.get("status", "") if consensus_block else ""
         row_diff_by_key: dict[tuple, dict] = {
             (rd.get("forecast_date", ""), rd.get("dimension", "Overall")): rd
             for rd in consensus_block.get("row_diffs", []) or []
         }
+        stab = question.get("run_stability") or {}
+        run_stab = stab.get("run_stability", "")
+        gpt_run_stab = stab.get("gpt_run_stability", "")
+        claude_run_stab = stab.get("claude_run_stability", "")
+        runs_seen = stab.get("runs_seen", "")
 
         for (fdate, dim) in sorted(all_keys):
             group_id = make_review_group_id(run_id, q_id, fdate, dim)
@@ -324,15 +334,10 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
             display_color = gpt_row.get("color") or claude_row.get("color") or ""
 
             row_diff = row_diff_by_key.get((fdate, dim)) or {}
-            color_match = row_diff.get("color_match")
-            q50_match = row_diff.get("q50_match")
             delta_pct = row_diff.get("delta_pct")
-            color_match_str = "" if color_match is None else ("TRUE" if color_match else "FALSE")
-            q50_match_str = "" if q50_match is None else ("TRUE" if q50_match else "FALSE")
             delta_pct_str = "" if delta_pct is None else f"{delta_pct:.3f}"
 
             row = {
-                # Question metadata
                 "question_name": q_name,
                 "status": resolution_status(fdate, display_color),
                 "target_date": fdate,
@@ -341,7 +346,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "resolution_criteria": q_criteria,
                 "question_type": q_type,
                 "unit": q_unit,
-                # GPT side scalars + per-model judge fields
                 "gpt_judge_confidence": gpt_view["quality_confidence"],
                 "gpt_browser_status": gpt_view["browser_status"],
                 "gpt_missing_data": gpt_view["missing_data"],
@@ -349,7 +353,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "gpt_validation_issues": gpt_view["validation_issues"],
                 "gpt_rationale": gpt_view["rationale"],
                 "gpt_sources": gpt_view["sources"],
-                # Claude side scalars
                 "claude_judge_confidence": claude_view["quality_confidence"],
                 "claude_browser_status": claude_view["browser_status"],
                 "claude_missing_data": claude_view["missing_data"],
@@ -357,7 +360,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "claude_validation_issues": claude_view["validation_issues"],
                 "claude_rationale": claude_view["rationale"],
                 "claude_sources": claude_view["sources"],
-                # Per-row per-model fields
                 "gpt_answer": gpt_row["answer"], "claude_answer": claude_row["answer"],
                 "gpt_color": gpt_row["color"], "claude_color": claude_row["color"],
                 "gpt_q0": gpt_row["q0"], "claude_q0": claude_row["q0"],
@@ -380,19 +382,19 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "claude_resolution_source": claude_row["resolution_source"],
                 "gpt_resolution_source_date": gpt_row["resolution_source_date"],
                 "claude_resolution_source_date": claude_row["resolution_source_date"],
-                # Consensus
-                "consensus_status": consensus_status_val,
-                "consensus_color_match": color_match_str,
-                "consensus_q50_match": q50_match_str,
+                "model_consensus": consensus_status_val,
                 "consensus_q50_delta_pct": delta_pct_str,
-                # Reviewer (empty for human fill-in)
+                "run_stability": run_stab,
+                "gpt_run_stability": gpt_run_stab,
+                "claude_run_stability": claude_run_stab,
+                "runs_seen": runs_seen,
+                "confidence_tier": _confidence_tier(consensus_status_val, run_stab),
                 "review_verdict": "",
                 "review_value": "",
                 "review_source": "",
                 "review_color": "",
                 "review_notes": "",
                 "reviewed": "",
-                # Sync IDs
                 "group_id": group_id,
                 "question_id": q_id,
                 "run_id": run_id,
@@ -537,20 +539,26 @@ def _format_instructions(sheet, ws) -> None:
     sheet.batch_update({"requests": reqs})
 
 
-# Three column-width buckets: narrow (N=80), medium (M=140), wide (W=210).
-_N, _M, _W = 80, 140, 210
+_N, _M = 80, 140
 
-# Per-field widths for model output columns (gpt_X / claude_X).
 _FIELD_WIDTH = {
     "answer": _M, "color": _N,
     "q0": _N, "q5": _N, "q25": _N, "q75": _N, "q95": _N, "q100": _N,
     "judge_confidence": _N, "browser_status": _M,
-    "missing_data": _W, "judge_reason": _W, "validation_issues": _W,
-    "latest_official_value": _M, "latest_official_date": _M, "latest_official_source": _W,
+    "missing_data": _M, "judge_reason": _M, "validation_issues": _M,
+    "latest_official_value": _M, "latest_official_date": _M, "latest_official_source": _M,
     "current_estimate": _M, "current_estimate_confidence": _N,
-    "rationale": _W, "sources": _W,
-    "resolution_source": _W, "resolution_source_date": _M,
+    "rationale": _M, "sources": _M,
+    "resolution_source": _M, "resolution_source_date": _M,
 }
+
+
+def _confidence_tier(model_consensus: str, run_stability: str) -> str:
+    if model_consensus == "auto_accepted" and run_stability == "both_stable":
+        return "high"
+    if model_consensus == "auto_accepted" and run_stability in ("converging", "one_stable"):
+        return "medium"
+    return "low"
 
 
 def _header_width(col: str) -> int:
@@ -558,10 +566,9 @@ def _header_width(col: str) -> int:
     for prefix in ("gpt_", "claude_"):
         if col.startswith(prefix):
             return _FIELD_WIDTH.get(col[len(prefix):], _M)
-    if col in ("consensus_color_match", "consensus_q50_match", "consensus_q50_delta_pct", "reviewed"):
+    if col in ("consensus_q50_delta_pct", "reviewed", "runs_seen",
+               "gpt_run_stability", "claude_run_stability"):
         return _N
-    if col == "review_notes":
-        return _W
     return _M
 
 
@@ -595,9 +602,8 @@ def _create_run_tab(sheet, tab_name: str, headers: list[str]):
             }
         }
 
-    # Compute band boundaries from the actual headers list.
     meta_end = len(_METADATA_COLS)
-    consensus_start = headers.index("consensus_status") if "consensus_status" in headers else None
+    consensus_start = headers.index("model_consensus") if "model_consensus" in headers else None
     reviewer_start = headers.index("review_verdict")
     sync_start = headers.index("group_id")
     n = len(headers)

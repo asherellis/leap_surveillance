@@ -1,11 +1,12 @@
 """CLI for LEAP surveillance runs and review sync."""
 
 import argparse
+import json
 import os
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace as _dc_replace
+from dataclasses import asdict, dataclass, replace as _dc_replace
 from datetime import datetime
 
 from .common import (
@@ -31,11 +32,12 @@ from .models import (
     validate_response,
 )
 from .storage import (
+    _serialize_model_result,
     build_run_data,
-    sync_reviews_to_bigquery,
+    enrich_with_run_stability,
+    write_accepted_to_fact_resolution,
     write_csv_output,
     write_json_output,
-    write_surveillance_to_bigquery,
 )
 from .sheets import (
     run_tab_name,
@@ -195,7 +197,7 @@ def _try_browser_refinement_for_model(
         eval_model=stack.eval_model,
         cost_bucket_stage1=stack.cost_bucket("judge_stage1"),
     )
-    refined_validation = validate_response(refined_response, q.expected_forecasts)
+    refined_validation = validate_response(refined_response, q.expected_forecasts, unit_min=q.unit_min, unit_max=q.unit_max)
     accept_refinement, accept_reason = _should_accept_browser_refinement(
         result.validation,
         refined_validation,
@@ -253,7 +255,7 @@ def _run_single_model_pipeline(
         cost_bucket_stage1=stack.cost_bucket("judge_stage1"),
         cost_bucket_stage2=stack.cost_bucket("judge_stage2"),
     )
-    validation = validate_response(response, q.expected_forecasts)
+    validation = validate_response(response, q.expected_forecasts, unit_min=q.unit_min, unit_max=q.unit_max)
     result = ModelRunResult(
         response=response,
         evidence=evidence,
@@ -321,7 +323,10 @@ def process_question(
                     error={"type": type(e).__name__, "message": str(e)[:500], "traceback": tb[-2000:]},
                 )
 
-    consensus = compute_consensus(per_model) if len(per_model) >= 2 else None
+    if len(per_model) >= 2:
+        consensus = compute_consensus(per_model)
+    else:
+        consensus = {"status": "single_model_only", "color_agreement": False, "q50_agreement": False, "row_diffs": []}
     return QuestionRunResult(per_model=per_model, costs=costs, consensus=consensus)
 
 
@@ -334,7 +339,6 @@ def cmd_run(args):
     active_model = TEST_MODEL if args.test_mode else DEFAULT_MODEL
     active_claude = TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL
     mode = _resolve_mode_flag(args)
-    # Run-level metadata reflects which models actually ran.
     run_models = {}
     if mode in ("gpt", "both"):
         run_models["gpt"] = active_model
@@ -413,6 +417,7 @@ def cmd_run(args):
     print(f"Running with {workers} worker(s)")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(_run_one, i, q) for i, q in enumerate(questions)]
+        partial_path = os.path.join(DEFAULT_OUTPUT_DIR, f"run_{run_id}_partial.json")
         for fut in as_completed(futures):
             i, result, err = fut.result()
             if err:
@@ -421,6 +426,15 @@ def cmd_run(args):
                 per_model_lists[i] = result.per_model
                 costs_list[i] = result.costs
                 consensus_blocks[i] = result.consensus
+            completed = [
+                {"id": questions[j].id, "name": questions[j].name,
+                 "per_model": {m: _serialize_model_result(r) for m, r in per_model_lists[j].items()} if per_model_lists[j] else None,
+                 "consensus": consensus_blocks[j], "cost": asdict(costs_list[j]) if costs_list[j] else None,
+                 "error": errors_list[j]}
+                for j in range(n) if per_model_lists[j] is not None or errors_list[j] is not None
+            ]
+            with open(partial_path, "w") as f:
+                json.dump({"run_id": run_id, "questions": completed}, f, indent=2)
 
     run_data = build_run_data(
         run_id,
@@ -432,30 +446,34 @@ def cmd_run(args):
         consensus_blocks=consensus_blocks,
         errors_list=errors_list,
     )
+    run_data = enrich_with_run_stability(run_data, DEFAULT_OUTPUT_DIR)
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
-    # CSV has model_id as the first column; both models go in as siblings.
+    try:
+        os.remove(partial_path)
+    except OSError:
+        pass
     write_csv_output(run_id, questions, per_model_lists, DEFAULT_OUTPUT_DIR)
     s = run_data["summary"]
     print(f"\nSaved: {json_path}")
+    model_errs = s.get("model_error_count", 0)
+    model_err_str = f", {model_errs} model error(s)" if model_errs else ""
     print(
         f"Summary: {s['ok_count']}/{s['question_count']} validation OK, "
         f"{s['quality_issue_count']} quality issues, "
-        f"{s['error_count']} errors, {s['browser_count']} browser extractions"
+        f"{s['error_count']} errors{model_err_str}, {s['browser_count']} browser extractions"
     )
     print(f"Due/unresolved (past-dated, no authoritative value found): {s['due_unresolved_count']}")
     print(f"Estimated cost: ${s['total_cost']:.4f}")
 
     if not args.no_bq:
         try:
-            bq_stats = write_surveillance_to_bigquery(run_data)
-            for key, label in [("results", "results"), ("evidence", "evidence rows"), ("runs", "run metadata")]:
-                stats = bq_stats.get(key)
-                if stats is not None:
-                    print(f"BigQuery: {stats.inserted_row_count} {label} written")
-                else:
-                    print(f"BigQuery: {key} write failed")
+            fr_stats = write_accepted_to_fact_resolution(run_data)
+            if fr_stats is not None:
+                print(f"BigQuery fact_resolution: {fr_stats.inserted_row_count} inserted, {fr_stats.updated_row_count} updated")
+            else:
+                print("BigQuery fact_resolution: no accepted rows to write")
         except Exception as e:
-            print(f"BigQuery write failed: {e} (continuing to Sheet)")
+            print(f"BigQuery fact_resolution write failed: {e}")
 
     if not args.no_sheet:
         try:
@@ -473,31 +491,42 @@ def cmd_sync(args):
         print("Nothing to sync.")
         return
 
+    print(f"\n  {'#':>3}  {'question':40s} {'date':12s} {'dim':20s} {'unit':12s} {'verdict':18s} review_value")
+    for i, item in enumerate(reviewed_items, 1):
+        name = (item.get("question_name") or "")[:38]
+        tdate = (item.get("target_date") or "")[:10]
+        dim = (item.get("dimension") or "")[:18]
+        unit = (item.get("unit") or "")[:10]
+        verdict = (item.get("review_verdict") or "")[:16]
+        rval = safe_str(item.get("review_value") or "")
+        print(f"  {i:>3}  {name:40s} {tdate:12s} {dim:20s} {unit:12s} {verdict:18s} {rval}")
+
     if args.no_bq:
-        print("\nDRY RUN (--no-bq): would sync the following to BigQuery:")
-        print(f"  {'#':>3}  {'question':40s} {'date':12s} {'dim':20s} {'unit':12s} {'verdict':18s} review_value")
-        for i, item in enumerate(reviewed_items, 1):
-            name = (item.get("question_name") or "")[:38]
-            tdate = (item.get("target_date") or "")[:10]
-            dim = (item.get("dimension") or "")[:18]
-            unit = (item.get("unit") or "")[:10]
-            verdict = (item.get("review_verdict") or "")[:16]
-            rval = safe_str(item.get("review_value") or "")
-            print(f"  {i:>3}  {name:40s} {tdate:12s} {dim:20s} {unit:12s} {verdict:18s} {rval}")
-        print(f"\n{len(reviewed_items)} item(s) would be synced. Re-run without --no-bq to write.")
+        print(f"\n{len(reviewed_items)} item(s) found. Re-run without --no-bq to write to fact_resolution.")
         return
 
-    stats = sync_reviews_to_bigquery(reviewed_items)
-    if stats.get("results"):
-        print(
-            f"BigQuery: {stats['results'].inserted_row_count} inserted, "
-            f"{stats['results'].updated_row_count} updated"
-        )
-    else:
-        print("BigQuery sync failed (no write access?)")
-        print("Use --no-bq to preview reviewed items without writing.")
-    if stats.get("skipped", 0) > 0:
-        print(f"  ({stats['skipped']} items skipped - raw data missing in BQ)")
+    by_run: dict[str, list] = {}
+    for item in reviewed_items:
+        by_run.setdefault(item.get("run_id", ""), []).append(item)
+    for rid, items in by_run.items():
+        json_path = os.path.join(DEFAULT_OUTPUT_DIR, f"run_{rid}.json")
+        try:
+            with open(json_path) as f:
+                run_data = json.load(f)
+        except FileNotFoundError:
+            print(f"  warning: run_{rid}.json not found; skipping fact_resolution write for this run")
+            continue
+        except Exception as e:
+            print(f"  warning: could not load run_{rid}.json: {e}")
+            continue
+        try:
+            fr_stats = write_accepted_to_fact_resolution(run_data, items)
+            if fr_stats is not None:
+                print(f"BigQuery fact_resolution ({rid}): {fr_stats.inserted_row_count} inserted, {fr_stats.updated_row_count} updated")
+            else:
+                print(f"BigQuery fact_resolution ({rid}): no accepted rows")
+        except Exception as e:
+            print(f"BigQuery fact_resolution write failed ({rid}): {e}")
 
 
 def cmd_setup(args):
@@ -535,7 +564,7 @@ Examples:
         help="Comma-separated question IDs to run (or path to file with one ID per line)",
     )
     run_parser.add_argument("--no-sheet", action="store_true", help="Skip publishing to Sheet")
-    run_parser.add_argument("--no-bq", action="store_true", help="Skip BigQuery writes")
+    run_parser.add_argument("--no-bq", action="store_true", help="Skip BigQuery writes (fact_resolution)")
     run_parser.add_argument(
         "--no-browser",
         action="store_true",
@@ -560,12 +589,12 @@ Examples:
     model_group.add_argument("--gpt", dest="mode_flag", action="store_const", const="gpt",
                               help="Run GPT-5.5 only")
     model_group.add_argument("--claude", dest="mode_flag", action="store_const", const="claude",
-                              help="Run Claude Sonnet only")
+                              help="Run Claude Opus only")
     model_group.add_argument("--both", dest="mode_flag", action="store_const", const="both",
                               help="Run both GPT and Claude in parallel (default)")
 
     sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from a run tab to BigQuery")
-    sync_parser.add_argument("--no-bq", action="store_true", help="Dry-run: print what would be synced; no write")
+    sync_parser.add_argument("--no-bq", action="store_true", help="Dry-run: print what would be written; no write")
     sync_parser.add_argument("--tab", type=str, default=None, help="Specific run_<run_id> tab to read (default: most recent)")
 
     setup_parser = subparsers.add_parser("setup", help="Rebuild the Instructions tab (does not touch run_* tabs)")

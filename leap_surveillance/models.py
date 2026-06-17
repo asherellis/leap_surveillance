@@ -32,6 +32,7 @@ class QuestionSpec:
     question_text: str = ""
     resolution_criteria: str = ""
     background_info: str = ""
+    dim_question_map: dict = field(default_factory=dict)  # {"fdate|dim": dim_question.question_id}
 
 
 @dataclass
@@ -358,7 +359,8 @@ def _parse_iso_date(value: str) -> date | None:
 
 
 def validate_response(
-    response: SurveillanceResponse, expected: list[ExpectedForecast] | None = None
+    response: SurveillanceResponse, expected: list[ExpectedForecast] | None = None,
+    unit_min: float | None = None, unit_max: float | None = None,
 ) -> dict:
     issues = []
     expected_has_q50 = bool(expected and any(e.quantile == 50 for e in expected))
@@ -408,6 +410,18 @@ def validate_response(
     null_count = sum(1 for f in response.forecasts if f.forecast_value is None)
     if null_count > len(response.forecasts) // 2:
         issues.append(f"{null_count}_null_values")
+
+    if unit_min is not None or unit_max is not None:
+        for f in response.forecasts:
+            v = f.forecast_value
+            if v is None:
+                continue
+            if unit_min is not None and v < unit_min:
+                issues.append(f"unit_bound_violation_below_min_{f.forecast_date}_{f.dimension}_q{f.quantile}")
+                break
+            if unit_max is not None and v > unit_max:
+                issues.append(f"unit_bound_violation_above_max_{f.forecast_date}_{f.dimension}_q{f.quantile}")
+                break
 
     quantile_groups = defaultdict(list)
     for f in response.forecasts:

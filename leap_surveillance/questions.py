@@ -137,6 +137,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         qg.question_group_background_info AS question_set_background_information,
         qg.question_group_resolution_criteria AS question_set_resolution_criteria,
         u.unit_display_text, u.unit_min_value, u.unit_max_value,
+        q.question_id,
         q.question_horizon_date AS question_resolution_date,
         q.question_percentile,
         q.question_dimension
@@ -195,6 +196,21 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
             continue
         if not safe_str(row.get("question_set_resolution_criteria")):
             print(f"  warning: no resolution_criteria for '{question_name}'")
+
+        # Build mapping from "fdate|dim" → dim_question.question_id for q50 rows only.
+        # For when-type questions, question_resolution_date is NULL; use TIMING_FORECAST_DATE.
+        dim_q_map = {}
+        for _, r in group.iterrows():
+            pct = r.get("question_percentile")
+            if is_empty(pct) or int(float(pct)) != 50:
+                continue
+            raw_date = r.get("question_resolution_date")
+            fdate = str(raw_date).strip() if not is_empty(raw_date) else TIMING_FORECAST_DATE
+            dim = str(r.get("question_dimension") or "Overall").strip() or "Overall"
+            dq_id = r.get("question_id")
+            if not is_empty(dq_id):
+                dim_q_map[f"{fdate}|{dim}"] = str(dq_id)
+
         questions.append(
             QuestionSpec(
                 question_id,
@@ -208,6 +224,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 question_text=question_text,
                 resolution_criteria=safe_str(row.get("question_set_resolution_criteria")),
                 background_info=safe_str(row.get("question_set_background_information")),
+                dim_question_map=dim_q_map,
             )
         )
 

@@ -3,31 +3,23 @@
 from collections import defaultdict
 from typing import Any
 
-
-# Two q50 values are "near zero" and treated as agreed if their absolute-value sum
-# falls below this threshold (avoids divide-by-zero noise on degenerate metrics).
-_NEAR_ZERO_SUM = 1e-9
-_Q50_TOLERANCE = 0.10  # 10% relative-to-mean
+from .common import NEAR_ZERO_SUM, Q50_TOLERANCE
 
 
 def _extract_q50_by_row(forecasts) -> dict[tuple[str, str], dict[str, Any]]:
     """Index forecasts by (forecast_date, dimension) → {"q50", "color"} dict."""
+    # `f` may be a Pydantic Forecast object or a plain dict (when reading from JSON).
+    def field(f, name):
+        return f.get(name) if isinstance(f, dict) else getattr(f, name, None)
+
     by_row: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"q50": None, "color": None})
     for f in forecasts or []:
-        # `f` may be a Pydantic Forecast object or a plain dict (when reading from JSON).
-        date = getattr(f, "forecast_date", None) or (f.get("forecast_date") if isinstance(f, dict) else None)
-        dim = getattr(f, "dimension", None) or (f.get("dimension") if isinstance(f, dict) else None) or "Overall"
-        quantile = getattr(f, "quantile", None)
-        if quantile is None and isinstance(f, dict):
-            quantile = f.get("quantile")
-        value = getattr(f, "forecast_value", None)
-        if value is None and isinstance(f, dict):
-            value = f.get("forecast_value")
-        color = getattr(f, "color_code", None)
-        if color is None and isinstance(f, dict):
-            color = f.get("color_code")
-        # color_code may be an enum on the Pydantic side.
-        color = getattr(color, "value", color)
+        date = field(f, "forecast_date")
+        dim = field(f, "dimension") or "Overall"
+        quantile = field(f, "quantile")
+        value = field(f, "forecast_value")
+        color = field(f, "color_code")
+        color = getattr(color, "value", color)  # color_code is an enum on the Pydantic side
         key = (date, dim)
         if by_row[key]["color"] is None:
             by_row[key]["color"] = color
@@ -41,9 +33,9 @@ def _q50_within_tolerance(a: float | None, b: float | None) -> bool:
     if a is None or b is None:
         return False
     abs_sum = abs(a) + abs(b)
-    if abs_sum < _NEAR_ZERO_SUM:
+    if abs_sum < NEAR_ZERO_SUM:
         return True  # both effectively zero
-    return abs(a - b) / (abs_sum / 2) <= _Q50_TOLERANCE
+    return abs(a - b) / (abs_sum / 2) <= Q50_TOLERANCE
 
 
 def _row_match(gpt_row: dict, claude_row: dict) -> tuple[bool, bool, bool, float | None]:
@@ -60,7 +52,7 @@ def _row_match(gpt_row: dict, claude_row: dict) -> tuple[bool, bool, bool, float
     else:
         q50_match = _q50_within_tolerance(gpt_q50, claude_q50)
         abs_sum = abs(gpt_q50) + abs(claude_q50)
-        delta_pct = (abs(gpt_q50 - claude_q50) / (abs_sum / 2)) if abs_sum >= _NEAR_ZERO_SUM else 0.0
+        delta_pct = (abs(gpt_q50 - claude_q50) / (abs_sum / 2)) if abs_sum >= NEAR_ZERO_SUM else 0.0
     return color_match, q50_match, color_match and q50_match, delta_pct
 
 
