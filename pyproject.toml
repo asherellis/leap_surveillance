@@ -1,7 +1,7 @@
 [project]
 name = "leap-surveillance"
 version = "0.1.0"
-description = "LEAP surveillance forecasting pipeline"
+description = "LEAP surveillance pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "openai>=2.0",

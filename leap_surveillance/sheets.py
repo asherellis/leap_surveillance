@@ -8,6 +8,7 @@ from .common import (
     NEVER_YEAR,
     SHEET_TEXT_LIMIT,
     enum_value,
+    is_empty,
     make_review_group_id,
     resolution_status,
     safe_str,
@@ -24,19 +25,19 @@ CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 _MODEL_FIELDS = [
     "answer", "color",
     "q0", "q5", "q25", "q75", "q95", "q100",
-    "judge_confidence", "browser_status", "browser_url", "browser_objective", "browser_error",
-    "missing_data", "judge_reason", "validation_issues",
     "latest_official_value", "latest_official_date", "latest_official_source",
     "current_estimate", "current_estimate_confidence",
     "rationale", "sources",
     "resolution_source", "resolution_source_date",
+    "judge_confidence", "browser_status", "browser_url", "browser_objective", "browser_error",
+    "missing_data", "judge_reason", "validation_issues",
 ]
 
 _METADATA_COLS = ["question_name", "status", "target_date", "dimension",
                   "question_resolution_status", "question_resolution_value",
                   "question_resolution_source", "question_resolution_source_date",
                   "needs_review",
-                  "question_text", "resolution_criteria", "question_type", "unit"]
+                  "question_type", "unit", "question_text", "resolution_criteria"]
 _CONSENSUS_COLS = [
     "model_consensus", "consensus_q50_delta_pct",
     "run_stability", "gpt_run_stability", "claude_run_stability", "runs_seen",
@@ -84,8 +85,8 @@ INSTRUCTIONS_CONTENT = [
     ["When finished, run leap-surveillance sync."],
     [""],
     ["Column groups"],
-    ["Metadata", "Question name, status, target date, dimension, full question text, resolution criteria, type, unit."],
-    ["Model columns", "--both mode has GPT/Claude interleaved pairs. Single-model runs have one model's columns and no consensus block."],
+    ["Metadata", "Question name, status, target date, dimension, resolution state, question type/unit, full question text, and resolution criteria."],
+    ["Model columns", "--both mode has GPT/Claude interleaved pairs. Forecast values come first, then official/current values and sources, then diagnostics."],
     ["Consensus/stability", "Model agreement, q50 delta, run stability, runs seen, confidence tier, value-change flags."],
     ["Reviewer columns", "Fill these in."],
     ["Sync IDs", "review_row_id, group_question_id, question_id, run_id — leave alone."],
@@ -228,8 +229,10 @@ def _question_resolution_fields(status: str, gpt_row: dict, claude_row: dict) ->
     """Derive target-date resolution fields without overloading baseline values."""
     status_norm = str(status or "").strip().lower()
     for row in (gpt_row, claude_row):
-        value = row.get("resolution_value") or (row.get("answer") if row.get("color") == "black" else "")
-        if value:
+        value = row.get("resolution_value")
+        if is_empty(value) and row.get("color") == "black":
+            value = row.get("answer")
+        if not is_empty(value):
             return {
                 "question_resolution_status": "resolved",
                 "question_resolution_value": value,
