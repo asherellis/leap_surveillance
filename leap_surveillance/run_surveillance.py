@@ -6,7 +6,7 @@ import os
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, replace as _dc_replace
+from dataclasses import dataclass
 from datetime import datetime
 
 from .common import (
@@ -21,9 +21,9 @@ from .common import (
     TEST_CLAUDE_MODEL,
     TEST_EVALUATOR_MODEL,
     TEST_MODEL,
-    safe_str,
 )
 from .models import (
+    BrowserEvidence,
     EvidenceItem,
     QuestionSpec,
     ResearchQualityReport,
@@ -35,19 +35,22 @@ from .storage import (
     _serialize_model_result,
     build_run_data,
     enrich_with_run_stability,
-    write_accepted_to_fact_resolution,
+    enrich_with_value_changes,
     write_csv_output,
     write_json_output,
 )
 from .sheets import (
     run_tab_name,
-    get_reviewed_items,
     publish_to_sheet,
     setup_sheet,
 )
+from .sync import cmd_sync
 from .questions import load_questions
 from .browser import browser_extract
 from .research import (
+    annotate_browser_evidence,
+    ensure_evidence_plan,
+    ensure_rc_source,
     judge_response,
     refine_with_browser,
     research_question,
@@ -71,9 +74,9 @@ class ModelStack:
 
 def _build_stacks(test_mode: bool) -> tuple[ModelStack, ModelStack]:
     if test_mode:
-        gpt = ModelStack("gpt", TEST_MODEL, TEST_EVALUATOR_MODEL, TEST_MODEL)
-        # Haiku fails browser-use's AgentOutput schema at step 12+; use gpt-4o-mini for test browser too.
-        claude = ModelStack("claude", TEST_CLAUDE_MODEL, TEST_CLAUDE_EVALUATOR_MODEL, TEST_MODEL)
+        gpt = ModelStack("gpt", TEST_MODEL, TEST_EVALUATOR_MODEL, DEFAULT_BROWSER_MODEL)
+        # Browser-use requires gpt-4o even in test mode — mini fails AgentOutput schema at step 12+.
+        claude = ModelStack("claude", TEST_CLAUDE_MODEL, TEST_CLAUDE_EVALUATOR_MODEL, DEFAULT_BROWSER_MODEL)
     else:
         gpt = ModelStack("gpt", DEFAULT_MODEL, DEFAULT_EVALUATOR_MODEL, DEFAULT_BROWSER_MODEL)
         # gpt-4o drives browser for both paths — Haiku and Sonnet both have intermittent AgentOutput schema
@@ -91,6 +94,9 @@ class ModelRunResult:
     quality: ResearchQualityReport | None
     browser_used: bool = False
     browser_status: str = "not_proposed"
+    browser_url: str = ""
+    browser_objective: str = ""
+    browser_error: str = ""
     error: dict | None = None  # {type, message, traceback[-2000:]} if this model errored
 
 
@@ -135,21 +141,37 @@ def _validation_score(validation: dict) -> int:
 def _should_accept_browser_refinement(
     original_validation: dict,
     refined_validation: dict,
+    original_response,
+    refined_response,
     original_quality,
     refined_quality,
 ) -> tuple[bool, str]:
-    # Reject only when the refinement is mechanically worse; the judge's verdict is noisy.
+    # Mechanical floor: never accept a broken response.
     if not refined_validation.get("usable_for_scoring", False):
         return False, "refined response is not usable for scoring"
-
-    if original_validation.get("ok", False) and not refined_validation.get("ok", False):
-        issues = ", ".join(refined_validation.get("issues", []) or [])
-        return False, f"refinement introduced validation issues: {issues}"
-
     if _validation_score(refined_validation) > _validation_score(original_validation):
         return False, "refinement increased deterministic validation issues"
 
-    return True, "refinement validation OK; quality warnings preserved"
+    # Re-judge must pass. If it's still unhappy we can't tell whether the new data is right
+    # or the judge caught a real defect (wrong column, wrong scope, wrong date).
+    if refined_quality.adequate:
+        return True, "re-judge passed"
+
+    return False, "re-judge still inadequate; retaining original"
+
+
+def _earliest_past_target(response) -> str | None:
+    """Earliest past target date in a response — the row whose value needs an as-of-date (historical) lookup."""
+    if response is None:
+        return None
+    today = datetime.now().strftime("%Y-%m-%d")
+    past = [str(f.forecast_date)[:10] for f in (response.forecasts or [])
+            if getattr(f, "forecast_date", None) and str(f.forecast_date)[:10] < today]
+    return min(past) if past else None
+
+
+def _question_js_risk(q: QuestionSpec) -> bool:
+    return bool((q.evidence_plan or {}).get("js_risk") or (q.rc_source or {}).get("js_risk"))
 
 
 def _try_browser_refinement_for_model(
@@ -161,24 +183,43 @@ def _try_browser_refinement_for_model(
     test_mode: bool = False,
 ) -> ModelRunResult:
     print(f"  [{stack.tag}] Browser: {result.quality.browser_url}", flush=True)
+    result.browser_url = result.quality.browser_url or ""
+    result.browser_objective = result.quality.browser_objective or ""
+    as_of_date = _earliest_past_target(result.response)
+    js_risk = _question_js_risk(q)
     browser_result = browser_extract(
         result.quality.browser_url,
         result.quality.browser_objective or "Extract data",
         test_mode=test_mode,
         model_override=stack.browser_navigator,
+        as_of_date=as_of_date,
+        skip_jina=js_risk,
     )
     if not browser_result.success:
         err = browser_result.error or "no error message returned"
         print(f"  [{stack.tag}] Browser failed: {err}")
         result.browser_status = "extract_failed"
+        result.browser_error = err
         return result
 
-    browser_evidence = EvidenceItem(
-        source_type="browser",
-        url=browser_result.url,
-        title=f"Browser extraction: {browser_result.objective}",
-        full_text=browser_result.extracted_text,
+    return _refine_model_with_browser_result(
+        q, result, stack=stack, costs=costs, browser_result=browser_result, test_mode=test_mode,
     )
+
+
+def _refine_model_with_browser_result(
+    q: QuestionSpec,
+    result: ModelRunResult,
+    *,
+    stack: ModelStack,
+    costs: RunCost,
+    browser_result: BrowserEvidence,
+    test_mode: bool = False,
+) -> ModelRunResult:
+    if result.response is None or result.quality is None:
+        return result
+
+    browser_evidence = annotate_browser_evidence(browser_result, q.evidence_plan)
     evidence = [*result.evidence, browser_evidence]
 
     refined_response = refine_with_browser(
@@ -199,10 +240,9 @@ def _try_browser_refinement_for_model(
     )
     refined_validation = validate_response(refined_response, q.expected_forecasts, unit_min=q.unit_min, unit_max=q.unit_max)
     accept_refinement, accept_reason = _should_accept_browser_refinement(
-        result.validation,
-        refined_validation,
-        result.quality,
-        refined_quality,
+        result.validation, refined_validation,
+        result.response, refined_response,
+        result.quality, refined_quality,
     )
     if accept_refinement:
         status = "ok" if refined_quality.adequate else "flagged for review"
@@ -217,6 +257,8 @@ def _try_browser_refinement_for_model(
             quality=refined_quality,
             browser_used=True,
             browser_status="accepted",
+            browser_url=browser_result.url,
+            browser_objective=browser_result.objective,
         )
 
     print(f"  [{stack.tag}] Browser data kept as evidence; original response retained ({accept_reason})")
@@ -229,7 +271,83 @@ def _try_browser_refinement_for_model(
         quality=result.quality,
         browser_used=True,
         browser_status="refinement_rejected",
+        browser_url=browser_result.url,
+        browser_objective=browser_result.objective,
+        browser_error=accept_reason,
     )
+
+
+def _browser_request_key(result: ModelRunResult) -> tuple[str, str] | None:
+    if result.error or result.quality is None:
+        return None
+    if result.quality.adequate or not result.quality.browser_would_help or not result.quality.browser_url:
+        return None
+    return (result.quality.browser_url, result.quality.browser_objective or "Extract data")
+
+
+def _apply_shared_browser_refinements(
+    q: QuestionSpec,
+    per_model: dict[str, ModelRunResult],
+    stacks: dict[str, ModelStack],
+    *,
+    costs: RunCost,
+    test_mode: bool = False,
+) -> dict[str, ModelRunResult]:
+    requests: dict[tuple[str, str], list[str]] = {}
+    for tag, result in per_model.items():
+        key = _browser_request_key(result)
+        if key is not None:
+            requests.setdefault(key, []).append(tag)
+
+    if not requests:
+        for result in per_model.values():
+            if result.quality and not result.quality.adequate and not result.browser_status.startswith("proposed"):
+                result.browser_status = "not_useful" if not result.quality.browser_would_help else "proposed_no_url"
+        return per_model
+
+    js_risk = _question_js_risk(q)
+    as_of_dates = [_earliest_past_target(r.response) for r in per_model.values() if r.response is not None]
+    as_of_dates = [d for d in as_of_dates if d]
+    as_of_date = min(as_of_dates) if as_of_dates else None
+
+    for (url, objective), requesters in requests.items():
+        print(f"  [shared] Browser: {url}", flush=True)
+        browser_result = browser_extract(
+            url,
+            objective,
+            test_mode=test_mode,
+            model_override=DEFAULT_BROWSER_MODEL,
+            as_of_date=as_of_date,
+            skip_jina=js_risk,
+        )
+        if not browser_result.success:
+            err = browser_result.error or "no error message returned"
+            print(f"  [shared] Browser failed: {err}")
+            for tag in requesters:
+                result = per_model[tag]
+                result.browser_status = "extract_failed"
+                result.browser_url = url
+                result.browser_objective = objective
+                result.browser_error = err
+            continue
+
+        for tag, result in list(per_model.items()):
+            if result.response is None or result.quality is None:
+                continue
+            if tag not in stacks:
+                continue
+            result.browser_url = url
+            result.browser_objective = objective
+            per_model[tag] = _refine_model_with_browser_result(
+                q,
+                result,
+                stack=stacks[tag],
+                costs=costs,
+                browser_result=browser_result,
+                test_mode=test_mode,
+            )
+
+    return per_model
 
 
 def _run_single_model_pipeline(
@@ -239,6 +357,7 @@ def _run_single_model_pipeline(
     costs: RunCost,
     use_browser: bool,
     test_mode: bool,
+    defer_browser: bool = False,
 ) -> ModelRunResult:
     """One model's full pipeline: research -> judge -> maybe browser -> maybe refine."""
     print(f"  [{stack.tag}] Researching with web search...", flush=True)
@@ -272,6 +391,11 @@ def _run_single_model_pipeline(
         elif not quality.browser_url:
             print(f"  [{stack.tag}] Browser skipped: no URL proposed ({quality.confidence}% confidence)")
             result.browser_status = "proposed_no_url"
+        elif defer_browser:
+            print(f"  [{stack.tag}] Browser proposed for shared extraction ({quality.confidence}% confidence)")
+            result.browser_status = "proposed_shared"
+            result.browser_url = quality.browser_url
+            result.browser_objective = quality.browser_objective or ""
         else:
             result = _try_browser_refinement_for_model(
                 q, result, stack=stack, costs=costs, test_mode=test_mode,
@@ -300,11 +424,17 @@ def process_question(
     if mode in ("claude", "both"):
         selected["claude"] = claude_stack
 
+    rc_stack = selected.get("gpt") or selected.get("claude")
+    if rc_stack is not None:
+        ensure_rc_source(q, rc_stack.eval_model)
+        ensure_evidence_plan(q)
+
     with ThreadPoolExecutor(max_workers=2) as ex:
         futures = {
             tag: ex.submit(_run_single_model_pipeline, q,
                            stack=stack, costs=costs,
-                           use_browser=use_browser, test_mode=test_mode)
+                           use_browser=use_browser, test_mode=test_mode,
+                           defer_browser=use_browser)
             for tag, stack in selected.items()
         }
         per_model: dict[str, ModelRunResult] = {}
@@ -321,8 +451,13 @@ def process_question(
                     error={"type": type(e).__name__, "message": str(e)[:500], "traceback": tb[-2000:]},
                 )
 
+    if use_browser:
+        per_model = _apply_shared_browser_refinements(
+            q, per_model, selected, costs=costs, test_mode=test_mode,
+        )
+
     if len(per_model) >= 2:
-        consensus = compute_consensus(per_model)
+        consensus = compute_consensus(per_model, q.question_type)
     else:
         consensus = {"status": "single_model_only", "color_agreement": False, "q50_agreement": False, "row_diffs": []}
     return QuestionRunResult(per_model=per_model, costs=costs, consensus=consensus)
@@ -356,7 +491,6 @@ def cmd_run(args):
         }[mode]
         print(f"Mode: {mode} ({active_models})")
         print(f"Limit: {args.limit or 'all'}")
-        print(f"BigQuery writes: {'skip' if args.no_bq else 'yes'}")
         print(f"Sheet: {'skip' if args.no_sheet else 'yes'}")
         if input("Continue? [y/N] ").lower() != "y":
             return
@@ -427,12 +561,14 @@ def cmd_run(args):
             completed = [
                 {"id": questions[j].id, "name": questions[j].name,
                  "per_model": {m: _serialize_model_result(r) for m, r in per_model_lists[j].items()} if per_model_lists[j] else None,
-                 "consensus": consensus_blocks[j], "cost": asdict(costs_list[j]) if costs_list[j] else None,
+                 "consensus": consensus_blocks[j], "cost": costs_list[j].as_dict() if costs_list[j] else None,
                  "error": errors_list[j]}
                 for j in range(n) if per_model_lists[j] is not None or errors_list[j] is not None
             ]
-            with open(partial_path, "w") as f:
+            tmp_path = partial_path + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump({"run_id": run_id, "questions": completed}, f, indent=2)
+            os.replace(tmp_path, partial_path)
 
     run_data = build_run_data(
         run_id,
@@ -445,6 +581,7 @@ def cmd_run(args):
         errors_list=errors_list,
     )
     run_data = enrich_with_run_stability(run_data, DEFAULT_OUTPUT_DIR)
+    run_data = enrich_with_value_changes(run_data, DEFAULT_OUTPUT_DIR)
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     try:
         os.remove(partial_path)
@@ -455,23 +592,15 @@ def cmd_run(args):
     print(f"\nSaved: {json_path}")
     model_errs = s.get("model_error_count", 0)
     model_err_str = f", {model_errs} model error(s)" if model_errs else ""
+    qbm = s.get("quality_by_model") or {}
+    qbm_str = ", ".join(f"{tag} {n}" for tag, n in sorted(qbm.items())) or "none"
     print(
         f"Summary: {s['ok_count']}/{s['question_count']} validation OK, "
-        f"{s['quality_issue_count']} quality issues, "
+        f"{s['quality_issue_count']} questions with quality issues ({qbm_str} inadequate), "
         f"{s['error_count']} errors{model_err_str}, {s['browser_count']} browser extractions"
     )
     print(f"Due/unresolved (past-dated, no authoritative value found): {s['due_unresolved_count']}")
     print(f"Estimated cost: ${s['total_cost']:.4f}")
-
-    if not args.no_bq:
-        try:
-            fr_stats = write_accepted_to_fact_resolution(run_data)
-            if fr_stats is not None:
-                print(f"BigQuery fact_resolution: {fr_stats.inserted_row_count} inserted, {fr_stats.updated_row_count} updated")
-            else:
-                print("BigQuery fact_resolution: no accepted rows to write")
-        except Exception as e:
-            print(f"BigQuery fact_resolution write failed: {e}")
 
     if not args.no_sheet:
         try:
@@ -479,52 +608,6 @@ def cmd_run(args):
             print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}'")
         except Exception as e:
             print(f"Sheet publishing failed: {e}")
-
-
-def cmd_sync(args):
-    reviewed_items, _ = get_reviewed_items(DEFAULT_SHEET_ID, tab_name=args.tab)
-    print(f"Found {len(reviewed_items)} reviewed items")
-
-    if not reviewed_items:
-        print("Nothing to sync.")
-        return
-
-    print(f"\n  {'#':>3}  {'question':40s} {'date':12s} {'dim':20s} {'unit':12s} {'verdict':18s} review_value")
-    for i, item in enumerate(reviewed_items, 1):
-        name = (item.get("question_name") or "")[:38]
-        tdate = (item.get("target_date") or "")[:10]
-        dim = (item.get("dimension") or "")[:18]
-        unit = (item.get("unit") or "")[:10]
-        verdict = (item.get("review_verdict") or "")[:16]
-        rval = safe_str(item.get("review_value") or "")
-        print(f"  {i:>3}  {name:40s} {tdate:12s} {dim:20s} {unit:12s} {verdict:18s} {rval}")
-
-    if args.no_bq:
-        print(f"\n{len(reviewed_items)} item(s) found. Re-run without --no-bq to write to fact_resolution.")
-        return
-
-    by_run: dict[str, list] = {}
-    for item in reviewed_items:
-        by_run.setdefault(item.get("run_id", ""), []).append(item)
-    for rid, items in by_run.items():
-        json_path = os.path.join(DEFAULT_OUTPUT_DIR, f"run_{rid}.json")
-        try:
-            with open(json_path) as f:
-                run_data = json.load(f)
-        except FileNotFoundError:
-            print(f"  warning: run_{rid}.json not found; skipping fact_resolution write for this run")
-            continue
-        except Exception as e:
-            print(f"  warning: could not load run_{rid}.json: {e}")
-            continue
-        try:
-            fr_stats = write_accepted_to_fact_resolution(run_data, items)
-            if fr_stats is not None:
-                print(f"BigQuery fact_resolution ({rid}): {fr_stats.inserted_row_count} inserted, {fr_stats.updated_row_count} updated")
-            else:
-                print(f"BigQuery fact_resolution ({rid}): no accepted rows")
-        except Exception as e:
-            print(f"BigQuery fact_resolution write failed ({rid}): {e}")
 
 
 def cmd_setup(args):
@@ -536,7 +619,7 @@ def cmd_setup(args):
     setup_sheet(DEFAULT_SHEET_ID)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="leap-surveillance",
         description="LEAP Surveillance - forecasts for expert panel questions",
@@ -545,8 +628,8 @@ def main():
 Examples:
   %(prog)s run --limit 5        Run surveillance on 5 questions
   %(prog)s run --limit 5 -y     Same, skip confirmation
-  %(prog)s sync                 Sync reviewed items from latest run tab
-  %(prog)s sync --tab run_...   Sync reviewed items from a specific run tab
+  %(prog)s sync                 Sync latest run tab to BigQuery
+  %(prog)s sync --tab run_...   Sync a specific run tab to BigQuery
   %(prog)s sync --no-bq         Dry-run: print what would be synced, no write
   %(prog)s setup                Rebuild the Instructions tab
         """,
@@ -562,7 +645,6 @@ Examples:
         help="Comma-separated question IDs to run (or path to file with one ID per line)",
     )
     run_parser.add_argument("--no-sheet", action="store_true", help="Skip publishing to Sheet")
-    run_parser.add_argument("--no-bq", action="store_true", help="Skip BigQuery writes (fact_resolution)")
     run_parser.add_argument(
         "--no-browser",
         action="store_true",
@@ -591,13 +673,18 @@ Examples:
     model_group.add_argument("--both", dest="mode_flag", action="store_const", const="both",
                               help="Run both GPT and Claude in parallel (default)")
 
-    sync_parser = subparsers.add_parser("sync", help="Sync reviewed items from a run tab to BigQuery")
+    sync_parser = subparsers.add_parser("sync", help="Sync a run tab to BigQuery")
     sync_parser.add_argument("--no-bq", action="store_true", help="Dry-run: print what would be written; no write")
     sync_parser.add_argument("--tab", type=str, default=None, help="Specific run_<run_id> tab to read (default: most recent)")
 
     setup_parser = subparsers.add_parser("setup", help="Rebuild the Instructions tab (does not touch run_* tabs)")
     setup_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "run":

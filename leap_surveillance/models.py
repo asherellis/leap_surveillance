@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
+import re
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +34,8 @@ class QuestionSpec:
     resolution_criteria: str = ""
     background_info: str = ""
     dim_question_map: dict = field(default_factory=dict)  # {"fdate|dim": dim_question.question_id}
+    rc_source: dict | None = None  # filled by extract_rc_source() before research; None = not yet extracted
+    evidence_plan: dict | None = None  # serialized EvidencePlan shared across research/judge/browser stages
 
 
 @dataclass
@@ -42,6 +45,8 @@ class EvidenceItem:
     title: Optional[str] = None
     snippet: Optional[str] = None
     full_text: Optional[str] = None
+    source_role: str = ""
+    retrieval_status: str = ""
 
 
 @dataclass
@@ -50,7 +55,6 @@ class RunCost:
     judge_stage1: float = 0.0
     judge_stage2: float = 0.0
     refinement: float = 0.0
-    # Claude path (dual-model mode).
     claude_research: float = 0.0
     claude_judge_stage1: float = 0.0
     claude_judge_stage2: float = 0.0
@@ -165,8 +169,7 @@ class SurveillanceResponse(BaseModel):
     sources: list[str]
 
 
-# Strict* models describe the LLM JSON output. The runtime models above use
-# nullable values, flattened source URLs, and system-assigned forecast value_type.
+# Strict* models describe the LLM JSON output; runtime models above allow nullable/flattened fields the LLM doesn't set.
 class StrictOfficialValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
@@ -218,6 +221,15 @@ class StrictSurveillanceResponse(BaseModel):
     sources: list[StrictSource]
 
 
+class StrictEventSurveillanceResponse(BaseModel):
+    """LLM output for probability/timing questions, where LOV/current are not meaningful."""
+    model_config = STRICT_CONFIG
+    resolution_values: list[StrictResolutionValue]
+    forecasts: list[StrictForecastValue]
+    rationale: str
+    sources: list[StrictSource]
+
+
 def make_strict_schema(
     model: type[BaseModel],
     allowed_dimensions: Optional[list[str]] = None,
@@ -262,6 +274,11 @@ def make_strict_schema(
         resolution_properties["forecast_date"]["enum"] = allowed_forecast_dates
     if allowed_dimensions and "dimension" in resolution_properties:
         resolution_properties["dimension"]["enum"] = allowed_dimensions
+    if allowed_dimensions:
+        for def_name in ("StrictOfficialValue", "StrictCurrentValue"):
+            props = schema.get("$defs", {}).get(def_name, {}).get("properties", {})
+            if "dimension" in props:
+                props["dimension"]["enum"] = allowed_dimensions
     if unit_min is not None or unit_max is not None:
         fv_prop = properties.get("forecast_value", {})
         if unit_min is not None:
@@ -276,16 +293,24 @@ def _convert_sentinel_value(v: float) -> Optional[float]:
 
 
 def strict_to_regular_response(
-    strict: StrictSurveillanceResponse | str,
+    strict: StrictSurveillanceResponse | StrictEventSurveillanceResponse | str,
     expected_forecasts: Optional[list[ExpectedForecast]] = None,
+    question_type: Optional[str] = None,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
+    no_official = question_type in ("probability", "when")
     if isinstance(strict, str):
-        strict = StrictSurveillanceResponse.model_validate_json(strict)
+        strict = (
+            StrictEventSurveillanceResponse.model_validate_json(strict)
+            if no_official
+            else StrictSurveillanceResponse.model_validate_json(strict)
+        )
 
-    evidence = [
-        EvidenceItem(source_type="web_search", url=s.url, title=s.title, snippet=s.snippet)
-        for s in strict.sources
-    ]
+    seen_urls: set[str] = set()
+    evidence = []
+    for s in strict.sources:
+        if s.url not in seen_urls:
+            seen_urls.add(s.url)
+            evidence.append(EvidenceItem(source_type="web_search", url=s.url, title=s.title, snippet=s.snippet))
     expected_value_types = {
         (e.forecast_date, e.dimension, e.quantile): e.value_type
         for e in expected_forecasts or []
@@ -329,7 +354,7 @@ def strict_to_regular_response(
                 date=ov.date,
                 source=ov.source,
             )
-            for ov in strict.last_official_values
+            for ov in ([] if no_official else getattr(strict, "last_official_values", []))
         ],
         current_estimates=[
             CurrentValue(
@@ -337,7 +362,7 @@ def strict_to_regular_response(
                 value=_convert_sentinel_value(cv.value),
                 confidence=cv.confidence,
             )
-            for cv in strict.current_estimates
+            for cv in ([] if no_official else getattr(strict, "current_estimates", []))
         ],
         resolution_values=[
             ResolutionValue(
@@ -366,6 +391,32 @@ def _parse_iso_date(value: str) -> date | None:
         return None
 
 
+def _contains_leap_forecast_anchor(response: "SurveillanceResponse") -> bool:
+    """Detect actual LEAP forecast sourcing without flagging explicit non-use statements."""
+    source_text = " ".join(response.sources or []).lower()
+    if "leap.forecastingresearch.org" in source_text or "leap wave" in source_text:
+        return True
+
+    rationale = response.rationale or ""
+    anchor_patterns = ("leap.forecastingresearch.org", "leap wave")
+    negation_re = re.compile(
+        r"\b(did not|didn't|do not|don't|not|never|without|excluded?|skip(?:ped)?|avoid(?:ed)?)\b"
+        r".{0,120}\b(use|read|cite|consult|anchor|rely|include|draw)\b"
+        r"|\b(use|read|cite|consult|anchor|rely|include|draw)\b.{0,120}"
+        r"\b(did not|didn't|do not|don't|not|never|without|excluded?|skip(?:ped)?|avoid(?:ed)?)\b",
+        re.IGNORECASE,
+    )
+    exclusion_re = re.compile(r"\b(did not|didn't|do not|don't|never|without|excluded?|skip(?:ped)?|avoid(?:ed)?)\b", re.IGNORECASE)
+    for sentence in re.split(r"(?<=[.!?])\s+", rationale):
+        lowered = sentence.lower()
+        if not any(pattern in lowered for pattern in anchor_patterns):
+            continue
+        if negation_re.search(sentence) or exclusion_re.search(sentence):
+            continue
+        return True
+    return False
+
+
 def validate_response(
     response: SurveillanceResponse, expected: list[ExpectedForecast] | None = None,
     unit_min: float | None = None, unit_max: float | None = None,
@@ -377,6 +428,10 @@ def validate_response(
         issues.append("no_forecasts")
     if not response.sources:
         issues.append("no_sources")
+
+    # Flag actual anchoring on LEAP's own panel forecasts, not rationale sentences denying it.
+    if _contains_leap_forecast_anchor(response):
+        issues.append("leap_forecast_anchoring")
 
     if expected:
         expected_keys = {(e.forecast_date, e.dimension) for e in expected}
@@ -479,9 +534,13 @@ def validate_response(
         if len(colors) > 1:
             issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")
 
+    seen_resolution_not_black: set[tuple] = set()
     for f in response.forecasts:
         if getattr(f.value_type, "value", f.value_type) == "resolution" and f.color_code.value != "black":
-            issues.append(f"resolution_not_black_{f.forecast_date}_{f.dimension}")
+            key = (f.forecast_date, f.dimension)
+            if key not in seen_resolution_not_black:
+                seen_resolution_not_black.add(key)
+                issues.append(f"resolution_not_black_{f.forecast_date}_{f.dimension}")
 
     if expected_has_q50:
         usable_for_scoring = any(

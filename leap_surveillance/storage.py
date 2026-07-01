@@ -18,25 +18,57 @@ from google.cloud.bigquery import DmlStats
 from .common import (
     DEFAULT_BQ_PROJECT,
     DEFAULT_SURVEILLANCE_DATASET,
-    NEAR_ZERO_SUM,
     Q50_TOLERANCE,
     TIMING_FORECAST_DATE,
+    WHEN_TOLERANCE_YR,
+    enum_value,
     is_empty,
     resolution_status,
-    safe_str,
-    to_float,
+    within_relative_tolerance,
 )
 
 
+def _safe_num(value):
+    try:
+        return float(str(value).replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float_or_none(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_date_or_none(value):
+    if is_empty(value):
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
 def context_maps(response: dict) -> tuple[dict, dict, dict]:
-    official = {
-        item.get("dimension", "Overall"): item
-        for item in response.get("last_official_values", []) or []
-    }
     current = {
         item.get("dimension", "Overall"): item
         for item in response.get("current_estimates", []) or []
     }
+    # A dimension can have multiple components (e.g. ratio numerator/denominator) — match by value, not last-wins.
+    official: dict = {}
+    for item in response.get("last_official_values", []) or []:
+        dim = item.get("dimension", "Overall")
+        if dim not in official:
+            official[dim] = item
+            continue
+        anchor = _safe_num((current.get(dim) or {}).get("value"))
+        if anchor is None:
+            continue
+        prev, new = _safe_num(official[dim].get("value")), _safe_num(item.get("value"))
+        if new is not None and (prev is None or abs(new - anchor) < abs(prev - anchor)):
+            official[dim] = item
     resolution = {
         (item.get("forecast_date"), item.get("dimension", "Overall")): item
         for item in response.get("resolution_values", []) or []
@@ -44,15 +76,16 @@ def context_maps(response: dict) -> tuple[dict, dict, dict]:
     return official, current, resolution
 
 
-def _none_if_empty(value):
-    return None if is_empty(value) else value
-
-
-def _first_non_empty(*values):
-    for value in values:
-        if not is_empty(value):
-            return value
-    return None
+def pick_by_dimension(value_map: dict, dim: str, single_dim: bool) -> dict:
+    """Match official/current values to a row dimension; tolerate free-text labels on older runs."""
+    if value_map.get(dim):
+        return value_map[dim]
+    if value_map.get("Overall"):
+        return value_map["Overall"]
+    for label, obj in value_map.items():  # older runs label by "{dim} (some detail)"
+        if label.startswith(f"{dim} ") or label.startswith(f"{dim}("):
+            return obj
+    return next(iter(value_map.values())) if (single_dim and value_map) else {}
 
 
 def _forecast_output_row(
@@ -63,15 +96,13 @@ def _forecast_output_row(
     forecast: dict,
     response: dict,
     validation: dict | None = None,
-    run_id: str | None = None,
-    created_at: str | None = None,
-    result_id: str | None = None,
 ) -> dict:
     official, current, resolution = context_maps(response)
     dim = forecast.get("dimension", "Overall")
     forecast_date = forecast.get("forecast_date", "")
-    official_value = official.get(dim) or official.get("Overall") or {}
-    current_value = current.get(dim) or current.get("Overall") or {}
+    single_dim = len({f.get("dimension", "Overall") for f in response.get("forecasts", []) or []}) <= 1
+    official_value = pick_by_dimension(official, dim, single_dim)
+    current_value = pick_by_dimension(current, dim, single_dim)
     resolution_value = resolution.get((forecast_date, dim)) or resolution.get((forecast_date, "Overall")) or {}
     # Route by whether the row resolved (black), not by date — past-dated unresolved rows are still gray estimates.
     color = forecast.get("color_code", "")
@@ -106,12 +137,6 @@ def _forecast_output_row(
         "latest_official_date": official_value.get("date", ""),
         "latest_official_source": official_value.get("source", ""),
     }
-    if result_id is not None:
-        row["result_id"] = result_id
-    if run_id is not None:
-        row["run_id"] = run_id
-    if created_at is not None:
-        row["created_at"] = created_at
     if validation is not None:
         row["validation_ok"] = str(validation.get("ok", False))
         row["usable_for_scoring"] = str(validation.get("usable_for_scoring", False))
@@ -133,6 +158,8 @@ def _serialize_model_result(model_result) -> dict | None:
                 "title": e.title,
                 "snippet": e.snippet,
                 "full_text": e.full_text,
+                "source_role": e.source_role,
+                "retrieval_status": e.retrieval_status,
             }
             for e in model_result.evidence
         ]
@@ -155,6 +182,9 @@ def _serialize_model_result(model_result) -> dict | None:
         }
     out["browser_used"] = bool(model_result.browser_used)
     out["browser_status"] = model_result.browser_status or "not_proposed"
+    out["browser_url"] = model_result.browser_url or (model_result.quality.browser_url if model_result.quality else "")
+    out["browser_objective"] = model_result.browser_objective or (model_result.quality.browser_objective if model_result.quality else "")
+    out["browser_error"] = model_result.browser_error or ""
     if model_result.error:
         out["error"] = model_result.error
     return out
@@ -202,6 +232,7 @@ def build_run_data(
             "resolution_criteria": q.resolution_criteria,
             "background_info": q.background_info,
             "dim_question_map": q.dim_question_map,
+            "evidence_plan": q.evidence_plan,
         }
         if error:
             result["error"] = error
@@ -228,19 +259,15 @@ def build_run_data(
 
 _STABILITY_MAX_RUNS = 10   # prior production runs to consider
 _STABILITY_SCAN_CAP = 40   # files to scan looking for them (most are legacy/test runs)
-_WHEN_TOLERANCE_YR = 2     # ±years for non-black when-type rows
-
-
 def _stable_pair(a: float | None, b: float | None, color: str | None, q_type: str) -> bool:
     """Two q50s agree: exact for resolved (black) rows, tolerance band otherwise."""
     if a is None or b is None:
         return False
     if color == "black":
-        return a == b
+        return abs(a - b) < 1e-9
     if q_type == "when":
-        return abs(a - b) <= _WHEN_TOLERANCE_YR
-    s = abs(a) + abs(b)
-    return s < NEAR_ZERO_SUM or abs(a - b) / (s / 2) <= Q50_TOLERANCE
+        return abs(a - b) <= WHEN_TOLERANCE_YR
+    return within_relative_tolerance(a, b, Q50_TOLERANCE)
 
 
 def _classify_sequence(points: list[tuple], q_type: str) -> str:
@@ -286,8 +313,7 @@ def _adequate_q50s(model_block: dict):
         return
     for fc in (model_block.get("response") or {}).get("forecasts", []):
         if fc.get("quantile") == 50 and fc.get("forecast_value") is not None:
-            color = fc.get("color_code")
-            color = color.get("value", color) if isinstance(color, dict) else color
+            color = enum_value(fc.get("color_code"))
             yield fc.get("forecast_date", ""), fc.get("dimension", "Overall"), fc.get("forecast_value"), color
 
 
@@ -355,25 +381,78 @@ def enrich_with_run_stability(run_data: dict, output_dir: str) -> dict:
     return run_data
 
 
+def _values_differ(a, b) -> bool:
+    """True if two LOV/current-estimate values are meaningfully different."""
+    if a is None and b is None:
+        return False
+    if a is None or b is None:
+        return True
+    try:
+        fa, fb = float(a), float(b)
+        return abs(fa - fb) > max(abs(fa), abs(fb), 1.0) * 0.001
+    except (ValueError, TypeError):
+        return str(a).strip() != str(b).strip()
+
+
+def enrich_with_value_changes(run_data: dict, output_dir: str) -> dict:
+    """Annotate each question with whether GPT's LOV or current estimate changed vs the prior run."""
+    current_models = run_data.get("models") or {}
+    current_run_id = run_data.get("run_id", "")
+
+    prior_runs = _read_production_history(output_dir, current_models, current_run_id)
+    if not prior_runs:
+        for q in run_data.get("questions", []):
+            q["value_changed"] = False
+        return run_data
+
+    prior_run = prior_runs[-1]  # most recent prior run
+    prior_by_id: dict[str, dict] = {q.get("id", ""): q for q in prior_run.get("questions", [])}
+
+    for q in run_data.get("questions", []):
+        qid = q.get("id", "")
+        prior_q = prior_by_id.get(qid)
+        if not prior_q:
+            q["value_changed"] = False
+            continue
+
+        curr_gpt = (q.get("per_model") or {}).get("gpt") or {}
+        prior_gpt = (prior_q.get("per_model") or {}).get("gpt") or {}
+        curr_official, curr_current, _ = context_maps((curr_gpt.get("response") or {}))
+        prior_official, prior_current, _ = context_maps((prior_gpt.get("response") or {}))
+
+        changed = False
+        all_dims = set(curr_official) | set(curr_current) | {"Overall"}
+        single = len({d for d in curr_official} | {d for d in curr_current}) <= 1
+        for dim in all_dims:
+            c_lov = pick_by_dimension(curr_official, dim, single).get("value")
+            p_lov = pick_by_dimension(prior_official, dim, single).get("value")
+            c_cur = pick_by_dimension(curr_current, dim, single).get("value")
+            p_cur = pick_by_dimension(prior_current, dim, single).get("value")
+            if _values_differ(c_lov, p_lov) or _values_differ(c_cur, p_cur):
+                changed = True
+                break
+
+        q["value_changed"] = changed
+
+    return run_data
+
+
 def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
-    """Question-level run counts. Prefers GPT when both models ran; falls back to Claude."""
+    """Question-level run counts. Quality and browser counts are per-model; ok_count uses GPT-preferred primary."""
     ok_count = 0
     quality_issue_count = 0
     browser_count = 0
     due_unresolved = 0
     model_error_count = 0
+    quality_by_model: dict[str, int] = defaultdict(int)
+    browser_by_model: dict[str, int] = defaultdict(int)
 
     for per_model in per_model_lists:
-        # Question-level summary uses whichever model produced output (GPT preferred for stable counts).
         primary = (per_model or {}).get("gpt") or (per_model or {}).get("claude")
         if primary is None:
             continue
         if (primary.validation or {}).get("ok"):
             ok_count += 1
-        if primary.quality is not None and primary.quality.adequate is False:
-            quality_issue_count += 1
-        if primary.browser_used:
-            browser_count += 1
         if primary.response is not None:
             seen: set[tuple[str, str]] = set()
             for f in primary.response.forecasts:
@@ -383,14 +462,27 @@ def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
                 seen.add(key)
                 if resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
                     due_unresolved += 1
-        for model_result in (per_model or {}).values():
-            if model_result is not None and model_result.error:
+        any_inadequate = False
+        for tag, model_result in (per_model or {}).items():
+            if model_result is None:
+                continue
+            if model_result.error:
                 model_error_count += 1
+            if model_result.quality is not None and model_result.quality.adequate is False:
+                quality_by_model[tag] += 1
+                any_inadequate = True
+            if model_result.browser_used:
+                browser_by_model[tag] += 1
+                browser_count += 1
+        if any_inadequate:
+            quality_issue_count += 1
 
     return {
         "question_count": len(per_model_lists),
         "ok_count": ok_count,
         "quality_issue_count": quality_issue_count,
+        "quality_by_model": dict(quality_by_model),
+        "browser_by_model": dict(browser_by_model),
         "error_count": sum(1 for e in errors_iter if e),
         "model_error_count": model_error_count,
         "browser_count": browser_count,
@@ -523,6 +615,24 @@ def _merge_bq(
         if pk not in cols:
             raise RuntimeError(f"TEMP table is missing '{pk}' after load.")
 
+        target_table = client.get_table(target)
+        target_cols = {field.name for field in target_table.schema}
+        missing_fields = [field for field in temp_schema if field.name not in target_cols]
+        if missing_fields:
+            target_table.schema = [
+                *target_table.schema,
+                *[
+                    bigquery.SchemaField(
+                        field.name,
+                        field.field_type,
+                        mode="NULLABLE",
+                        description=field.description,
+                    )
+                    for field in missing_fields
+                ],
+            ]
+            client.update_table(target_table, ["schema"])
+
         non_pk_cols = [col for col in cols if col != pk]
         update_cols = [col for col in (update_cols or non_pk_cols) if col in non_pk_cols]
 
@@ -595,33 +705,217 @@ def _try_merge_bigquery_rows(
         return None
 
 
-def write_accepted_to_fact_resolution(run_data: dict, reviewed_items: list | None = None):
-    """Write auto-accepted or human-approved forecasts to fact.fact_resolution."""
+def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = None):
+    """Write resolved/projected target-date values to fact.fact_resolution."""
     now = datetime.now(timezone.utc)
 
-    reviewed_map: dict[tuple, dict] = {}
-    for item in (reviewed_items or []):
-        key = (item.get("question_id", ""), item.get("target_date", ""), item.get("dimension", "Overall") or "Overall")
-        reviewed_map[key] = item
+    item_map: dict[tuple, dict] = {}
+    for item in (all_items or []):
+        group_qid = item.get("group_question_id") or item.get("question_id", "")
+        key = (group_qid, item.get("target_date", ""), item.get("dimension", "Overall") or "Overall")
+        item_map[key] = item
 
-    def q50_values(per_model: dict, fdate: str, dim: str) -> list[float]:
-        vals = []
-        for block in per_model.values():
-            for fc in (block.get("response") or {}).get("forecasts", []):
-                if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
-                    d = fc.get("dimension", "Overall") or "Overall"
-                    v = fc.get("forecast_value")
-                    if d == dim and v is not None:
-                        vals.append(float(v))
-        return vals
-
-    def row_color(per_model: dict, fdate: str, dim: str) -> str | None:
+    def effective_color(item: dict | None, per_model: dict, fdate: str, dim: str) -> str | None:
+        review_color = (item or {}).get("review_color", "")
+        if review_color not in (None, ""):
+            # Normalize spacing variants ("dark gray" → "dark_gray") before writing to BQ.
+            review_color = review_color.strip().lower().replace(" ", "_")
+            return review_color
         for tag in ("gpt", "claude"):
             for fc in (per_model.get(tag) or {}).get("response", {}).get("forecasts", []):
                 if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
                     if (fc.get("dimension", "Overall") or "Overall") == dim:
-                        c = fc.get("color_code")
-                        return c.get("value", c) if isinstance(c, dict) else c
+                        return enum_value(fc.get("color_code"))
+        return None
+
+    def black_q50_avg(per_model: dict, fdate: str, dim: str) -> float | None:
+        vals = []
+        for block in per_model.values():
+            for fc in (block.get("response") or {}).get("forecasts", []):
+                if fc.get("quantile") != 50 or fc.get("forecast_date") != fdate:
+                    continue
+                if (fc.get("dimension", "Overall") or "Overall") != dim:
+                    continue
+                c = enum_value(fc.get("color_code"))
+                if c == "black":
+                    v = fc.get("forecast_value")
+                    if v is not None:
+                        vals.append(float(v))
+        return sum(vals) / len(vals) if vals else None
+
+    def model_resolution_source(per_model: dict, fdate: str, dim: str) -> tuple[str, date | None]:
+        for tag in ("gpt", "claude"):
+            resolution = {
+                (item.get("forecast_date"), item.get("dimension", "Overall")): item
+                for item in (per_model.get(tag) or {}).get("response", {}).get("resolution_values", []) or []
+            }
+            item = resolution.get((fdate, dim)) or resolution.get((fdate, "Overall")) or {}
+            if item:
+                return item.get("source") or "surveillance_projected", _parse_date_or_none(item.get("source_date"))
+        return "surveillance_projected", None
+
+    rows = []
+    for q in run_data.get("questions", []):
+        group_qid = q.get("id", "")
+        per_model = q.get("per_model") or {}
+        dim_q_map = q.get("dim_question_map") or {}
+
+        for key, dq_id in dim_q_map.items():
+            fdate, dim = key.split("|", 1)
+            if fdate == TIMING_FORECAST_DATE:
+                continue
+
+            item = item_map.get((group_qid, fdate, dim))
+            color = effective_color(item, per_model, fdate, dim)
+            reviewed_status = ((item or {}).get("reviewed_question_resolution_status") or "").strip().lower()
+            system_status = ((item or {}).get("question_resolution_status") or "").strip().lower()
+            status = reviewed_status or system_status
+            if color != "black" and status not in ("resolved", "projected"):
+                continue
+
+            reviewed_value = _safe_float_or_none((item or {}).get("reviewed_question_resolution_value"))
+            system_value = _safe_float_or_none((item or {}).get("question_resolution_value"))
+            if reviewed_value is not None:
+                value = reviewed_value
+                source = (item or {}).get("review_source") or "surveillance_reviewed"
+                resolution_status_value = "projected" if reviewed_status == "projected" else "confirmed"
+                resolved_at = now if resolution_status_value in ("resolved", "confirmed") else None
+                resolution_date = (
+                    _parse_date_or_none((item or {}).get("question_resolution_source_date"))
+                    or date.fromisoformat(fdate)
+                )
+            elif system_value is not None:
+                value = system_value
+                source = (item or {}).get("question_resolution_source") or "surveillance_projected"
+                resolution_status_value = "projected"
+                resolved_at = None
+                resolution_date = (
+                    _parse_date_or_none((item or {}).get("question_resolution_source_date"))
+                    or date.fromisoformat(fdate)
+                )
+            else:
+                value = black_q50_avg(per_model, fdate, dim)
+                if value is None:
+                    continue
+                source, source_date = model_resolution_source(per_model, fdate, dim)
+                resolution_status_value = "projected"
+                resolved_at = None
+                resolution_date = source_date or date.fromisoformat(fdate)
+
+            rows.append({
+                "question_id": dq_id,
+                "resolution_value": value,
+                "resolution_date": resolution_date,
+                "resolution_source": source,
+                "resolution_status": resolution_status_value,
+                "resolved_at": resolved_at,
+            })
+
+    if not rows:
+        return None
+    return _try_merge_bigquery_rows(
+        "fact_resolution", rows,
+        pk="question_id", dataset="fact", table="fact_resolution",
+    )
+
+
+def _run_date_from_id(run_id: str) -> date:
+    try:
+        return datetime.strptime(run_id[:8], "%Y%m%d").date()
+    except (ValueError, TypeError):
+        return datetime.now(timezone.utc).date()
+
+
+def write_to_dim_baseline(run_data: dict, all_sheet_rows: list[dict]):
+    """Write historical/current baseline values to dim.dim_baseline."""
+    run_id = run_data.get("run_id", "")
+    current_date = _run_date_from_id(run_id)
+
+    def first_float(*values) -> tuple[float | None, str]:
+        for label, value in values:
+            parsed = _safe_float_or_none(value)
+            if parsed is not None:
+                return parsed, label
+        return None, ""
+
+    rows = []
+    seen: set[str] = set()
+    for item in all_sheet_rows or []:
+        group_qid = item.get("group_question_id") or item.get("question_id", "")
+        if not group_qid:
+            continue
+        dim = item.get("dimension") or "Overall"
+
+        lov, lov_origin = first_float(
+            ("reviewed", item.get("review_last_official_value")),
+            ("gpt", item.get("gpt_latest_official_value")),
+            ("claude", item.get("claude_latest_official_value")),
+        )
+        lov_date = (
+            _parse_date_or_none(item.get("gpt_latest_official_date"))
+            or _parse_date_or_none(item.get("claude_latest_official_date"))
+            or current_date
+        )
+        current, current_origin = first_float(
+            ("reviewed", item.get("review_current_value")),
+            ("gpt", item.get("gpt_current_estimate")),
+            ("claude", item.get("claude_current_estimate")),
+        )
+
+        candidates = [
+            ("historical", lov, lov_date, lov_origin),
+            ("current_day", current, current_date, current_origin),
+        ]
+        for baseline_type, value, baseline_date, origin in candidates:
+            if value is None:
+                continue
+            baseline_id = f"{run_id}_{group_qid}_{dim}_{baseline_type}".replace(" ", "_")
+            if baseline_id in seen:
+                continue
+            seen.add(baseline_id)
+            rows.append({
+                "baseline_id": baseline_id,
+                "question_group_id": group_qid,
+                "question_group_source_id": group_qid,
+                "question_dimension": dim,
+                "baseline_date": baseline_date,
+                "baseline_value": value,
+                "baseline_type": baseline_type,
+                "baseline_source": "fri_research" if origin == "reviewed" else "llm_surveillance",
+            })
+
+    if not rows:
+        return None
+    return _try_merge_bigquery_rows(
+        "dim_baseline", rows,
+        pk="baseline_id", dataset="dim", table="dim_baseline",
+    )
+
+
+def write_to_surveillance_result(run_data: dict, all_sheet_rows: list[dict]):
+    """Write full surveillance results (LLM forecasts + human review) to surveillance.surveillance_result."""
+    now = datetime.now(timezone.utc)
+    run_id = run_data.get("run_id", "")
+
+    sheet_map: dict[tuple, dict] = {}
+    for item in (all_sheet_rows or []):
+        group_qid = item.get("group_question_id") or item.get("question_id", "")
+        key = (group_qid, item.get("target_date", ""), item.get("dimension", "Overall") or "Overall")
+        sheet_map[key] = item
+
+    def q50_for(per_model: dict, model: str, fdate: str, dim: str) -> float | None:
+        for fc in (per_model.get(model) or {}).get("response", {}).get("forecasts", []):
+            if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
+                if (fc.get("dimension", "Overall") or "Overall") == dim:
+                    v = fc.get("forecast_value")
+                    return float(v) if v is not None else None
+        return None
+
+    def color_for(per_model: dict, model: str, fdate: str, dim: str) -> str | None:
+        for fc in (per_model.get(model) or {}).get("response", {}).get("forecasts", []):
+            if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
+                if (fc.get("dimension", "Overall") or "Overall") == dim:
+                    return enum_value(fc.get("color_code"))
         return None
 
     rows = []
@@ -633,54 +927,48 @@ def write_accepted_to_fact_resolution(run_data: dict, reviewed_items: list | Non
 
         for key, dq_id in dim_q_map.items():
             fdate, dim = key.split("|", 1)
-            if fdate == TIMING_FORECAST_DATE:
-                continue  # "event_occurrence" is not a real date; fact_resolution.resolution_date is DATE
-            reviewed = reviewed_map.get((group_qid, fdate, dim))
+            is_timing = fdate == TIMING_FORECAST_DATE
+            sheet = sheet_map.get((group_qid, fdate, dim)) or {}
 
-            if reviewed is not None:
-                verdict = (reviewed.get("review_verdict") or "").lower().strip()
-                if verdict not in ("correct", "close"):
-                    continue
-                raw = reviewed.get("review_value", "")
-                if raw not in (None, ""):
-                    try:
-                        value = float(raw)
-                    except (ValueError, TypeError):
-                        continue
-                else:
-                    # require explicit value when models disagreed
-                    if consensus_status != "auto_accepted":
-                        continue
-                    vals = q50_values(per_model, fdate, dim)
-                    if not vals:
-                        continue
-                    value = sum(vals) / len(vals)
-                source = "surveillance_reviewed"
-            elif consensus_status == "auto_accepted":
-                vals = q50_values(per_model, fdate, dim)
-                if not vals:
-                    continue
-                value = sum(vals) / len(vals)
-                source = "surveillance_consensus"
-            else:
-                continue
-
-            color = row_color(per_model, fdate, dim)
-            is_resolved = color == "black"
             rows.append({
+                "run_question_id": f"{run_id}_{dq_id}",
+                "run_id": run_id,
                 "question_id": dq_id,
-                "resolution_value": value,
-                "resolution_date": date.fromisoformat(fdate),
-                "resolution_source": source,
-                "resolution_status": "resolved" if is_resolved else "projected",
-                "resolved_at": now if is_resolved else None,
+                "group_question_id": group_qid,
+                "question_name": q.get("name", ""),
+                "dimension": dim,
+                "target_date": None if is_timing else fdate,
+                "question_type": q.get("question_type", ""),
+                "unit": q.get("unit", ""),
+                "status": sheet.get("status", ""),
+                "question_resolution_status": sheet.get("question_resolution_status") or None,
+                "question_resolution_value": _safe_float_or_none(sheet.get("question_resolution_value")),
+                "question_resolution_source": sheet.get("question_resolution_source") or None,
+                "question_resolution_source_date": sheet.get("question_resolution_source_date") or None,
+                "needs_review": sheet.get("needs_review") in (True, "TRUE", "true", "1", 1),
+                "gpt_q50": q50_for(per_model, "gpt", fdate, dim),
+                "claude_q50": q50_for(per_model, "claude", fdate, dim),
+                "gpt_color": color_for(per_model, "gpt", fdate, dim),
+                "claude_color": color_for(per_model, "claude", fdate, dim),
+                "consensus_status": consensus_status,
+                "reviewed": sheet.get("reviewed", False),
+                "review_verdict": sheet.get("review_verdict") or None,
+                "review_last_official_value": _safe_float_or_none(sheet.get("review_last_official_value")),
+                "review_current_value": _safe_float_or_none(sheet.get("review_current_value")),
+                "reviewed_question_resolution_status": sheet.get("reviewed_question_resolution_status") or None,
+                "reviewed_question_resolution_value": _safe_float_or_none(sheet.get("reviewed_question_resolution_value")),
+                "review_color": sheet.get("review_color") or None,
+                "review_source": sheet.get("review_source") or None,
+                "review_notes": sheet.get("review_notes") or None,
+                "synced_at": now,
             })
 
     if not rows:
         return None
     return _try_merge_bigquery_rows(
-        "fact_resolution", rows,
-        pk="question_id", dataset="fact", table="fact_resolution",
+        "surveillance_result", rows,
+        pk="run_question_id",
+        dataset=DEFAULT_SURVEILLANCE_DATASET,
+        table="surveillance_result",
+        clock_col="synced_at",
     )
-
-

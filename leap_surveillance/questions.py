@@ -133,7 +133,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
     SELECT
         qg.question_group_id AS question_set_id,
         qg.question_group_name AS question_set_name,
-        q.question_text AS question_set_text,
+        qg.question_group_text AS question_set_text,
         qg.question_group_background_info AS question_set_background_information,
         qg.question_group_resolution_criteria AS question_set_resolution_criteria,
         u.unit_display_text, u.unit_min_value, u.unit_max_value,
@@ -197,8 +197,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         if not safe_str(row.get("question_set_resolution_criteria")):
             print(f"  warning: no resolution_criteria for '{question_name}'")
 
-        # Build mapping from "fdate|dim" → dim_question.question_id for q50 rows only.
-        # For when-type questions, question_resolution_date is NULL; use TIMING_FORECAST_DATE.
+        # Map "fdate|dim" -> dim_question.question_id for q50 rows only (when-type dates are NULL, use TIMING_FORECAST_DATE).
         dim_q_map = {}
         for _, r in group.iterrows():
             pct = r.get("question_percentile")
