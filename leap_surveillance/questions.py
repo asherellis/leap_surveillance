@@ -17,36 +17,20 @@ from .storage import query_bq
 
 def _infer_surveillance_question_type(
     question_text: str,
-    unit: str,
+    unit_name: str,
     dates: list[str],
     dimensions: list[str],
     source_percentiles: list[int],
 ) -> str:
-    text = question_text.lower()
-    unit_lower = unit.lower()
-    pct_set = set(source_percentiles)
 
-    if not dates and pct_set:
+    if unit_name.strip().lower() == "probability": 
+        if set(source_percentiles) == {50}:
+            return "probability"
+        else:
+            print(f"  warning: skipping '{question_text}' - probability unit question with non-50 percentiles not supported. It's handled as a quantile question instead.")
+    if not dates:
         return "when"
-
-    asks_probability = bool(
-        re.search(r"\bprobabilit(y|ies)\b|\bwill\b", text)
-    )
-    probability_unit = "probability" in unit_lower
-    scalar_probability = pct_set == {50} and (
-        probability_unit
-        or "what is the probability" in text
-        or text.strip().startswith("will ")
-        or text.strip().startswith("what is the probability")
-        or text.strip().startswith("what's the probability")
-    )
-    distribution_over_options = pct_set == {50} and probability_unit and len(dimensions) > 1
-
-    if asks_probability and (scalar_probability or distribution_over_options):
-        return "probability"
-
     return "quantile"
-
 
 def _build_prompt_context(row, dates: list[str], dimensions: list[str]) -> str:
     prompt = safe_str(row.get("question_set_text"))
@@ -56,7 +40,7 @@ def _build_prompt_context(row, dates: list[str], dimensions: list[str]) -> str:
     res = safe_str(row.get("question_set_resolution_criteria"))
     if res:
         prompt += f"\n\nResolution:\n{res}"
-    unit = safe_str(row.get("unit_display_text"))
+    unit = safe_str(row.get("unit_name"))
     if unit:
         prompt += f"\n\nUnit: {unit}"
 
@@ -136,7 +120,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         qg.question_group_text AS question_set_text,
         qg.question_group_background_info AS question_set_background_information,
         qg.question_group_resolution_criteria AS question_set_resolution_criteria,
-        u.unit_display_text, u.unit_min_value, u.unit_max_value,
+        u.unit_name, u.unit_min_value, u.unit_max_value,
         q.question_id,
         q.question_horizon_date AS question_resolution_date,
         q.question_percentile,
@@ -177,7 +161,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         )
 
         question_text = safe_str(row.get("question_set_text"))
-        unit = safe_str(row.get("unit_display_text"))
+        unit_name = safe_str(row.get("unit_name"))
 
         # Points-allocation groups are not quantile, timing, or probability questions.
         if not dates and not source_percentiles:
@@ -185,7 +169,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
             continue
 
         question_type = _infer_surveillance_question_type(
-            question_text, unit, dates, dimensions, source_percentiles
+            question_text, unit_name, dates, dimensions, source_percentiles
         )
         prompt = _build_prompt_context(row, dates, dimensions)
         expected = _expected_forecasts(question_type, dates, dimensions)
@@ -217,7 +201,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 prompt,
                 expected,
                 question_type=question_type,
-                unit=unit,
+                unit=unit_name,
                 unit_min=to_float(row.get("unit_min_value")),
                 unit_max=to_float(row.get("unit_max_value")),
                 question_text=question_text,
