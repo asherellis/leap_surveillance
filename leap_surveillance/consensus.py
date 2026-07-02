@@ -57,6 +57,33 @@ def _extract_q50_by_row(forecasts) -> dict[tuple[str, str], dict[str, Any]]:
     return dict(by_row)
 
 
+def _extract_resolution_by_row(response) -> dict[tuple[str, str], dict]:
+    """Index a model's resolution_values by (forecast_date, dimension) → {value, status}."""
+    result: dict[tuple[str, str], dict] = {}
+    for rv in (_field(response, "resolution_values") or []):
+        date = _field(rv, "forecast_date")
+        dim = _field(rv, "dimension") or "Overall"
+        result[(date, dim)] = {
+            "value": _field(rv, "value"),
+            "status": _field(rv, "resolution_status") or "unresolved",
+        }
+    return result
+
+
+def _resolution_value_match(gpt_res: dict | None, claude_res: dict | None) -> tuple[bool, float | None]:
+    """Compare two models' resolved values for a row. Two rows with no authoritative value agree."""
+    gv = (gpt_res or {}).get("value")
+    cv = (claude_res or {}).get("value")
+    if gv is None and cv is None:
+        return True, None          # both failed/unresolved → agreement
+    if gv is None or cv is None:
+        return False, None         # one resolved, the other not → disagreement
+    match = _values_match(gv, cv)  # observed values compared with ±5% tolerance
+    denom = (abs(gv) + abs(cv)) / 2
+    delta_pct = (abs(gv - cv) / denom) if denom > 0 else 0.0
+    return match, delta_pct
+
+
 def _q50_within_tolerance(a: float | None, b: float | None) -> bool:
     """For non-black rows: q50 must agree within 10% relative-to-mean."""
     return within_relative_tolerance(a, b, Q50_TOLERANCE)
@@ -107,6 +134,8 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
 
     gpt_rows = _extract_q50_by_row(gpt.response.forecasts)
     claude_rows = _extract_q50_by_row(claude.response.forecasts)
+    gpt_res = _extract_resolution_by_row(gpt.response)
+    claude_res = _extract_resolution_by_row(claude.response)
     all_keys = sorted(set(gpt_rows.keys()) | set(claude_rows.keys()))
 
     # Missing LOV/current values don't block agreement — probability/when/panel questions may not have them.
@@ -120,14 +149,34 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
     row_diffs = []
     color_all_match = True
     q50_all_match = True
+    resolution_all_match = True
     for key in all_keys:
         date, dim = key
         gpt_row = gpt_rows.get(key, {"q50": None, "color": None})
         claude_row = claude_rows.get(key, {"q50": None, "color": None})
-        color_match, q50_match, _, delta_pct = _row_match(gpt_row, claude_row, question_type)
-        q50_required = question_type in ("when", "probability")
-        # when/probability rows have no objective official/current value, so q50 is the substantive match signal.
-        row_match_ok = color_match and official_all_match and current_all_match and (q50_match if q50_required else True)
+
+        # A row whose q50 is nulled in both models and has a resolution entry is a resolution
+        # row: compare the resolved value, not q50 (which was intentionally nulled).
+        is_resolution_row = (
+            gpt_row["q50"] is None and claude_row["q50"] is None
+            and (key in gpt_res or key in claude_res)
+        )
+        if is_resolution_row:
+            q50_match, delta_pct = _resolution_value_match(gpt_res.get(key), claude_res.get(key))
+            both_failed = (gpt_res.get(key) or {}).get("value") is None and (claude_res.get(key) or {}).get("value") is None
+            # Color isn't meaningful when neither model resolved a value.
+            color_match = True if both_failed else (gpt_row["color"] == claude_row["color"] and gpt_row["color"] is not None)
+            row_match_ok = color_match and official_all_match and current_all_match and q50_match
+            if not q50_match:
+                resolution_all_match = False
+        else:
+            color_match, q50_match, _, delta_pct = _row_match(gpt_row, claude_row, question_type)
+            q50_required = question_type in ("when", "probability")
+            # when/probability rows have no objective official/current value, so q50 is the substantive match signal.
+            row_match_ok = color_match and official_all_match and current_all_match and (q50_match if q50_required else True)
+            if not q50_match:
+                q50_all_match = False
+
         row_diffs.append({
             "forecast_date": date,
             "dimension": dim,
@@ -137,16 +186,15 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
             "claude_color": claude_row["color"],
             "color_match": color_match,
             "q50_match": q50_match,
+            "resolution_row": is_resolution_row,
             "delta_pct": delta_pct,
             "match": row_match_ok,
         })
         if not color_match:
             color_all_match = False
-        if not q50_match:
-            q50_all_match = False
 
     both_adequate = gpt_adequate and claude_adequate
-    all_rows_agree = color_all_match and official_all_match and current_all_match
+    all_rows_agree = color_all_match and official_all_match and current_all_match and resolution_all_match
     if question_type in ("when", "probability"):
         all_rows_agree = all_rows_agree and q50_all_match  # q50 is the substantive signal here
 
@@ -170,12 +218,15 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
             reasons.append("current value mismatch across dimensions")
         if question_type in ("when", "probability") and not q50_all_match:
             reasons.append("q50 mismatch")
+        if not resolution_all_match:
+            reasons.append("resolution value mismatch on some rows")
         reason = "; ".join(reasons) if reasons else "models disagree"
 
     return {
         "status": status,
         "color_agreement": color_all_match,
         "q50_agreement": q50_all_match,
+        "resolution_agreement": resolution_all_match,
         "official_agreement": official_all_match,
         "current_agreement": current_all_match,
         "row_diffs": row_diffs,

@@ -33,6 +33,7 @@ from .models import (
     QuestionSpec,
     ResearchQualityReport,
     RunCost,
+    StrictConditionalResponse,
     StrictEventSurveillanceResponse,
     StrictSurveillanceResponse,
     SurveillanceResponse,
@@ -331,24 +332,30 @@ def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
 
 
 def _resolution_guidance(question: QuestionSpec) -> str:
-    if not any(f.value_type == "resolution" for f in question.expected_forecasts):
-        return "No requested forecast rows are past resolution dates. Return an empty resolution_values list unless a future target date has already resolved early."
+    if question.is_conditional:
+        return "This is a conditional (scenario) question: it does not resolve. Return an empty resolution_values list and do not attempt any resolution lookup."
 
-    if question.question_type in ("probability", "when"):
-        return """Resolution value guidance:
-Some requested rows may have value_type="resolution" or may have resolved early. Try to find whether the event/target has resolved as of the relevant date.
+    if question.question_type == "when":
+        # Timing questions must ALWAYS be checked — only research reveals whether the event occurred.
+        return """Resolution value guidance (timing — ALWAYS check on every run):
+Determine whether the event has ALREADY occurred as of today. This check is mandatory every run.
 
-- If you find an authoritative resolution for the target date: report it in resolution_values (with source and source_date), set all relevant forecast values for that group to the resolved value, and use color_code="black".
-- If no authoritative resolution exists: leave that group out of resolution_values and return the requested forecast/probability/timing rows with the non-black color that reflects remaining uncertainty.
+- If it HAS occurred: add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, best_guess_resolution=<same year>, plus source and source_date. Its timing quantile values will be ignored (nulled) — you need not craft a distribution for it.
+- If it has NOT occurred: add a resolution_values entry with resolution_status="unresolved", value=-999, best_guess_resolution=<your median year>, and forecast the timing quantiles as usual.
+- Timing questions can NEVER be "failed".
 - resolution_values.source_date = the date the value represents, not the source's publication date."""
 
-    return """Resolution value guidance:
-Some requested rows have value_type="resolution": their target date has passed, so try to find the metric's authoritative value as of that exact target date. A past date does not guarantee that a resolved value exists.
+    if not any(f.value_type == "resolution" for f in question.expected_forecasts):
+        return "No requested forecast rows are past their resolution date. Return an empty resolution_values list unless a future target date has already resolved early."
 
-- If you find an authoritative value for the target date: report it in resolution_values (with source and source_date), set all quantiles for that group to that single value, and use color_code="black".
-- If no authoritative value exists for the target date (the metric was never measured for it, the data is not published yet, or only post-target-date sources exist): leave that group out of resolution_values, give your best-estimate distribution across the quantiles, and use the non-black color that reflects your remaining uncertainty. Put your single best guess in current_estimates so the estimate is not lost. A non-black distribution for a past target date where no official value has been published is correct behavior and will not be penalized.
-- resolution_values.source_date = the date the value represents, not the source's publication date.
-- current_estimates reflect today's best guess and must never overwrite or substitute for a past resolution value."""
+    # quantile / probability with at least one past (resolution) target date
+    return """Resolution value guidance (mandatory for past target dates):
+Some requested rows have value_type="resolution": their target date has passed, so you MUST check hard whether the metric has an authoritative value as of that exact target date. Consult multiple sources before concluding it is unresolved. For EACH such (date, dimension) add exactly one resolution_values entry:
+
+- If you find an authoritative value: resolution_status="resolved", value=<the value>, best_guess_resolution=<same value>, with source and source_date.
+- If after thorough checking no authoritative value exists: resolution_status="failed", value=-999, best_guess_resolution=<your single best estimate>, source and source_date empty.
+- Do NOT craft a genuine forecast distribution for a past date: still list its expected quantile rows (for completeness) but their forecast_value will be ignored/nulled — put your effort into the resolution_values entry.
+- resolution_values.source_date = the date the value represents, not the source's publication date."""
 
 
 def _question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
@@ -383,7 +390,12 @@ Use color_code="black" if the event has already occurred. If it has not occurred
 
 
 def _research_schema(question: QuestionSpec) -> dict:
-    model = StrictEventSurveillanceResponse if question.question_type in ("probability", "when") else StrictSurveillanceResponse
+    if question.is_conditional:
+        model = StrictConditionalResponse
+    elif question.question_type in ("probability", "when"):
+        model = StrictEventSurveillanceResponse
+    else:
+        model = StrictSurveillanceResponse
     return make_strict_schema(
         model,
         allowed_dimensions=sorted({f.dimension for f in question.expected_forecasts}),
@@ -395,14 +407,23 @@ def _research_schema(question: QuestionSpec) -> dict:
 
 
 def _schema_name(question: QuestionSpec) -> str:
+    if question.is_conditional:
+        return "StrictConditionalResponse"
     return "StrictEventSurveillanceResponse" if question.question_type in ("probability", "when") else "StrictSurveillanceResponse"
 
 
 def _task_steps(question: QuestionSpec) -> str:
+    if question.is_conditional:
+        return """Task:
+1. Generate forecast rows for every expected date/dimension/quantile listed above, as CONDITIONAL estimates that assume the scenario holds (see the conditional-question framing above). Do not forecast whether the scenario itself occurs.
+2. Provide structured sources with url, title, and snippet.
+
+Do not return latest official values, current estimates, or resolution values for a conditional question; those fields are intentionally absent from the output schema."""
+
     if question.question_type in ("probability", "when"):
         return """Task:
-1. Determine whether any expected target row is already resolved. If an authoritative resolution exists, report it in resolution_values with source and source_date.
-2. Generate forecast rows for every expected date/dimension/quantile listed above. For unresolved rows, these are the model's forecast/probability/timing estimates; for resolved rows, all relevant values should collapse to the resolution value.
+1. Check hard whether any expected target has already resolved (see the resolution guidance) and report it in resolution_values with resolution_status, value, source, and source_date.
+2. Generate forecast rows for every expected date/dimension/quantile listed above. For rows whose target date has resolved, still list the rows but do not craft a distribution — their forecast_value will be ignored/nulled.
 3. Provide structured sources with url, title, and snippet.
 
 Do not return latest official values or current estimates for this question type; those fields are intentionally absent from the output schema."""
@@ -410,13 +431,16 @@ Do not return latest official values or current estimates for this question type
     return """Task:
 1. Find the latest official value for the metric, including date and source. Do not guess. If no exact official value exists, use the closest quasi-official value that the background or resolution criteria clearly point to, and say so in the rationale. Report exactly one last_official_value per dimension: the final figure in the question's own unit. If the metric is derived (e.g. a ratio or per-capita figure), report the computed result, not its separate components.
 2. Estimate the current value as of the run date: if the question resolved today, what value would you score the forecast against? This may differ from the latest official value and can combine the latest data point, current reporting, and reasonable extrapolation.
-3. For past target dates, report a resolution value only when an authoritative source supports it. If no such value exists, leave it unresolved rather than guessing one.
-4. Generate forecast rows for every expected date/dimension/quantile listed above.
+3. For EACH past target date (value_type="resolution"), check hard for an authoritative value and add a resolution_values entry with resolution_status (resolved/failed), value or best_guess_resolution, source, and source_date (see the resolution guidance).
+4. Generate genuine forecast distributions only for FUTURE target dates. Still list the expected quantile rows for past dates (for completeness), but their forecast_value will be ignored/nulled — put your effort into their resolution_values entry.
 5. Provide structured sources with url, title, and snippet."""
 
 
 def _rationale_requirements(question: QuestionSpec) -> str:
-    return EVENT_RATIONALE_REQUIREMENTS if question.question_type in ("probability", "when") else RATIONALE_REQUIREMENTS
+    # Conditional questions have no LOV/current either, so the event-style rationale fits.
+    if question.is_conditional or question.question_type in ("probability", "when"):
+        return EVENT_RATIONALE_REQUIREMENTS
+    return RATIONALE_REQUIREMENTS
 
 
 def _claude_research(
@@ -488,7 +512,7 @@ def _claude_research(
                     text = text[idx:]
 
         try:
-            return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
+            return strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
         except Exception as e:
             retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
             if attempt < 3 and retryable:
@@ -545,7 +569,7 @@ def _gpt_research(
     text = _COLLAPSE_FLOATS_RE.sub(r'\1', response.output_text)
 
     try:
-        return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
+        return strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
     except Exception as e:
         if attempt < 3 and ("EOF while parsing" in str(e) or "validation error" in str(e).lower()):
             print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
@@ -1064,7 +1088,7 @@ Instructions:
             if costs is not None:
                 setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
         text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
-        refined_response, _ = strict_to_regular_response(text, question.expected_forecasts, question.question_type)
+        refined_response, _ = strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
         return refined_response
     except Exception as e:
         retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
