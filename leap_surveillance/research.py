@@ -334,11 +334,11 @@ def _resolution_guidance(question: QuestionSpec) -> str:
     if question.question_type == "when":
         # Timing questions must ALWAYS be checked — only research reveals whether the event occurred.
         return """Resolution value guidance (timing — ALWAYS check on every run):
-Determine whether the event has ALREADY occurred as of today. This check is mandatory every run.
+Determine whether the event has ALREADY occurred as of today, as defined by the question's resolution criteria. This check is mandatory every run.
 
-- If it HAS occurred: add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, best_guess_resolution=<same year>, plus source and source_date. Its timing quantile values will be ignored (nulled) — you need not craft a distribution for it.
-- If it has NOT occurred: add a resolution_values entry with resolution_status="unresolved", value=-999, best_guess_resolution=<your median year>, and forecast the timing quantiles as usual.
-- Timing questions can NEVER be "failed".
+- If it HAS occurred (per the resolution criteria): add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, plus source and source_date. Leave best_guess_resolution null. Its timing quantile values will be ignored (nulled) — you need not craft a distribution for it.
+- If it has NOT occurred: add a resolution_values entry with resolution_status="unresolved", value null, and best_guess_resolution null (your estimate is already captured in the timing quantiles); forecast the timing quantiles as usual.
+- Timing questions can NEVER be "failed" — the event has either occurred or not.
 - resolution_values.source_date = the date the value represents, not the source's publication date."""
 
     if not any(f.value_type == "resolution" for f in question.expected_forecasts):
@@ -346,10 +346,10 @@ Determine whether the event has ALREADY occurred as of today. This check is mand
 
     # quantile / probability with at least one past (resolution) target date
     return """Resolution value guidance (mandatory for past target dates):
-Some requested rows have value_type="resolution": their target date has passed, so you MUST check hard whether the metric has an authoritative value as of that exact target date. Consult multiple sources before concluding it is unresolved. For EACH such (date, dimension) add exactly one resolution_values entry:
+Some requested rows have value_type="resolution": their target date has passed, so you MUST check hard whether the metric has an authoritative value as of that exact target date, as defined by the question's resolution criteria. Consult multiple sources before concluding it is unresolved. For EACH such (date, dimension) add exactly one resolution_values entry:
 
-- If you find an authoritative value: resolution_status="resolved", value=<the value>, best_guess_resolution=<same value>, with source and source_date.
-- If after thorough checking no authoritative value exists: resolution_status="failed", value=-999, best_guess_resolution=<your single best estimate>, source and source_date empty.
+- If you find an authoritative value: resolution_status="resolved", value=<the value>, with source and source_date. Leave best_guess_resolution null.
+- If after thorough checking no authoritative value exists: resolution_status="failed", value null, best_guess_resolution=<your single best estimate>, source and source_date empty.
 - Do NOT craft a genuine forecast distribution for a past date: still list its expected quantile rows (for completeness) but their forecast_value will be ignored/nulled — put your effort into the resolution_values entry.
 - resolution_values.source_date = the date the value represents, not the source's publication date."""
 

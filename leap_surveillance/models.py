@@ -198,8 +198,8 @@ class StrictResolutionValue(BaseModel):
     forecast_date: str
     dimension: str
     resolution_status: ResolutionStatus
-    value: float                    # authoritative value; use -999 when none was found
-    best_guess_resolution: float    # best point estimate (equals value when resolved; your estimate when failed)
+    value: Optional[float]                   # authoritative value; null when none was found
+    best_guess_resolution: Optional[float]   # only set for a "failed" resolution; null otherwise
     source_date: str
     source: str
     confidence: int = Field(ge=0, le=100)
