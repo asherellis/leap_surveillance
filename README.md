@@ -2,7 +2,8 @@
 
 Runs LLM surveillance on LEAP forecasting questions. Loads questions from BigQuery,
 generates structured forecasts with web search (and optional browser automation), and
-writes local JSON/CSV plus a per-run Google Sheet review tab.
+writes local JSON/CSV plus a per-run Google Sheet review tab. Runs land in `outputs/`
+as `run_<run_id>.{json,csv}`.
 
 ## Setup
 
@@ -24,8 +25,10 @@ Optional config (sheet ID, BQ project, model overrides) is in `.env.example`.
 ## Run
 
 ```bash
+leap-surveillance run --both -y                            # dual-model run (default)
+leap-surveillance run --gpt -y                             # GPT only
+leap-surveillance run --claude -y                          # Claude only
 leap-surveillance run --test-mode --limit 3 --no-sheet -y  # cheap smoke test
-leap-surveillance run --limit 10 -y                        # batch + Sheet tab
 leap-surveillance run --questions <id1>,<id2> -y           # specific questions
 ```
 
@@ -47,7 +50,3 @@ review fields, and unreviewed rows carry model projections. Historical/current b
 sync to `dim.dim_baseline`. Resolved or projected target-date values sync to
 `fact.fact_resolution`.
 To rebuild only the Instructions tab: `leap-surveillance setup -y`.
-
-## Layout
-
-`leap_surveillance/` is the package. Runs land in `outputs/` as `run_<run_id>.{json,csv}`.

@@ -774,8 +774,9 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
                 continue
 
             reviewed_value = _safe_float_or_none((item or {}).get("reviewed_question_resolution_value"))
-            # Old-schema tabs lack reviewed_question_resolution_value; rlov with review_color=black is the resolution value.
-            if reviewed_value is None and (item or {}).get("review_color", "").strip().lower() == "black":
+            # Old-schema tabs lack reviewed_question_resolution_value; in those tabs, black review rows used rlov as the resolution value.
+            has_resolution_value_col = (item or {}).get("has_reviewed_question_resolution_value_col", True)
+            if reviewed_value is None and not has_resolution_value_col and (item or {}).get("review_color", "").strip().lower() == "black":
                 reviewed_value = _safe_float_or_none((item or {}).get("review_last_official_value"))
             system_value = _safe_float_or_none((item or {}).get("question_resolution_value"))
             if reviewed_value is not None:
