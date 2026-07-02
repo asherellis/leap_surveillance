@@ -58,7 +58,7 @@ _COLLAPSE_FLOATS_RE = re.compile(r'(\d+\.\d{4})\d{4,}')
 
 _RC_SOURCE_PROMPT = """Given a question name and its resolution criteria, identify the PRIMARY external data source that the metric value will be pulled from.
 
-Focus on the DATA SOURCE, not the "resolution body" (FRI staff, LEAP panel) who makes the final call. If the RC says "use the St. Louis Fed study if available, else FRI staff", the primary source is St. Louis Fed. If the RC names EIU Democracy Index scores, the primary source is EIU.
+Focus on the DATA SOURCE, not the "resolution body" (FRI staff, LEAP panel) who makes the final call. For example, if the resolution criteria say "use the St. Louis Fed study if available, else FRI staff", the primary source is St. Louis Fed. If the resolution criteria names EIU Democracy Index scores, the primary source is EIU.
 
 Return JSON with:
 - named_source: short name (e.g. "Epoch AI", "FRED", "BLS", "IC3", "St. Louis Fed", "IEA"). Use "FRI LEAP panel" only if resolution is entirely an expert survey with no external data source.
@@ -85,7 +85,7 @@ class EvidencePlan:
 
 
 EVIDENCE_PRIORITY_RULE = (
-    "Prefer exact metric/period/scope/unit matches from the RC-named primary source. "
+    "Prefer exact metric/period/scope/unit matches from the resolution criteria-named primary source. "
     "Use secondary or stale sources only when the primary source is unavailable or ambiguous."
 )
 
@@ -118,9 +118,9 @@ def _required_filters(text: str) -> dict[str, str]:
     if hard_match:
         filters["difficulty"] = hard_match.group(1).title()
     if "highest" in lowered and ("ever" in lowered or "historical" in lowered):
-        filters["time_window"] = "dated/historical/archived snapshots; not live/rolling unless RC explicitly says live"
+        filters["time_window"] = "dated/historical/archived snapshots; not live/rolling unless resolution criteria explicitly says live"
     if "current" in lowered and "live" in lowered:
-        filters["time_window"] = "live/current view only if it matches the RC period"
+        filters["time_window"] = "live/current view only if it matches the resolution criteria period"
     return filters
 
 
@@ -205,7 +205,7 @@ def annotate_browser_evidence(browser_result: BrowserEvidence, plan_or_dict: Evi
 
 
 def extract_rc_source(rc_text: str, eval_model: str) -> dict | None:
-    """Extract primary resolution source from RC text using a cheap LLM call."""
+    """Extract primary resolution source from resolution criteria text using a cheap LLM call."""
     if not rc_text or not rc_text.strip():
         return None
     try:
@@ -634,7 +634,7 @@ def _rc_source_mismatch_rule(question: QuestionSpec) -> str:
         return ""
     src = rc["named_source"]
     return (
-        f"\n6. SOURCE_MISMATCH: The response did not cite {src} (the RC-named primary source) "
+        f"\n6. SOURCE_MISMATCH: The response did not cite {src} (the resolution criteria-named primary source) "
         f"and does not explain why a different source is a better fit. Only flag if the rationale "
         f"had a feasible path to {src} but chose a secondary or unofficial substitute instead."
     )
