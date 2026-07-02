@@ -941,6 +941,7 @@ def get_reviewed_items(
             "review_current_value": row.get("review_current_value"),
             "reviewed_question_resolution_status": row.get("reviewed_question_resolution_status"),
             "reviewed_question_resolution_value": row.get("reviewed_question_resolution_value"),
+            "has_reviewed_question_resolution_value_col": "reviewed_question_resolution_value" in row,
             "review_source": row.get("review_source"),
             "review_verdict": row.get("review_verdict"),
             "review_color": row.get("review_color"),
