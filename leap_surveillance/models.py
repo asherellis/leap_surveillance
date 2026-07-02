@@ -36,9 +36,6 @@ class QuestionSpec:
     dim_question_map: dict = field(default_factory=dict)  # {"fdate|dim": dim_question.question_id}
     rc_source: dict | None = None  # filled by extract_rc_source() before research; None = not yet extracted
     evidence_plan: dict | None = None  # serialized EvidencePlan shared across research/judge/browser stages
-    is_conditional: bool = False  # scenario_id IS NOT NULL: elicit forecasts only, no LOV/current/resolution
-    scenario_name: str = ""
-    scenario_description: str = ""
 
 
 @dataclass
@@ -243,18 +240,6 @@ class StrictEventSurveillanceResponse(BaseModel):
     sources: list[StrictSource]
 
 
-class StrictConditionalResponse(BaseModel):
-    """LLM output for conditional (scenario) questions: forecasts only.
-
-    A hypothetical scenario never resolves, and LOV/current are not meaningful, so
-    resolution_values/last_official_values/current_estimates are all omitted.
-    """
-    model_config = STRICT_CONFIG
-    forecasts: list[StrictForecastValue]
-    rationale: str
-    sources: list[StrictSource]
-
-
 def make_strict_schema(
     model: type[BaseModel],
     allowed_dimensions: Optional[list[str]] = None,
@@ -324,21 +309,17 @@ def _resolution_status_str(rv) -> str:
 
 
 def strict_to_regular_response(
-    strict: StrictSurveillanceResponse | StrictEventSurveillanceResponse | StrictConditionalResponse | str,
+    strict: StrictSurveillanceResponse | StrictEventSurveillanceResponse | str,
     expected_forecasts: Optional[list[ExpectedForecast]] = None,
     question_type: Optional[str] = None,
-    is_conditional: bool = False,
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
-    # Conditional (scenario) questions elicit forecasts only: no LOV/current, no resolution.
-    no_official = is_conditional or question_type in ("probability", "when")
-    no_resolution = is_conditional
+    no_official = question_type in ("probability", "when")
     if isinstance(strict, str):
-        if is_conditional:
-            strict = StrictConditionalResponse.model_validate_json(strict)
-        elif no_official:
-            strict = StrictEventSurveillanceResponse.model_validate_json(strict)
-        else:
-            strict = StrictSurveillanceResponse.model_validate_json(strict)
+        strict = (
+            StrictEventSurveillanceResponse.model_validate_json(strict)
+            if no_official
+            else StrictSurveillanceResponse.model_validate_json(strict)
+        )
 
     seen_urls: set[str] = set()
     evidence = []
@@ -350,7 +331,7 @@ def strict_to_regular_response(
         (e.forecast_date, e.dimension, e.quantile): e.value_type
         for e in expected_forecasts or []
     }
-    strict_resolutions = [] if no_resolution else getattr(strict, "resolution_values", [])
+    strict_resolutions = getattr(strict, "resolution_values", [])
     resolution_by_key = {
         (rv.forecast_date, rv.dimension): rv for rv in strict_resolutions
     }

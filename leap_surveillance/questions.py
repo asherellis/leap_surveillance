@@ -32,14 +32,7 @@ def _infer_surveillance_question_type(
         return "when"
     return "quantile"
 
-def _build_prompt_context(
-    row,
-    dates: list[str],
-    dimensions: list[str],
-    is_conditional: bool = False,
-    scenario_name: str = "",
-    scenario_description: str = "",
-) -> str:
+def _build_prompt_context(row, dates: list[str], dimensions: list[str]) -> str:
     prompt = safe_str(row.get("question_set_text"))
     bg = safe_str(row.get("question_set_background_information"))
     if bg:
@@ -65,32 +58,15 @@ def _build_prompt_context(
         prompt += f"\nRequested resolution dates: {', '.join(dates)}"
     if dimensions != ["Overall"]:
         prompt += f"\nRequested dimensions: {', '.join(dimensions)}"
-
-    if is_conditional:
-        block = (
-            "\n\n=== CONDITIONAL QUESTION ===\n"
-            "This is a CONDITIONAL question. Every value you produce must be a CONDITIONAL "
-            "forecast/probability that ASSUMES the scenario below holds. Do NOT forecast "
-            "whether the scenario itself occurs — treat it as given, and condition all "
-            "estimates on it."
-        )
-        if scenario_name:
-            block += f"\nScenario: {scenario_name}"
-        if scenario_description:
-            block += f"\n{scenario_description}"
-        prompt += block
     return prompt
 
 
 def _expected_forecasts(
-    question_type: str, dates: list[str], dimensions: list[str], is_conditional: bool = False
+    question_type: str, dates: list[str], dimensions: list[str]
 ) -> list[ExpectedForecast]:
-    # A conditional (scenario) question never resolves — every row is a forecast, regardless of date.
-    vt = (lambda d: "forecast") if is_conditional else date_value_type
-
     if question_type == "probability":
         return [
-            ExpectedForecast(d, dim, 50, vt(d))
+            ExpectedForecast(d, dim, 50, date_value_type(d))
             for d in dates
             for dim in dimensions
         ]
@@ -103,7 +79,7 @@ def _expected_forecasts(
         ]
 
     return [
-        ExpectedForecast(d, dim, p, vt(d))
+        ExpectedForecast(d, dim, p, date_value_type(d))
         for d in dates
         for dim in dimensions
         for p in FULL_QUANTILES
@@ -116,7 +92,6 @@ DEV_QUESTION_IDS = (
     "6bf9bae3e8b4d3c1a5fe0c48af99b1941bbf1aa61f2173e75e4b6f2db0e3a9ef",  # U.S. and China Military Agreement (probability)
     "147346ac17bb49d1d0ae6b0894f1d96b803ed5d1d315f7dddb5130799cb52714",  # Coffee Test (when / timing)
     "10a514657ba6e075f831ef8d5e4635ffd9003f24e0f6a2e4db8f95999c98bfeb",  # U.S. versus China Polarity (multi-dim)
-    "72a911c390c1e95899c40679bda8088094993d5bb4971c1aa1475e5c3877e134",  # conditional (scenario) question
 )
 
 
@@ -127,6 +102,9 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         ids = ", ".join(f'"{qid}"' for qid in DEV_QUESTION_IDS)
         dev_filter = f"AND qg.question_group_id IN ({ids})"
 
+    # Conditional (scenario) questions are excluded: scenario_id IS NULL is filtered per-row,
+    # before any GROUP BY, so mixed groups keep only their unconditional questions and
+    # fully-conditional groups drop out entirely. See memory/conditional_questions.md.
     query = f"""
     WITH forecast_groups AS (
         SELECT qg.question_group_id, qg.question_group_name
@@ -134,6 +112,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         JOIN `{DEFAULT_BQ_PROJECT}.dim.dim_question` q
             ON qg.question_group_id = q.question_group_id
         WHERE q.project_id = 'leap' AND q.question_type = 'forecast'
+        AND q.scenario_id IS NULL
         {dev_filter}
         GROUP BY qg.question_group_id, qg.question_group_name
         ORDER BY qg.question_group_name
@@ -149,18 +128,15 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         q.question_id,
         q.question_horizon_date AS question_resolution_date,
         q.question_percentile,
-        q.question_dimension, 
-        q.scenario_id, -- if not NULL, this is a conditional scenario question
-        s.scenario_name, 
-        s.scenario_description
+        q.question_dimension
     FROM `{DEFAULT_BQ_PROJECT}.dim.dim_question_group` qg
     JOIN forecast_groups fg ON qg.question_group_id = fg.question_group_id
     JOIN `{DEFAULT_BQ_PROJECT}.dim.dim_question` q
         ON qg.question_group_id = q.question_group_id
         AND q.project_id = 'leap'
         AND q.question_type = 'forecast'
+        AND q.scenario_id IS NULL
     LEFT JOIN `{DEFAULT_BQ_PROJECT}.dim.dim_unit` u ON qg.unit_id = u.unit_id
-    LEFT JOIN `{DEFAULT_BQ_PROJECT}.dim.dim_scenario` s ON q.scenario_id = s.scenario_id
     ORDER BY qg.question_group_name, q.question_horizon_date, q.question_dimension, q.question_percentile"""
 
     df = query_bq(query)
@@ -192,20 +168,6 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         question_text = safe_str(row.get("question_set_text"))
         unit_name = safe_str(row.get("unit_name"))
 
-        # scenario_id is per-row on dim_question; a group is conditional if any row carries one.
-        scenario_id_values = [s for s in group["scenario_id"].tolist() if not is_empty(s)]
-        is_conditional = bool(scenario_id_values)
-        scenario_name = ""
-        scenario_description = ""
-        if is_conditional:
-            distinct_scenarios = {safe_str(s).strip() for s in scenario_id_values}
-            if len(distinct_scenarios) > 1 or len(scenario_id_values) != len(group):
-                print(f"  warning: '{row.get('question_set_name')}' has non-uniform scenario_id across rows; treating whole group as conditional")
-            scenario_rows = group[group["scenario_id"].apply(lambda s: not is_empty(s))]
-            srow = scenario_rows.iloc[0]
-            scenario_name = safe_str(srow.get("scenario_name"))
-            scenario_description = safe_str(srow.get("scenario_description"))
-
         # Points-allocation groups are not quantile, timing, or probability questions.
         if not dates and not source_percentiles:
             print(f"  warning: skipping '{row.get('question_set_name')}' - points-allocation type not supported")
@@ -214,10 +176,8 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         question_type = _infer_surveillance_question_type(
             question_text, unit_name, dates, dimensions, source_percentiles
         )
-        prompt = _build_prompt_context(
-            row, dates, dimensions, is_conditional, scenario_name, scenario_description
-        )
-        expected = _expected_forecasts(question_type, dates, dimensions, is_conditional)
+        prompt = _build_prompt_context(row, dates, dimensions)
+        expected = _expected_forecasts(question_type, dates, dimensions)
 
         question_id = row.get("question_set_id")
         question_name = row.get("question_set_name")
@@ -253,9 +213,6 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 resolution_criteria=safe_str(row.get("question_set_resolution_criteria")),
                 background_info=safe_str(row.get("question_set_background_information")),
                 dim_question_map=dim_q_map,
-                is_conditional=is_conditional,
-                scenario_name=scenario_name,
-                scenario_description=scenario_description,
             )
         )
 

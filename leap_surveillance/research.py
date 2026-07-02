@@ -33,7 +33,6 @@ from .models import (
     QuestionSpec,
     ResearchQualityReport,
     RunCost,
-    StrictConditionalResponse,
     StrictEventSurveillanceResponse,
     StrictSurveillanceResponse,
     SurveillanceResponse,
@@ -332,9 +331,6 @@ def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
 
 
 def _resolution_guidance(question: QuestionSpec) -> str:
-    if question.is_conditional:
-        return "This is a conditional (scenario) question: it does not resolve. Return an empty resolution_values list and do not attempt any resolution lookup."
-
     if question.question_type == "when":
         # Timing questions must ALWAYS be checked — only research reveals whether the event occurred.
         return """Resolution value guidance (timing — ALWAYS check on every run):
@@ -390,12 +386,7 @@ Use color_code="black" if the event has already occurred. If it has not occurred
 
 
 def _research_schema(question: QuestionSpec) -> dict:
-    if question.is_conditional:
-        model = StrictConditionalResponse
-    elif question.question_type in ("probability", "when"):
-        model = StrictEventSurveillanceResponse
-    else:
-        model = StrictSurveillanceResponse
+    model = StrictEventSurveillanceResponse if question.question_type in ("probability", "when") else StrictSurveillanceResponse
     return make_strict_schema(
         model,
         allowed_dimensions=sorted({f.dimension for f in question.expected_forecasts}),
@@ -407,19 +398,10 @@ def _research_schema(question: QuestionSpec) -> dict:
 
 
 def _schema_name(question: QuestionSpec) -> str:
-    if question.is_conditional:
-        return "StrictConditionalResponse"
     return "StrictEventSurveillanceResponse" if question.question_type in ("probability", "when") else "StrictSurveillanceResponse"
 
 
 def _task_steps(question: QuestionSpec) -> str:
-    if question.is_conditional:
-        return """Task:
-1. Generate forecast rows for every expected date/dimension/quantile listed above, as CONDITIONAL estimates that assume the scenario holds (see the conditional-question framing above). Do not forecast whether the scenario itself occurs.
-2. Provide structured sources with url, title, and snippet.
-
-Do not return latest official values, current estimates, or resolution values for a conditional question; those fields are intentionally absent from the output schema."""
-
     if question.question_type in ("probability", "when"):
         return """Task:
 1. Check hard whether any expected target has already resolved (see the resolution guidance) and report it in resolution_values with resolution_status, value, source, and source_date.
@@ -437,10 +419,7 @@ Do not return latest official values or current estimates for this question type
 
 
 def _rationale_requirements(question: QuestionSpec) -> str:
-    # Conditional questions have no LOV/current either, so the event-style rationale fits.
-    if question.is_conditional or question.question_type in ("probability", "when"):
-        return EVENT_RATIONALE_REQUIREMENTS
-    return RATIONALE_REQUIREMENTS
+    return EVENT_RATIONALE_REQUIREMENTS if question.question_type in ("probability", "when") else RATIONALE_REQUIREMENTS
 
 
 def _claude_research(
@@ -512,7 +491,7 @@ def _claude_research(
                     text = text[idx:]
 
         try:
-            return strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
+            return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
         except Exception as e:
             retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
             if attempt < 3 and retryable:
@@ -569,7 +548,7 @@ def _gpt_research(
     text = _COLLAPSE_FLOATS_RE.sub(r'\1', response.output_text)
 
     try:
-        return strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
+        return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
     except Exception as e:
         if attempt < 3 and ("EOF while parsing" in str(e) or "validation error" in str(e).lower()):
             print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
@@ -1088,7 +1067,7 @@ Instructions:
             if costs is not None:
                 setattr(costs, cost_bucket, getattr(costs, cost_bucket) + cost_for_tokens(model_id, response.usage.input_tokens, response.usage.output_tokens))
         text = _COLLAPSE_FLOATS_RE.sub(r'\1', text)
-        refined_response, _ = strict_to_regular_response(text, question.expected_forecasts, question.question_type, question.is_conditional)
+        refined_response, _ = strict_to_regular_response(text, question.expected_forecasts, question.question_type)
         return refined_response
     except Exception as e:
         retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()

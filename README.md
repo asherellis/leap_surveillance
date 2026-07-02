@@ -4,6 +4,8 @@ Runs LLM surveillance on LEAP forecasting questions. Loads questions from BigQue
 generates structured forecasts with web search (and optional browser automation), and
 writes local JSON/CSV plus a per-run Google Sheet review tab.
 
+This pipeline intentionally excludes conditional questions for now. To re-implement them, look at memory/conditional_questions.md
+
 ## Setup
 
 ```bash
