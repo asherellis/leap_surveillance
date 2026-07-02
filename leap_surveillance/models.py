@@ -181,7 +181,7 @@ class SurveillanceResponse(BaseModel):
 class StrictOfficialValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
-    value: float
+    value: Optional[float]   # null when no official value is available (no -999 sentinel)
     date: str
     source: str
 
@@ -189,7 +189,7 @@ class StrictOfficialValue(BaseModel):
 class StrictCurrentValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
-    value: float
+    value: Optional[float]   # null when no current estimate is available (no -999 sentinel)
     confidence: int = Field(ge=0, le=100)
 
 
@@ -210,7 +210,7 @@ class StrictForecastValue(BaseModel):
     forecast_date: str
     dimension: str
     quantile: int
-    forecast_value: float
+    forecast_value: Optional[float]   # null when no estimate is possible (no -999 sentinel)
     color_code: ColorCode
 
 
@@ -290,15 +290,27 @@ def make_strict_schema(
             if "dimension" in props:
                 props["dimension"]["enum"] = allowed_dimensions
     if unit_min is not None or unit_max is not None:
-        fv_prop = properties.get("forecast_value", {})
+        # forecast_value is nullable (anyOf [number, null]); apply bounds to the number branch,
+        # not the anyOf wrapper, so a null value is still allowed but non-null values are bounded.
+        fv_num = _numeric_branch(properties.get("forecast_value", {}))
         if unit_min is not None:
-            fv_prop["minimum"] = unit_min
+            fv_num["minimum"] = unit_min
         if unit_max is not None:
-            fv_prop["maximum"] = unit_max
+            fv_num["maximum"] = unit_max
     return schema
 
 
-def _convert_sentinel_value(v: float) -> Optional[float]:
+def _numeric_branch(prop: dict) -> dict:
+    """Return the sub-schema that carries the numeric type, unwrapping an Optional's anyOf."""
+    for sub in prop.get("anyOf", []):
+        if sub.get("type") == "number":
+            return sub
+    return prop
+
+
+def _convert_sentinel_value(v: Optional[float]) -> Optional[float]:
+    # Value fields are now nullable, so the model emits null directly. This stays only as a
+    # defensive backstop for a stray legacy -999.
     return None if v == -999 else v
 
 

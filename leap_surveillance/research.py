@@ -252,7 +252,7 @@ q0 and q100 are feasibility bounds, not ordinary probabilistic quantiles.
 
 Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
 
-Use -999 only when no reasonable estimate is possible for a specific value."""
+Set forecast_value to null only when no reasonable estimate is possible for a specific value."""
 
 
 QUANTILE_INTERPRETATION_BRIEF = """Quantile interpretation:
@@ -266,7 +266,7 @@ Quantile meanings:
 - q=100: Highest value still possible. Use the natural unit upper bound, or a 99.99th-percentile scenario if no natural bound exists.
 - q0/q100 are bounds, not ordinary credible-interval endpoints. Wide bounds are expected for naturally wide ranges.
 
-Use -999 only when no reasonable estimate is possible for a specific value."""
+Set forecast_value to null only when no reasonable estimate is possible for a specific value."""
 
 
 COLOR_CODE_SYSTEM_FULL = """Color coding:
@@ -304,7 +304,7 @@ RESEARCH_PRINCIPLES = """Research principles:
 - Respect scope. If the metric is limited to a particular category, track, subset, or population, confirm each source matches that scope, and note in your rationale what you included and excluded.
 - Use base rates where available. When the metric has historical data or a clear reference class, use it as an anchor for the forecast. If your forecast departs materially from that history or reference class, say why.
 - Build aggregates exactly as the question defines them. If the metric is an average, sum, or index over components, gather each component and compute it yourself rather than copying a headline figure; list each component value, source, date, and the arithmetic you used. Combine components using the method the question's resolution criteria specifies; impose no default weighting of your own. When the component structure is ambiguous (e.g., a benchmark reports multiple sub-scores or tiers and the criteria doesn't say how they roll up), state the assumption you made and flag it explicitly in your rationale.
-- Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer -999 (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
+- Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer null (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
 
 
 RATIONALE_REQUIREMENTS = """Rationale requirements:
@@ -1025,7 +1025,7 @@ Instructions:
 - If the browser data only shows that a dashboard does not expose the needed value, say so in the rationale and keep the original forecast distribution unless it was directly contradicted.
 - If the browser data successfully extracts the needed value, update the affected official/current/resolution values and rewrite the rationale so it no longer claims that value was unreadable, unavailable, or only inferable from stale/secondary sources.
 - Return exactly the expected rows. The system assigns value_type from those rows.
-- Use -999 only when no defensible estimate is possible.
+- Set a value to null only when no defensible estimate is possible.
 - When incorporating browser data: match the question's period, unit, and scope; for derived or aggregate metrics, compute using the method the resolution criteria specifies; do not assert values the browser page does not explicitly state.
 
 {_rationale_requirements(question)}"""
