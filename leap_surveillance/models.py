@@ -257,6 +257,8 @@ def make_strict_schema(
         if "properties" in obj:
             obj["additionalProperties"] = False
             obj["required"] = list(obj["properties"].keys())
+        # The generic recursion below also descends into "$defs" (it's a dict value),
+        # so no separate $defs pass is needed.
         for value in obj.values():
             if isinstance(value, dict):
                 fix_schema(value)
@@ -264,9 +266,6 @@ def make_strict_schema(
                 for item in value:
                     if isinstance(item, dict):
                         fix_schema(item)
-        if "$defs" in obj:
-            for def_schema in obj["$defs"].values():
-                fix_schema(def_schema)
         return obj
 
     schema = fix_schema(schema)
@@ -306,6 +305,36 @@ def _numeric_branch(prop: dict) -> dict:
         if sub.get("type") == "number":
             return sub
     return prop
+
+
+_STRICT_UNSUPPORTED_KEYS = (
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "minItems", "maxItems",
+)
+
+
+def strict_tool_schema(schema: dict) -> dict:
+    """Deep-copied schema safe for Anthropic strict tool use.
+
+    Strict tool use guarantees tool inputs validate exactly against input_schema, but does
+    not support numeric/string bound constraints — strip them (bounds are still enforced
+    post-hoc by validate_response and stated in the prompt).
+    """
+    import copy
+
+    def strip(obj):
+        if isinstance(obj, dict):
+            for key in _STRICT_UNSUPPORTED_KEYS:
+                obj.pop(key, None)
+            for value in obj.values():
+                strip(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                strip(item)
+
+    cleaned = copy.deepcopy(schema)
+    strip(cleaned)
+    return cleaned
 
 
 def _convert_sentinel_value(v: Optional[float]) -> Optional[float]:
@@ -562,6 +591,20 @@ def validate_response(
             if f.forecast_value is not None:
                 black_groups[key].append(f.forecast_value)
 
+    # A failed/unresolved resolution row legitimately isn't black (no authoritative value),
+    # and its (nulled) quantile colors carry no meaning — exempt those groups from the
+    # color-consistency checks below.
+    resolution_status_by_key = {
+        (r.forecast_date, r.dimension): (r.resolution_status or "unresolved")
+        for r in response.resolution_values
+    }
+    unresolved_resolution_keys = {
+        (f.forecast_date, f.dimension)
+        for f in response.forecasts
+        if getattr(f.value_type, "value", f.value_type) == "resolution"
+        and resolution_status_by_key.get((f.forecast_date, f.dimension), "unresolved") in ("failed", "unresolved")
+    }
+
     for key, values in black_groups.items():
         if len({round(v, 12) for v in values}) > 1:
             issues.append(f"black_quantiles_differ_{key[0]}_{key[1]}")
@@ -569,14 +612,9 @@ def validate_response(
         if key not in resolution_keys:
             issues.append(f"black_without_resolution_value_{key[0]}_{key[1]}")
     for key, colors in group_colors.items():
-        if len(colors) > 1:
+        if len(colors) > 1 and key not in unresolved_resolution_keys:
             issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")
 
-    # A failed/unresolved resolution row legitimately isn't black (no authoritative value).
-    resolution_status_by_key = {
-        (r.forecast_date, r.dimension): (r.resolution_status or "unresolved")
-        for r in response.resolution_values
-    }
     seen_resolution_not_black: set[tuple] = set()
     for f in response.forecasts:
         if getattr(f.value_type, "value", f.value_type) == "resolution" and f.color_code.value != "black":

@@ -7,7 +7,7 @@ import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .common import (
     CLAUDE_EVALUATOR_MODEL,
@@ -141,9 +141,6 @@ def _validation_score(validation: dict) -> int:
 def _should_accept_browser_refinement(
     original_validation: dict,
     refined_validation: dict,
-    original_response,
-    refined_response,
-    original_quality,
     refined_quality,
 ) -> tuple[bool, str]:
     # Mechanical floor: never accept a broken response.
@@ -164,7 +161,8 @@ def _earliest_past_target(response) -> str | None:
     """Earliest past target date in a response — the row whose value needs an as-of-date (historical) lookup."""
     if response is None:
         return None
-    today = datetime.now().strftime("%Y-%m-%d")
+    # UTC to stay consistent with date_value_type/row_resolution_status (avoids near-midnight drift).
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     past = [str(f.forecast_date)[:10] for f in (response.forecasts or [])
             if getattr(f, "forecast_date", None) and str(f.forecast_date)[:10] < today]
     return min(past) if past else None
@@ -172,39 +170,6 @@ def _earliest_past_target(response) -> str | None:
 
 def _question_js_risk(q: QuestionSpec) -> bool:
     return bool((q.evidence_plan or {}).get("js_risk") or (q.rc_source or {}).get("js_risk"))
-
-
-def _try_browser_refinement_for_model(
-    q: QuestionSpec,
-    result: ModelRunResult,
-    *,
-    stack: ModelStack,
-    costs: RunCost,
-    test_mode: bool = False,
-) -> ModelRunResult:
-    print(f"  [{stack.tag}] Browser: {result.quality.browser_url}", flush=True)
-    result.browser_url = result.quality.browser_url or ""
-    result.browser_objective = result.quality.browser_objective or ""
-    as_of_date = _earliest_past_target(result.response)
-    js_risk = _question_js_risk(q)
-    browser_result = browser_extract(
-        result.quality.browser_url,
-        result.quality.browser_objective or "Extract data",
-        test_mode=test_mode,
-        model_override=stack.browser_navigator,
-        as_of_date=as_of_date,
-        skip_jina=js_risk,
-    )
-    if not browser_result.success:
-        err = browser_result.error or "no error message returned"
-        print(f"  [{stack.tag}] Browser failed: {err}")
-        result.browser_status = "extract_failed"
-        result.browser_error = err
-        return result
-
-    return _refine_model_with_browser_result(
-        q, result, stack=stack, costs=costs, browser_result=browser_result, test_mode=test_mode,
-    )
 
 
 def _refine_model_with_browser_result(
@@ -240,9 +205,7 @@ def _refine_model_with_browser_result(
     )
     refined_validation = validate_response(refined_response, q.expected_forecasts, unit_min=q.unit_min, unit_max=q.unit_max)
     accept_refinement, accept_reason = _should_accept_browser_refinement(
-        result.validation, refined_validation,
-        result.response, refined_response,
-        result.quality, refined_quality,
+        result.validation, refined_validation, refined_quality,
     )
     if accept_refinement:
         status = "ok" if refined_quality.adequate else "flagged for review"
@@ -357,7 +320,6 @@ def _run_single_model_pipeline(
     costs: RunCost,
     use_browser: bool,
     test_mode: bool,
-    defer_browser: bool = False,
 ) -> ModelRunResult:
     """One model's full pipeline: research -> judge -> maybe browser -> maybe refine."""
     print(f"  [{stack.tag}] Researching with web search...", flush=True)
@@ -391,15 +353,12 @@ def _run_single_model_pipeline(
         elif not quality.browser_url:
             print(f"  [{stack.tag}] Browser skipped: no URL proposed ({quality.confidence}% confidence)")
             result.browser_status = "proposed_no_url"
-        elif defer_browser:
+        else:
+            # Browser extraction always runs deferred/shared at the question level (process_question).
             print(f"  [{stack.tag}] Browser proposed for shared extraction ({quality.confidence}% confidence)")
             result.browser_status = "proposed_shared"
             result.browser_url = quality.browser_url
             result.browser_objective = quality.browser_objective or ""
-        else:
-            result = _try_browser_refinement_for_model(
-                q, result, stack=stack, costs=costs, test_mode=test_mode,
-            )
     else:
         print(f"  [{stack.tag}] Quality: {quality.confidence}% confidence")
 
@@ -434,7 +393,7 @@ def process_question(
             tag: ex.submit(_run_single_model_pipeline, q,
                            stack=stack, costs=costs,
                            use_browser=use_browser, test_mode=test_mode,
-                           defer_browser=use_browser)
+                           )
             for tag, stack in selected.items()
         }
         per_model: dict[str, ModelRunResult] = {}
@@ -469,8 +428,11 @@ def _resolve_mode_flag(args) -> str:
 
 
 def cmd_run(args):
-    active_model = TEST_MODEL if args.test_mode else DEFAULT_MODEL
-    active_claude = TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL
+    # Derive recorded models from the same stacks the pipeline actually runs with,
+    # so run metadata can't drift from reality.
+    gpt_stack, claude_stack = _build_stacks(args.test_mode)
+    active_model = gpt_stack.research_model
+    active_claude = claude_stack.research_model
     mode = _resolve_mode_flag(args)
     run_models = {}
     if mode in ("gpt", "both"):
@@ -515,7 +477,7 @@ def cmd_run(args):
         print("No questions to run. Check --questions IDs, --limit, or the BigQuery source.")
         return
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     n = len(questions)
     per_model_lists: list[dict | None] = [None] * n
     costs_list = [None] * n
@@ -549,7 +511,11 @@ def cmd_run(args):
     print(f"Running with {workers} worker(s)")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(_run_one, i, q) for i, q in enumerate(questions)]
+        # The final writers mkdir too, but the partial writer runs first — on a fresh
+        # checkout `outputs/` doesn't exist yet and the first completion would crash.
+        os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
         partial_path = os.path.join(DEFAULT_OUTPUT_DIR, f"run_{run_id}_partial.json")
+        completed_payloads: dict[int, dict] = {}  # serialize each finished question once, not O(n²)
         for fut in as_completed(futures):
             i, result, err = fut.result()
             if err:
@@ -558,13 +524,13 @@ def cmd_run(args):
                 per_model_lists[i] = result.per_model
                 costs_list[i] = result.costs
                 consensus_blocks[i] = result.consensus
-            completed = [
-                {"id": questions[j].id, "name": questions[j].name,
-                 "per_model": {m: _serialize_model_result(r) for m, r in per_model_lists[j].items()} if per_model_lists[j] else None,
-                 "consensus": consensus_blocks[j], "cost": costs_list[j].as_dict() if costs_list[j] else None,
-                 "error": errors_list[j]}
-                for j in range(n) if per_model_lists[j] is not None or errors_list[j] is not None
-            ]
+            completed_payloads[i] = {
+                "id": questions[i].id, "name": questions[i].name,
+                "per_model": {m: _serialize_model_result(r) for m, r in per_model_lists[i].items()} if per_model_lists[i] else None,
+                "consensus": consensus_blocks[i], "cost": costs_list[i].as_dict() if costs_list[i] else None,
+                "error": errors_list[i],
+            }
+            completed = [completed_payloads[j] for j in sorted(completed_payloads)]
             tmp_path = partial_path + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump({"run_id": run_id, "questions": completed}, f, indent=2)
@@ -688,11 +654,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
-        cmd_run(args)
+        raise SystemExit(cmd_run(args) or 0)
     elif args.command == "sync":
-        cmd_sync(args)
+        raise SystemExit(cmd_sync(args) or 0)
     elif args.command == "setup":
-        cmd_setup(args)
+        raise SystemExit(cmd_setup(args) or 0)
     else:
         parser.print_help()
 

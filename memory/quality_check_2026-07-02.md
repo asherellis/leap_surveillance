@@ -8,38 +8,39 @@ reported by review (high confidence but not line-verified).
 Each item has an ID (`ST`=storage, `QMC`=questions/models/consensus/common, `RE`=research,
 `IO`=sheets/run_surveillance/sync/browser) so they can be turned into issues individually.
 
-## Summary (HIGH first)
+## Summary (HIGH first) — Resolution column updated 2026-07-03
 
-| ID | Sev | File:line | One-liner |
-|----|-----|-----------|-----------|
-| QMC-1 | HIGH | questions.py:197 | NaN dimension → `"nan"` key; breaks dim_question_id mapping for "Overall" rows |
-| ST-1 | HIGH | storage.py:140,537 | CSV `fieldnames=rows[0].keys()` crashes on heterogeneous rows |
-| ST-2 | HIGH | storage.py:764,929 | `key.split("|")` unpack crashes on a key without `"|"` |
-| RE-1 | HIGH | research.py:463,539 | Unbounded rate-limit retry loop (`sleep(60); continue`, no ceiling) |
-| RE-2 | HIGH | research.py:499,555,1076 | Parse-failure retry re-runs the whole paid web-search call |
-| IO-1 | HIGH | run_surveillance.py:334 | Browser refinement applied to ALL models, not just requesters |
-| IO-2 | HIGH | sheets.py:288 | "Latest run" = lexicographic max; a `run_backup` tab syncs to BQ |
-| IO-4 | HIGH | run_surveillance.py:686 | CLI never `sys.exit`s → failures/`return 2` exit 0 |
-| IO-8 | HIGH | browser.py:58 | SSRF guard never resolves hostname (DNS → metadata/internal) |
-| QMC-2 | MED | models.py:283 + research.py:255 | `-999` forecast sentinel is illegal under `unit_min` bound → dead path |
-| ST-3 | MED | storage.py:743,911 | Unguarded `float(v)` on model value crashes the whole writer |
-| ST-4 | MED | storage.py:786,794,803 | Bare `date.fromisoformat(fdate)` can raise and abort writer |
-| ST-5 | MED | storage.py:408 | value_changed compares GPT vs a prior run matched on a different model |
-| ST-6 | MED | storage.py:363,402 | Prior-run history read + JSON-parsed from disk twice per run |
-| ST-7 | MED | storage.py:718-755,906-919 | Repeated linear rescans of forecasts (~4 per key); should index |
-| RE-3 | MED | research.py:1034 | `refine_with_browser` can switch provider (Claude→OpenAI) silently |
-| RE-4 | MED | research.py:988 | Refine prompt drops LEAP anti-anchoring + RC-source + run_date guardrails |
-| RE-5 | MED | research.py:458,534 | Timeout detected by substring match, not typed exception |
-| RE-6 | MED | research.py:470 + common.py:71 | Cost silently $0 for unknown model; web-search/cache tokens uncounted |
-| QMC-3 | MED | questions.py:26 | probability-unit + no-dates misclassified as `when` (message says quantile) |
-| QMC-4 | MED | consensus.py:197 | quantile rows can auto_accept with wildly different q50 (by design?) |
-| QMC-6 | MED | models.py:559 | `mixed_colors` false-positive on unresolved (nulled) resolution rows |
-| IO-6 | MED | sync.py:41 | 3 BQ writes non-atomic; partial failure still exits 0 |
-| IO-5 | MED | run_surveillance.py:553 | Partial-progress JSON rewritten in full each future → O(n²) |
-| IO-7 | MED | run_surveillance.py:472 | Two sources of truth for "which models ran" can drift |
-| ST-10 | MED | storage.py:781 | Reviewed value + blank status silently becomes "confirmed" |
+Legend: ✅ fixed · 🟡 partial / mitigated · ⏸ AWAITING DECISION (consult Nadja) · ❌ not a bug
+(auditor claim rejected on verification) · 📋 deferred (documented, not fixed).
 
-Plus LOW / cleanup items listed at the end.
+| ID | Sev | File:line | One-liner | Resolution |
+|----|-----|-----------|-----------|------------|
+| QMC-1 | HIGH | questions.py:197 | NaN dimension → `"nan"` key; breaks dim_question_id mapping | ✅ `is_empty`+`safe_str` guard, mirrors the sibling set-builder |
+| ST-1 | HIGH | storage.py:140,537 | CSV `fieldnames=rows[0].keys()` crashes on heterogeneous rows | ✅ union of all row keys + `restval=""` |
+| ST-2 | HIGH | storage.py:764,929 | `key.split("\|")` unpack crashes on a key without `"\|"` | ✅ guard + warn + skip in both writers |
+| RE-1 | HIGH | research.py:463,539 | Unbounded rate-limit retry loop | ✅ `MAX_RATE_LIMIT_RETRIES` (env-tunable, default 5) on both providers |
+| RE-2 | HIGH | research.py:499,555,1076 | Parse-failure retry re-runs the whole paid web-search call | ⏸ AWAITING DECISION — recommend leave-as-is+document (strict schemas make it rare; bounded at 3); alternative: cheap re-emit follow-up (needs live test) |
+| IO-1 | HIGH | run_surveillance.py:334 | Browser refinement applied to ALL models, not just requesters | ⏸ AWAITING DECISION — recommend requesters-only; alternative: keep sharing but fix the 2-URL overwrite |
+| IO-2 | HIGH | sheets.py:288 | "Latest run" = lexicographic max; `run_backup` tab could sync to BQ | ✅ strict `^run_\d{8}_\d{6}$` filter |
+| IO-4 | HIGH | run_surveillance.py:686 | CLI never `sys.exit`s → failures exit 0 | ✅ `raise SystemExit(cmd(args) or 0)` for run/sync/setup |
+| IO-8 | HIGH | browser.py:58 | SSRF guard never resolves hostname | ✅ resolves via `getaddrinfo`, checks every IP (private/reserved/loopback/link-local), blocks `*.internal`; unresolvable → blocked |
+| QMC-2 | MED | models.py + research.py | `-999` forecast sentinel illegal under unit bound | ✅ (2026-07-02) fully nullable value fields; bounds on number branch; pending `check_nullable_schema.py --live` |
+| ST-3 | MED | storage.py:743,911 | Unguarded `float(v)` crashes writer | ✅ `_safe_float_or_none` via shared `_q50_forecast` helper |
+| ST-4 | MED | storage.py:786+ | Bare `date.fromisoformat(fdate)` can abort writer | ✅ `_parse_date_or_none(fdate)` fallback; row skipped+warned only if BOTH source date and fdate unparseable |
+| ST-5 | MED | storage.py:408 | value_changed compares GPT vs prior run matched on a different model | ✅ filters prior runs to same-GPT-model (matches stability enricher semantics) |
+| ST-6 | MED | storage.py:363,402 | Prior-run history read from disk twice | ✅ module-level cache keyed by (dir, run_id, models) |
+| ST-7 | MED | storage.py writers | Repeated linear rescans of forecasts | 🟡 duplication removed via shared `_q50_forecast` (folds ST-11); full dict-index deferred — N is small |
+| RE-3 | MED | research.py:1034 | refine can switch provider silently | ❌ NOT A BUG — call site already threads `model=stack.research_model`; `_build_stacks` keeps provider in test mode. The `None` fallback is a latent hazard for future callers only (noted) |
+| RE-4 | MED | research.py:988 | Refine prompt drops guardrails | 🟡 added run_date + LEAP anti-anchoring to refine prompt; full shared-builder consolidation deferred (RE-7/8) |
+| RE-5 | MED | research.py:458,534 | Timeout detected by substring only | ✅ typed `APITimeoutError` check first, substring as fallback (`_is_timeout_error`) |
+| RE-6 | MED | common.py:71 | Cost silently $0 for unknown model | 🟡 warns once per unpriced model; web-search/cache token accounting deferred (needs price data) |
+| QMC-3 | MED | questions.py:26 | probability-unit + no-dates misrouted to `when` | ✅ explicit `return "quantile"` after warning; no-dates case then skips via the empty-expected guard |
+| QMC-4 | MED | consensus.py:197 | quantile auto-accepts regardless of q50 divergence | ⏸ AWAITING DECISION — recommend gating quantile auto-accept on q50 too (tolerance already exists) |
+| QMC-6 | MED | models.py:559 | `mixed_colors` false-positive on failed/unresolved resolution rows | ✅ those groups exempted from mixed-colors check |
+| IO-6 | MED | sync.py:41 | Partial BQ-sync failure still exits 0 | ✅ failures counted; `cmd_sync` returns 1; MERGEs are idempotent so re-run reconciles (atomicity itself unchanged) |
+| IO-5 | MED | run_surveillance.py:553 | O(n²) partial-progress serialization | ✅ per-question payload cached once (`completed_payloads`) |
+| IO-7 | MED | run_surveillance.py:472 | Two sources of truth for "which models ran" | ✅ `run_models` derived from `_build_stacks(test_mode)` |
+| ST-10 | MED | storage.py:781 | Reviewed value + blank status → silently "confirmed" | ⏸ AWAITING DECISION — recommend keep-current (value implies confirm) + document in sheet instructions; alternatives: projected, or skip+warn |
 
 ---
 
@@ -238,55 +239,54 @@ now`. **Fix:** require an explicit status before marking confirmed.
 
 ---
 
-## LOW / cleanup
+## LOW / cleanup — with resolutions (2026-07-03)
 
-- **ST-8 / IO-11 / IO-12 — run_id format + timezone.** run ordering (`storage.py:322`),
-  `_run_date_from_id` (`:824`), latest-tab (IO-2) all assume `YYYYMMDD_HHMMSS`; `run_id` and
-  `_earliest_past_target` use **local** time while `resolution_status` uses **UTC**
-  (near-midnight class-drift); second-resolution run_id can collide/overwrite. Fix: sort runs
-  by `created_at` in the JSON; standardize on UTC; add a short uuid suffix to run_id.
-- **ST-9 — storage.py:781-782** dead `"resolved"` branch (`resolution_status_value` is only
-  projected/confirmed).
-- **ST-11 — storage.py:906-919** `q50_for`/`color_for` are identical loops; fold into ST-7 index.
-- **ST-12 — storage.py:109** uses `getattr(color,"value",color)` instead of `enum_value`.
-- **ST-13 — storage.py:424** value-change `all_dims` from current only; misses dims dropped
-  since prior run.
-- **ST-14/15/16** — `_combine_stability` "one_stable" label edge; `run_data['run_id']` `[]` vs
-  `.get`; MERGE strict `>` skips equal-clock re-syncs.
-- **QMC-5 — models.py:253-269** `fix_schema` processes `$defs` twice (generic recursion + the
-  explicit loop). Remove one.
-- **QMC-8 — consensus.py:77-79** two models both failing to resolve count as agreement without
-  comparing `resolution_status` (failed vs unresolved "agree"). (Touches recent rework.)
-- **QMC-9 — models.py:403 vs 415-438** `response.sources` is URLs-only, but
-  `_contains_leap_forecast_anchor` scans it for "leap wave"/domain text → sources half of the
-  anchor check is near-dead; only the rationale scan works.
-- **QMC-11 — common.py:141 `resolution_status()`** returns a *different* vocabulary
-  (`resolved/resolved_early/due_unresolved/forecast`) than the `ResolutionStatus` enum
-  (`resolved/failed/unresolved`). Both live → foot-gun. Consider renaming the row-status one to
-  `display_row_status`.
-- **QMC-10 / QMC-12** — `iterrows` in `dim_q_map` build could be a vectorized filter (small N);
-  `_infer_surveillance_question_type` has unused `dimensions` param and `question_text`
-  (warning-only).
-- **RE-7 / RE-8 — research.py** three hand-rolled provider dispatches (`_claude_research`/
-  `_gpt_research`/`_call_structured_judge`/`refine_with_browser`) and parallel FULL/BRIEF
-  prompt constants — the main drift surface; consolidate into one `_call_model` + one canonical
-  prompt block.
-- **RE-9/10/11/12/13/14** — `_gpt_research` retry predicate omits `"expected ident"`;
-  `web_search_20250305` (basic) hardcoded regardless of model; `max_tokens=64000`
-  non-streaming relies on the explicit timeout to bypass the SDK long-request guard, and
-  retry/timeout layers compound wall-clock; fresh SDK client per call; broad `except Exception`
-  can mask programming errors; `decide_browser` returns a URL even on a `False` decision.
-- **IO-3 — run_surveillance.py:177-207** `_try_browser_refinement_for_model` + its `else`
-  branch (`:399`) are unreachable dead code (defer_browser is always set).
-- **IO-9 — sheets.py:264-285** single-model runs flag every row `needs_review=TRUE`
-  (`single_model_only != auto_accepted`). Confirm intended.
-- **IO-10 / IO-16 — run_surveillance.py:141** `_should_accept_browser_refinement` has 3 unused
-  params; `sheets.py:914` `row.get("group_id")` legacy column; `sync.py:75` discards
-  `row_numbers`.
-- **IO-13/14/15/17** — publish makes several sequential Sheets `batch_update`s (mergeable);
-  `browser.py:209` `'"error":' in extracted` false-rejects pages containing that text;
-  `browser.py:140` extension check ignores query strings (`report.csv?dl=1`); Jina fetch/
-  validation duplicated between `wayback_snapshot` and `browser_extract`.
+- **ST-8 / IO-11 / IO-12 — run_id format + timezone.** 🟡 partial: `run_id` generation and
+  `_earliest_past_target` switched to **UTC** (consistent with `date_value_type`/
+  `row_resolution_status`). 📋 deferred: sorting history by `created_at` instead of filename,
+  and a collision suffix on run_id (same-second double-run is unlikely; suffix would ripple
+  through tab names / review ids — do deliberately if ever needed).
+- **ST-9** ✅ dead `"resolved"` branch removed (`resolved_at = now if status == "confirmed"`).
+- **ST-11** ✅ folded: `q50_for`/`color_for`/`effective_color`/`black_q50_avg` all share one
+  `_q50_forecast()` helper.
+- **ST-12** ✅ uses `enum_value` now.
+- **ST-13** ✅ `all_dims` includes prior-run dims, so a disappeared value flags
+  `value_changed=True`.
+- **ST-14/15/16** — ST-15 ✅ (`.get("run_id", "")`). ST-14 📋 (`_combine_stability` "one_stable"
+  label semantics — confirm intended). ST-16 📋 (MERGE strict `>` on equal clocks — fine for
+  run-scoped PKs).
+- **QMC-5** ✅ redundant explicit `$defs` loop removed (generic recursion covers it).
+- **QMC-8** ❌ NOT A BUG in practice: within a question type the statuses that can co-occur
+  make a status-mismatch-with-equal-values impossible (resolved-vs-failed already differ on
+  value; failed and unresolved don't co-occur across quantile vs timing). No change.
+- **QMC-9** ❌ MOSTLY NOT A BUG: the domain string `leap.forecastingresearch.org` DOES match
+  inside bare URLs, so the sources half of the anchor check works; only the `"leap wave"`
+  text match is dead there (still covered by the rationale scan). No change.
+- **QMC-11** ✅ renamed `common.resolution_status` → `row_resolution_status` (+docstring
+  contrasting it with the `ResolutionStatus` enum); call sites in sheets.py/storage.py updated.
+- **QMC-10 / QMC-12** — QMC-12 ✅ unused `dimensions` param removed from
+  `_infer_surveillance_question_type`. QMC-10 📋 disregarded (iterrows on tiny per-group data;
+  vectorizing adds noise, not value).
+- **RE-7 / RE-8** 📋 deferred: consolidating the three provider dispatches into one
+  `_call_model` and unifying FULL/BRIEF prompt constants is the right refactor but too large
+  to do blind (no live API tests available). Do when next touching research.py with keys.
+- **RE-9/10/11/12/13/14** — RE-9 ✅ shared `_is_retryable_parse_error` (adds "expected ident"
+  to the GPT path). RE-10/11/12/13 📋 deferred (web_search tool version, streaming for 64k,
+  client reuse, broad-except narrowing — all behavior-preserving improvements needing live
+  validation). RE-14 📋 harmless (downstream gates on `browser_would_help`).
+- **IO-3** ✅ dead `_try_browser_refinement_for_model` + unreachable `else` branch + the
+  always-true `defer_browser` param deleted; browser extraction is now explicitly
+  shared/deferred-only.
+- **IO-9** ⏸ AWAITING DECISION (minor): single-model runs mark every row
+  `needs_review=TRUE` because `single_model_only != auto_accepted`. Likely fine (single-model
+  output HAS no consensus check), but confirm.
+- **IO-10 / IO-16** — IO-10 ✅ three unused params removed from
+  `_should_accept_browser_refinement`. IO-16 📋 kept: `group_id` fallback reads legacy tabs;
+  `row_numbers` return value harmless.
+- **IO-13/14/15/17** — IO-14 ✅ `'"error":'` only treated as an error payload when the
+  extraction is a JSON blob (`lstrip().startswith("{")`). IO-15 ✅ extension check parses the
+  URL path (query strings can't slip through). IO-13 📋 (merge Sheets batch_updates —
+  optimization). IO-17 📋 (dedupe Jina fetch helper — do when next touching browser.py).
 
 ---
 
@@ -302,8 +302,54 @@ now`. **Fix:** require an explicit status before marking confirmed.
    `TIMING_FORECAST_DATE` as the sole when-date. Worth a documented invariants list.
 5. **Two "resolution status" vocabularies** (QMC-11) coexist — rename one.
 
-## Suggested triage order
-Fix now (cheap + real): QMC-1, ST-1, ST-2, ST-3, ST-4, IO-4, RE-1, RE-5, QMC-3, QMC-6.
-Design decision needed: QMC-2, QMC-4, ST-5, IO-1, RE-2, RE-3/4.
-Security: IO-8 (SSRF) — fix before any untrusted-URL browsing.
-Cleanup/refactor when touching the area: ST-6/7, RE-7/8, IO-3/5, common.py vocab.
+## Status after fix pass (2026-07-03)
+
+**Fixed & verified** (imports clean; retrieval + nullable-schema suites all-pass; per-fix
+spot tests pass): QMC-1/3/5/6/11/12, ST-1/2/3/4/5/6/9/11/12/13/15, RE-1/5/9 (+RE-4/6
+partial), IO-2/3/4/5/6/7/8/10/14/15, and QMC-2 from the previous pass.
+
+**⏸ Awaiting Nadja's decision** (recommendations in the table above):
+1. **QMC-4** — gate quantile auto-accept on q50 agreement? (recommend: yes)
+2. **IO-1** — browser refinement: requesters-only vs shared-with-overwrite-fix?
+   (recommend: requesters-only)
+3. **ST-10** — reviewed value + blank status: keep "confirmed" / projected / skip+warn?
+   (recommend: keep confirmed + document)
+4. **RE-2** — parse-failure retry: leave-as-is+document vs cheap follow-up rewrite?
+   (recommend: leave; rare under strict schemas, bounded at 3)
+5. **IO-9** (minor) — single-model runs flag all rows needs_review; confirm intended.
+
+**❌ Rejected auditor claims** (checked, not bugs): RE-3 (model IS threaded via
+`stack.research_model`), QMC-8 (status-mismatch scenario can't occur), QMC-9 (domain check
+works on URLs).
+
+**📋 Deferred** (documented, do when touching the area / with live API keys): full forecast
+index (ST-7 remainder), provider-dispatch + prompt-constant consolidation (RE-7/8),
+web_search version / streaming / client reuse / broad-except narrowing (RE-10..13),
+created_at-based history sort + run_id collision suffix (ST-8/IO-12), Sheets batch merge
+(IO-13), Jina dedupe (IO-17), web-search cost accounting (RE-6 remainder).
+
+**Needs live API test when keys available**: `python check_nullable_schema.py --live`
+(QMC-2 nullable schema acceptance on both providers).
+
+## Post-audit finds (from the first fresh-machine run, 2026-07-03)
+- **IO-18** ✅ HIGH — partial-progress writer crashed with `FileNotFoundError` on a fresh
+  checkout: it wrote `outputs/run_*_partial.json.tmp` before `outputs/` existed (only the
+  END-of-run writers mkdir'd). Both questions' results were lost. Fixed:
+  `os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)` before the loop. Classic
+  worked-on-the-author's-machine bug (dir pre-existed there).
+- **IO-19** ✅ — pyproject.toml missing runtime deps on a fresh venv:
+  `google-cloud-bigquery` needs the `[pandas]` extra (`db-dtypes`/`pyarrow` for
+  `to_dataframe`), and `requests` was only transitive. Both declared now.
+- **ASSUMPTION (documented, not changed)** — `DEFAULT_OUTPUT_DIR="outputs"` and `.env`
+  loading are cwd-relative: the CLI must be launched from the repo root.
+- **RE-15** ✅ — Claude's `produce_forecast` tool calls could come back structurally
+  malformed (observed: missing required `sources` on the Coffee Test in test mode),
+  burning a parse-retry that re-runs the paid search (RE-2's cost). Root fix applied:
+  **Anthropic strict tool use** (`strict: true` on the tool definition, GA, no beta header;
+  supported on Opus 4.8 + Haiku 4.5) — the API now guarantees tool inputs validate against
+  the schema, matching the guarantee the OpenAI path already had. Numeric bounds
+  (`minimum`/`maximum`, unsupported under strict) are stripped from the Anthropic copy via
+  `models.strict_tool_schema()`; bounds remain in the prompt and are enforced post-hoc by
+  `validate_response`. Applied to both `_claude_research` and `refine_with_browser`.
+  **Pending live test:** `check_nullable_schema.py --live` now exercises strict + nullable
+  together (needs a valid ANTHROPIC_API_KEY).

@@ -68,11 +68,21 @@ def strip_provider_prefix(model: str) -> str:
     return model
 
 
+_warned_unpriced_models: set[str] = set()
+
+
 def cost_for_tokens(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Estimate cost from token counts using the local price table (longest matching key wins)."""
+    """Estimate cost from token counts using the local price table (longest matching key wins).
+
+    Note: only input/output tokens are counted — server-side web-search charges and cache
+    tokens are not, so reported cost is a lower bound.
+    """
     bare = strip_provider_prefix(model)
     matches = [key for key in _MODEL_PRICES if key in bare]
     if not matches:
+        if bare not in _warned_unpriced_models:
+            _warned_unpriced_models.add(bare)
+            print(f"  warning: no price entry for model '{bare}'; its cost will be reported as $0")
         return 0.0
     inp_price, out_price = _MODEL_PRICES[max(matches, key=len)]
     return (input_tokens * inp_price + output_tokens * out_price) / 1_000_000
@@ -138,7 +148,12 @@ def date_value_type(forecast_date: str, today: date | None = None) -> str:
         return "forecast"
 
 
-def resolution_status(forecast_date: str, color_code, today: date | None = None) -> str:
+def row_resolution_status(forecast_date: str, color_code, today: date | None = None) -> str:
+    """Display status for a target-date row (resolved / resolved_early / due_unresolved / forecast).
+
+    Distinct from models.ResolutionStatus (resolved / failed / unresolved), which is the
+    LLM-reported resolution outcome.
+    """
     is_black = enum_value(color_code) == "black"
     today = today or datetime.now(timezone.utc).date()
     try:

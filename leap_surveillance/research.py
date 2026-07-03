@@ -37,6 +37,7 @@ from .models import (
     StrictSurveillanceResponse,
     SurveillanceResponse,
     make_strict_schema,
+    strict_tool_schema,
     strict_to_regular_response,
 )
 
@@ -50,6 +51,21 @@ RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 1800.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 120.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 2)
 MAX_SEARCH_ROUNDS = _env_int("LEAP_MAX_SEARCH_ROUNDS", 20)
+MAX_RATE_LIMIT_RETRIES = _env_int("LEAP_MAX_RATE_LIMIT_RETRIES", 5)
+
+
+def _is_timeout_error(e: Exception) -> bool:
+    """Typed SDK timeout classes first; substring fallback for wrapped messages."""
+    if isinstance(e, (anthropic.APITimeoutError, openai.APITimeoutError)):
+        return True
+    s = str(e).lower()
+    return "timeout" in s or "timed out" in s
+
+
+def _is_retryable_parse_error(e: Exception) -> bool:
+    """Malformed-JSON/validation failures worth one cheap re-attempt (shared across providers)."""
+    s = str(e)
+    return "EOF while parsing" in s or "expected ident" in s or "validation error" in s.lower()
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 65)
 
 
@@ -433,15 +449,20 @@ def _claude_research(
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     """Research via Anthropic SDK with server-side web search and adaptive thinking."""
     schema = _research_schema(question)
+    # strict: True makes the API guarantee tool inputs validate against the schema,
+    # eliminating malformed produce_forecast payloads (missing fields, wrong nesting).
+    # Numeric bounds are stripped (unsupported under strict); validate_response enforces them.
     produce_tool = {
         "name": "produce_forecast",
         "description": "Output the structured surveillance forecast.",
-        "input_schema": schema,
+        "strict": True,
+        "input_schema": strict_tool_schema(schema),
     }
     messages = [{"role": "user", "content": prompt}]
     model_id = strip_provider_prefix(model)
 
     timeout_attempt = 0
+    rate_limit_attempt = 0
     search_round = 0
     while True:
         try:
@@ -455,13 +476,13 @@ def _claude_research(
                 **thinking,
             )
         except Exception as e:
-            error_str = str(e).lower()
-            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+            if _is_timeout_error(e) and timeout_attempt < MAX_TIMEOUT_RETRIES:
                 timeout_attempt += 1
                 print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
                 continue
-            if isinstance(e, anthropic.RateLimitError):
-                print("    rate limit; sleeping 60s...")
+            if isinstance(e, anthropic.RateLimitError) and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+                rate_limit_attempt += 1
+                print(f"    rate limit; sleeping 60s (retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
                 time.sleep(60)
                 continue
             raise
@@ -493,8 +514,7 @@ def _claude_research(
         try:
             return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
         except Exception as e:
-            retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
-            if attempt < 3 and retryable:
+            if attempt < 3 and _is_retryable_parse_error(e):
                 print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
                 return _claude_research(question, model, prompt, attempt=attempt + 1, costs=costs, cost_bucket=cost_bucket)
             print(f"    validation error (raw text[:500]): {text[:500]}")
@@ -517,6 +537,7 @@ def _gpt_research(
     extra = {} if test_mode else {"reasoning": {"effort": DEFAULT_REASONING_EFFORT}}
 
     timeout_attempt = 0
+    rate_limit_attempt = 0
     while True:
         try:
             response = openai.OpenAI().responses.create(
@@ -531,13 +552,13 @@ def _gpt_research(
             )
             break
         except Exception as e:
-            error_str = str(e).lower()
-            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+            if _is_timeout_error(e) and timeout_attempt < MAX_TIMEOUT_RETRIES:
                 timeout_attempt += 1
                 print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
                 continue
-            if isinstance(e, openai.RateLimitError):
-                print("    rate limit; sleeping 60s...")
+            if isinstance(e, openai.RateLimitError) and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+                rate_limit_attempt += 1
+                print(f"    rate limit; sleeping 60s (retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
                 time.sleep(60)
                 continue
             raise
@@ -550,7 +571,7 @@ def _gpt_research(
     try:
         return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
     except Exception as e:
-        if attempt < 3 and ("EOF while parsing" in str(e) or "validation error" in str(e).lower()):
+        if attempt < 3 and _is_retryable_parse_error(e):
             print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
             return _gpt_research(question, model, prompt, attempt=attempt + 1, test_mode=test_mode, costs=costs, cost_bucket=cost_bucket)
         print(f"    validation error (raw text[:500]): {text[:500]}")
@@ -988,6 +1009,7 @@ def refine_with_browser(
     prompt = f"""Update the surveillance response with new browser-extracted data.
 
 Question: {question.name}
+Run date: {datetime.now(timezone.utc).date().isoformat()}
 Background: {question.prompt}
 
 {evidence_plan_summary}
@@ -1027,6 +1049,7 @@ Instructions:
 - Return exactly the expected rows. The system assigns value_type from those rows.
 - Set a value to null only when no defensible estimate is possible.
 - When incorporating browser data: match the question's period, unit, and scope; for derived or aggregate metrics, compute using the method the resolution criteria specifies; do not assert values the browser page does not explicitly state.
+- Do not anchor on existing LEAP forecasts. If the browser content or original sources include a LEAP Wave report or forecastingresearch.org page, do not use it as a source, official value, or anchor for any estimate.
 
 {_rationale_requirements(question)}"""
 
@@ -1037,7 +1060,7 @@ Instructions:
 
     try:
         if provider_for_model(model) == "anthropic":
-            produce_tool = {"name": "produce_forecast", "description": "Output the refined surveillance forecast.", "input_schema": schema}
+            produce_tool = {"name": "produce_forecast", "description": "Output the refined surveillance forecast.", "strict": True, "input_schema": strict_tool_schema(schema)}
             response = anthropic.Anthropic().messages.create(
                 model=model_id,
                 max_tokens=64000,

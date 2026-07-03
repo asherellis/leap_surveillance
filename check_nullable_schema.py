@@ -170,8 +170,10 @@ def live_anthropic() -> None:
     try:
         import anthropic
         client = anthropic.Anthropic()
+        # Mirrors production: strict tool use (guaranteed schema-valid inputs) with numeric
+        # bounds stripped, exactly as research.py now sends it.
         tool = {"name": "produce_forecast", "description": "Output the structured surveillance forecast.",
-                "input_schema": _live_schema()}
+                "strict": True, "input_schema": m.strict_tool_schema(_live_schema())}
         resp = client.messages.create(
             model=strip_provider_prefix(TEST_CLAUDE_MODEL),
             max_tokens=2000,

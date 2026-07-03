@@ -19,15 +19,15 @@ def _infer_surveillance_question_type(
     question_text: str,
     unit_name: str,
     dates: list[str],
-    dimensions: list[str],
     source_percentiles: list[int],
 ) -> str:
 
-    if unit_name.strip().lower() == "probability": 
+    if unit_name.strip().lower() == "probability":
         if set(source_percentiles) == {50}:
             return "probability"
-        else:
-            print(f"  warning: skipping '{question_text}' - probability unit question with non-50 percentiles not supported. It's handled as a quantile question instead.")
+        # Explicit return so a no-dates probability-unit question can't fall through to "when".
+        print(f"  warning: '{question_text}' - probability unit question with non-50 percentiles not supported; handled as a quantile question instead.")
+        return "quantile"
     if not dates:
         return "when"
     return "quantile"
@@ -174,7 +174,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
             continue
 
         question_type = _infer_surveillance_question_type(
-            question_text, unit_name, dates, dimensions, source_percentiles
+            question_text, unit_name, dates, source_percentiles
         )
         prompt = _build_prompt_context(row, dates, dimensions)
         expected = _expected_forecasts(question_type, dates, dimensions)
@@ -194,7 +194,9 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 continue
             raw_date = r.get("question_resolution_date")
             fdate = str(raw_date).strip() if not is_empty(raw_date) else TIMING_FORECAST_DATE
-            dim = str(r.get("question_dimension") or "Overall").strip() or "Overall"
+            # NaN is truthy, so `or "Overall"` alone would produce a "nan" key; use is_empty.
+            raw_dim = r.get("question_dimension")
+            dim = (safe_str(raw_dim).strip() if not is_empty(raw_dim) else "") or "Overall"
             dq_id = r.get("question_id")
             if not is_empty(dq_id):
                 dim_q_map[f"{fdate}|{dim}"] = str(dq_id)
