@@ -352,7 +352,7 @@ def _resolution_guidance(question: QuestionSpec) -> str:
         return """Resolution value guidance (timing — ALWAYS check on every run):
 Determine whether the event has ALREADY occurred as of today, as defined by the question's resolution criteria. This check is mandatory every run.
 
-- If it HAS occurred (per the resolution criteria): add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, plus source and source_date. Leave best_guess_resolution null. Its timing quantile values will be ignored (nulled) — you need not craft a distribution for it.
+- If it HAS occurred (per the resolution criteria): add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, plus source and source_date. Leave best_guess_resolution null. The occurrence year is now known, so set all seven timing quantiles to that same year and color_code="black".
 - If it has NOT occurred: add a resolution_values entry with resolution_status="unresolved", value null, and best_guess_resolution null (your estimate is already captured in the timing quantiles); forecast the timing quantiles as usual.
 - Timing questions can NEVER be "failed" — the event has either occurred or not.
 - resolution_values.source_date = the date the value represents, not the source's publication date."""
@@ -421,7 +421,7 @@ def _task_steps(question: QuestionSpec) -> str:
     if question.question_type in ("probability", "when"):
         return """Task:
 1. Check hard whether any expected target has already resolved (see the resolution guidance) and report it in resolution_values with resolution_status, value, source, and source_date.
-2. Generate forecast rows for every expected date/dimension/quantile listed above. For rows whose target date has resolved, still list the rows but do not craft a distribution — their forecast_value will be ignored/nulled.
+2. Generate forecast rows for every expected date/dimension/quantile listed above. For resolved rows, follow the resolution guidance above rather than crafting a fresh distribution.
 3. Provide structured sources with url, title, and snippet.
 
 Do not return latest official values or current estimates for this question type; those fields are intentionally absent from the output schema."""

@@ -1,7 +1,5 @@
 """Load and shape LEAP question metadata from BigQuery."""
 
-import re
-
 from .common import (
     DEFAULT_BQ_PROJECT,
     FULL_QUANTILES,
