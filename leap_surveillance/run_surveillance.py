@@ -34,8 +34,8 @@ from .models import (
 from .storage import (
     _serialize_model_result,
     build_run_data,
-    enrich_with_run_stability,
-    enrich_with_value_changes,
+    annotate_run_stability,
+    annotate_value_changes,
     write_csv_output,
     write_json_output,
 )
@@ -546,8 +546,8 @@ def cmd_run(args):
         consensus_blocks=consensus_blocks,
         errors_list=errors_list,
     )
-    run_data = enrich_with_run_stability(run_data, DEFAULT_OUTPUT_DIR)
-    run_data = enrich_with_value_changes(run_data, DEFAULT_OUTPUT_DIR)
+    run_data = annotate_run_stability(run_data, DEFAULT_OUTPUT_DIR)
+    run_data = annotate_value_changes(run_data, DEFAULT_OUTPUT_DIR)
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     try:
         os.remove(partial_path)

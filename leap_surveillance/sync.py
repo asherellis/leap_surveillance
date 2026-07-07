@@ -6,7 +6,7 @@ import os
 from .common import DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, safe_str
 from .sheets import get_reviewed_items
 from .storage import (
-    write_accepted_to_fact_resolution,
+    write_to_fact_resolution,
     write_to_dim_baseline,
     write_to_surveillance_result,
 )
@@ -57,7 +57,7 @@ def _write_run_items(run_id: str, items: list[dict]) -> int:
         print(f"BigQuery dim_baseline write failed ({run_id}): {e}")
 
     try:
-        fr_stats = write_accepted_to_fact_resolution(run_data, items)
+        fr_stats = write_to_fact_resolution(run_data, items)
         if fr_stats is not None:
             print(f"BigQuery fact_resolution ({run_id}): {fr_stats.inserted_row_count} inserted, {fr_stats.updated_row_count} updated")
         else:

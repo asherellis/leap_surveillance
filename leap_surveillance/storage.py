@@ -345,7 +345,7 @@ def _read_production_history(output_dir: str, current_models: dict, current_run_
     return runs
 
 
-def enrich_with_run_stability(run_data: dict, output_dir: str) -> dict:
+def annotate_run_stability(run_data: dict, output_dir: str) -> dict:
     """Annotate each question with cross-run stability, scanning prior production runs once."""
     current_models = run_data.get("models") or {}
     current_run_id = run_data.get("run_id", "")
@@ -400,15 +400,30 @@ def _values_differ(a, b) -> bool:
         return str(a).strip() != str(b).strip()
 
 
-def enrich_with_value_changes(run_data: dict, output_dir: str) -> dict:
-    """Annotate each question with whether GPT's LOV or current estimate changed vs the prior run."""
+def _baseline_changed(curr_block: dict | None, prior_block: dict | None) -> bool:
+    """True if a model's last-official or current value moved between runs, for any dimension."""
+    curr_official, curr_current, _ = context_maps((curr_block or {}).get("response") or {})
+    prior_official, prior_current, _ = context_maps((prior_block or {}).get("response") or {})
+    # Include prior-run dims so a value that disappeared since last run also flags a change.
+    all_dims = set(curr_official) | set(curr_current) | set(prior_official) | set(prior_current) | {"Overall"}
+    single = len(set(curr_official) | set(curr_current)) <= 1
+    for dim in all_dims:
+        c_lov = pick_by_dimension(curr_official, dim, single).get("value")
+        p_lov = pick_by_dimension(prior_official, dim, single).get("value")
+        c_cur = pick_by_dimension(curr_current, dim, single).get("value")
+        p_cur = pick_by_dimension(prior_current, dim, single).get("value")
+        if _values_differ(c_lov, p_lov) or _values_differ(c_cur, p_cur):
+            return True
+    return False
+
+
+def annotate_value_changes(run_data: dict, output_dir: str) -> dict:
+    """Annotate each question with whether either model's LOV or current estimate changed vs the prior run."""
     current_models = run_data.get("models") or {}
     current_run_id = run_data.get("run_id", "")
 
     prior_runs = _read_production_history(output_dir, current_models, current_run_id)
-    # Compare GPT against GPT's own production history: history admits a run if ANY tag
-    # matched, so filter to runs whose gpt model equals the current one (same semantics as
-    # the per-tag filter in enrich_with_run_stability's ingest).
+    # Anchor on GPT's own history; also compare Claude when the prior run's Claude model matches.
     current_gpt = current_models.get("gpt")
     gpt_prior_runs = [r for r in prior_runs if current_gpt and (r.get("models") or {}).get("gpt") == current_gpt]
     if not gpt_prior_runs:
@@ -418,32 +433,19 @@ def enrich_with_value_changes(run_data: dict, output_dir: str) -> dict:
 
     prior_run = gpt_prior_runs[-1]  # most recent prior run with the same GPT model
     prior_by_id: dict[str, dict] = {q.get("id", ""): q for q in prior_run.get("questions", [])}
+    current_claude = current_models.get("claude")
+    compare_claude = bool(current_claude and (prior_run.get("models") or {}).get("claude") == current_claude)
 
     for q in run_data.get("questions", []):
-        qid = q.get("id", "")
-        prior_q = prior_by_id.get(qid)
+        prior_q = prior_by_id.get(q.get("id", ""))
         if not prior_q:
             q["value_changed"] = False
             continue
-
-        curr_gpt = (q.get("per_model") or {}).get("gpt") or {}
-        prior_gpt = (prior_q.get("per_model") or {}).get("gpt") or {}
-        curr_official, curr_current, _ = context_maps((curr_gpt.get("response") or {}))
-        prior_official, prior_current, _ = context_maps((prior_gpt.get("response") or {}))
-
-        changed = False
-        # Include prior-run dims so a value that disappeared since last run also flags a change.
-        all_dims = set(curr_official) | set(curr_current) | set(prior_official) | set(prior_current) | {"Overall"}
-        single = len(set(curr_official) | set(curr_current)) <= 1
-        for dim in all_dims:
-            c_lov = pick_by_dimension(curr_official, dim, single).get("value")
-            p_lov = pick_by_dimension(prior_official, dim, single).get("value")
-            c_cur = pick_by_dimension(curr_current, dim, single).get("value")
-            p_cur = pick_by_dimension(prior_current, dim, single).get("value")
-            if _values_differ(c_lov, p_lov) or _values_differ(c_cur, p_cur):
-                changed = True
-                break
-
+        curr_pm = q.get("per_model") or {}
+        prior_pm = prior_q.get("per_model") or {}
+        changed = _baseline_changed(curr_pm.get("gpt"), prior_pm.get("gpt"))
+        if not changed and compare_claude:
+            changed = _baseline_changed(curr_pm.get("claude"), prior_pm.get("claude"))
         q["value_changed"] = changed
 
     return run_data
@@ -583,7 +585,7 @@ def query_bq(
     return job.to_dataframe(create_bqstorage_client=use_bqstorage, timeout=timeout_s)
 
 
-def _merge_bq(
+def _merge_bigquery(
     df: pd.DataFrame,
     pk: str,
     dataset: str,
@@ -707,7 +709,7 @@ def _try_merge_bigquery_rows(
                 df[col] = df[col].astype(dtype)
 
     try:
-        return _merge_bq(
+        return _merge_bigquery(
             df,
             pk=pk,
             dataset=dataset,
@@ -729,7 +731,7 @@ def _q50_forecast(model_block: dict | None, fdate: str, dim: str) -> dict | None
     return None
 
 
-def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = None):
+def write_to_fact_resolution(run_data: dict, all_items: list | None = None):
     """Write resolved/projected target-date values to fact.fact_resolution."""
     now = datetime.now(timezone.utc)
 

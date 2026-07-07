@@ -28,21 +28,22 @@ _MODEL_FIELDS = [
     "q0", "q5", "q25", "q75", "q95", "q100",
     "latest_official_value", "latest_official_date", "latest_official_source",
     "current_estimate", "current_estimate_confidence",
-    "rationale", "sources",
     "resolution_source", "resolution_source_date",
     "judge_confidence", "browser_status", "browser_url", "browser_objective", "browser_error",
-    "missing_data", "judge_reason", "validation_issues",
+    "missing_data", "validation_issues", "judge_reason",
+    "rationale", "sources",
 ]
 
-_METADATA_COLS = ["question_name", "status", "target_date", "dimension",
+_METADATA_COLS = ["question_name", "needs_review", "status", "target_date", "dimension",
+                  "question_type", "unit",
                   "question_resolution_status", "question_resolution_value",
                   "question_resolution_source", "question_resolution_source_date",
-                  "needs_review",
-                  "question_type", "unit", "question_text", "resolution_criteria"]
-_CONSENSUS_COLS = [
-    "model_consensus", "consensus_q50_delta_pct",
+                  "question_text", "resolution_criteria"]
+# Diagnostics apply to any run; consensus columns are dual-model-only.
+_CONSENSUS_COLS = ["model_consensus", "consensus_q50_delta_pct", "confidence_tier"]
+_DIAGNOSTIC_COLS = [
     "run_stability", "gpt_run_stability", "claude_run_stability", "runs_seen",
-    "confidence_tier", "has_official_value", "has_current_value", "value_has_changed",
+    "has_official_value", "has_current_value", "value_has_changed",
 ]
 _REVIEWER_COLS = [
     "review_verdict", "review_last_official_value", "review_current_value",
@@ -64,9 +65,9 @@ def _interleaved_model_cols() -> list[str]:
 def _review_headers(mode: str) -> list[str]:
     """Build the review-tab layout for dual-model or single-model runs."""
     if mode == "both":
-        return [*_METADATA_COLS, *_interleaved_model_cols(), *_CONSENSUS_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
+        return [*_METADATA_COLS, *_interleaved_model_cols(), *_CONSENSUS_COLS, *_DIAGNOSTIC_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
     tag = "gpt" if mode == "gpt" else "claude"
-    return [*_METADATA_COLS, *[f"{tag}_{f}" for f in _MODEL_FIELDS], *_REVIEWER_COLS, *_SYNC_COLS]
+    return [*_METADATA_COLS, *[f"{tag}_{f}" for f in _MODEL_FIELDS], *_DIAGNOSTIC_COLS, *_REVIEWER_COLS, *_SYNC_COLS]
 
 
 VERDICT_OPTIONS = ["correct", "close", "partially right", "wrong", "confidently wrong", "unknown"]
@@ -108,7 +109,7 @@ INSTRUCTIONS_CONTENT = [
     ["confidence_tier", "high = auto_accepted + both_stable. medium = auto_accepted + partially stable. low = everything else."],
     ["has_official_value", "TRUE if an authoritative last official value exists for this question."],
     ["has_current_value", "TRUE if a current-day estimate exists for this question."],
-    ["value_has_changed", "TRUE if GPT's last official value or current estimate changed since the prior run. Blank on the first run."],
+    ["value_has_changed", "TRUE if either model's last official value or current estimate changed since the prior run. Blank on the first run."],
     ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value. Fill from Task 1 or manual lookup."],
     ["review_current_value", "Human-verified current value as of the run date."],
@@ -164,7 +165,7 @@ INSTRUCTIONS_CONTENT = [
     ["confidence_tier", "high / medium / low. Derived from consensus status and run stability."],
     ["has_official_value", "TRUE if GPT or Claude found a published last official value for this question. FALSE for question types where no official figure exists."],
     ["has_current_value", "TRUE if GPT or Claude produced a current-day estimate for this question. FALSE where not applicable."],
-    ["value_has_changed", "TRUE if GPT's last official value or current estimate changed since the prior run. FALSE = unchanged. Blank = first run."],
+    ["value_has_changed", "TRUE if either model's last official value or current estimate changed since the prior run. FALSE = unchanged. Blank = first run."],
     ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value."],
     ["review_current_value", "Human-verified current value as of the run date."],
