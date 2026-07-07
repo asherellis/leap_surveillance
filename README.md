@@ -5,6 +5,8 @@ generates structured forecasts with web search (and optional browser automation)
 writes local JSON/CSV plus a per-run Google Sheet review tab. Runs land in `outputs/`
 as `run_<run_id>.{json,csv}`.
 
+This pipeline intentionally excludes conditional questions for now. To re-implement them, look at memory/conditional_questions.md
+
 ## Setup
 
 ```bash

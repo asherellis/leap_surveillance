@@ -37,6 +37,7 @@ from .models import (
     StrictSurveillanceResponse,
     SurveillanceResponse,
     make_strict_schema,
+    strict_tool_schema,
     strict_to_regular_response,
 )
 
@@ -50,6 +51,21 @@ RESEARCH_TIMEOUT = _env_float("LEAP_RESEARCH_TIMEOUT", 1800.0)
 EVALUATION_TIMEOUT = _env_float("LEAP_EVALUATION_TIMEOUT", 120.0)
 MAX_TIMEOUT_RETRIES = _env_int("LEAP_MAX_TIMEOUT_RETRIES", 2)
 MAX_SEARCH_ROUNDS = _env_int("LEAP_MAX_SEARCH_ROUNDS", 20)
+MAX_RATE_LIMIT_RETRIES = _env_int("LEAP_MAX_RATE_LIMIT_RETRIES", 5)
+
+
+def _is_timeout_error(e: Exception) -> bool:
+    """Typed SDK timeout classes first; substring fallback for wrapped messages."""
+    if isinstance(e, (anthropic.APITimeoutError, openai.APITimeoutError)):
+        return True
+    s = str(e).lower()
+    return "timeout" in s or "timed out" in s
+
+
+def _is_retryable_parse_error(e: Exception) -> bool:
+    """Malformed-JSON/validation failures worth one cheap re-attempt (shared across providers)."""
+    s = str(e)
+    return "EOF while parsing" in s or "expected ident" in s or "validation error" in s.lower()
 MIN_ADEQUATE_CONFIDENCE = _env_int("LEAP_MIN_ADEQUATE_CONFIDENCE", 65)
 
 
@@ -58,7 +74,7 @@ _COLLAPSE_FLOATS_RE = re.compile(r'(\d+\.\d{4})\d{4,}')
 
 _RC_SOURCE_PROMPT = """Given a question name and its resolution criteria, identify the PRIMARY external data source that the metric value will be pulled from.
 
-Focus on the DATA SOURCE, not the "resolution body" (FRI staff, LEAP panel) who makes the final call. If the RC says "use the St. Louis Fed study if available, else FRI staff", the primary source is St. Louis Fed. If the RC names EIU Democracy Index scores, the primary source is EIU.
+Focus on the DATA SOURCE, not the "resolution body" (FRI staff, LEAP panel) who makes the final call. For example, if the resolution criteria say "use the St. Louis Fed study if available, else FRI staff", the primary source is St. Louis Fed. If the resolution criteria names EIU Democracy Index scores, the primary source is EIU.
 
 Return JSON with:
 - named_source: short name (e.g. "Epoch AI", "FRED", "BLS", "IC3", "St. Louis Fed", "IEA"). Use "FRI LEAP panel" only if resolution is entirely an expert survey with no external data source.
@@ -85,7 +101,7 @@ class EvidencePlan:
 
 
 EVIDENCE_PRIORITY_RULE = (
-    "Prefer exact metric/period/scope/unit matches from the RC-named primary source. "
+    "Prefer exact metric/period/scope/unit matches from the resolution criteria-named primary source. "
     "Use secondary or stale sources only when the primary source is unavailable or ambiguous."
 )
 
@@ -118,9 +134,9 @@ def _required_filters(text: str) -> dict[str, str]:
     if hard_match:
         filters["difficulty"] = hard_match.group(1).title()
     if "highest" in lowered and ("ever" in lowered or "historical" in lowered):
-        filters["time_window"] = "dated/historical/archived snapshots; not live/rolling unless RC explicitly says live"
+        filters["time_window"] = "dated/historical/archived snapshots; not live/rolling unless resolution criteria explicitly says live"
     if "current" in lowered and "live" in lowered:
-        filters["time_window"] = "live/current view only if it matches the RC period"
+        filters["time_window"] = "live/current view only if it matches the resolution criteria period"
     return filters
 
 
@@ -205,7 +221,7 @@ def annotate_browser_evidence(browser_result: BrowserEvidence, plan_or_dict: Evi
 
 
 def extract_rc_source(rc_text: str, eval_model: str) -> dict | None:
-    """Extract primary resolution source from RC text using a cheap LLM call."""
+    """Extract primary resolution source from resolution criteria text using a cheap LLM call."""
     if not rc_text or not rc_text.strip():
         return None
     try:
@@ -252,7 +268,7 @@ q0 and q100 are feasibility bounds, not ordinary probabilistic quantiles.
 
 Use q5/q25/q50/q75/q95 as the probability distribution, with q50 as the median. Values must be non-decreasing: q0 <= q5 <= q25 <= q50 <= q75 <= q95 <= q100. Adjacent quantiles may be equal when justified by a feasibility bound or high-confidence point mass (e.g., q0 = q5 = current value for a cumulative metric near its floor).
 
-Use -999 only when no reasonable estimate is possible for a specific value."""
+Set forecast_value to null only when no reasonable estimate is possible for a specific value."""
 
 
 QUANTILE_INTERPRETATION_BRIEF = """Quantile interpretation:
@@ -266,7 +282,7 @@ Quantile meanings:
 - q=100: Highest value still possible. Use the natural unit upper bound, or a 99.99th-percentile scenario if no natural bound exists.
 - q0/q100 are bounds, not ordinary credible-interval endpoints. Wide bounds are expected for naturally wide ranges.
 
-Use -999 only when no reasonable estimate is possible for a specific value."""
+Set forecast_value to null only when no reasonable estimate is possible for a specific value."""
 
 
 COLOR_CODE_SYSTEM_FULL = """Color coding:
@@ -304,7 +320,7 @@ RESEARCH_PRINCIPLES = """Research principles:
 - Respect scope. If the metric is limited to a particular category, track, subset, or population, confirm each source matches that scope, and note in your rationale what you included and excluded.
 - Use base rates where available. When the metric has historical data or a clear reference class, use it as an anchor for the forecast. If your forecast departs materially from that history or reference class, say why.
 - Build aggregates exactly as the question defines them. If the metric is an average, sum, or index over components, gather each component and compute it yourself rather than copying a headline figure; list each component value, source, date, and the arithmetic you used. Combine components using the method the question's resolution criteria specifies; impose no default weighting of your own. When the component structure is ambiguous (e.g., a benchmark reports multiple sub-scores or tiers and the criteria doesn't say how they roll up), state the assumption you made and flag it explicitly in your rationale.
-- Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer -999 (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
+- Don't manufacture data. Ground each value in a source that actually reports it. When you cannot, prefer null (or appropriately wide uncertainty for forecast rows) over inferring a number from out-of-scope or out-of-period material. Never present an extrapolation as if it were observed data."""
 
 
 RATIONALE_REQUIREMENTS = """Rationale requirements:
@@ -331,24 +347,27 @@ def _expected_forecast_lines(expected_forecasts: list[ExpectedForecast]) -> str:
 
 
 def _resolution_guidance(question: QuestionSpec) -> str:
-    if not any(f.value_type == "resolution" for f in question.expected_forecasts):
-        return "No requested forecast rows are past resolution dates. Return an empty resolution_values list unless a future target date has already resolved early."
+    if question.question_type == "when":
+        # Timing questions must ALWAYS be checked — only research reveals whether the event occurred.
+        return """Resolution value guidance (timing — ALWAYS check on every run):
+Determine whether the event has ALREADY occurred as of today, as defined by the question's resolution criteria. This check is mandatory every run.
 
-    if question.question_type in ("probability", "when"):
-        return """Resolution value guidance:
-Some requested rows may have value_type="resolution" or may have resolved early. Try to find whether the event/target has resolved as of the relevant date.
-
-- If you find an authoritative resolution for the target date: report it in resolution_values (with source and source_date), set all relevant forecast values for that group to the resolved value, and use color_code="black".
-- If no authoritative resolution exists: leave that group out of resolution_values and return the requested forecast/probability/timing rows with the non-black color that reflects remaining uncertainty.
+- If it HAS occurred (per the resolution criteria): add a resolution_values entry with resolution_status="resolved", value=<the occurrence year>, plus source and source_date. Leave best_guess_resolution null. Its timing quantile values will be ignored (nulled) — you need not craft a distribution for it.
+- If it has NOT occurred: add a resolution_values entry with resolution_status="unresolved", value null, and best_guess_resolution null (your estimate is already captured in the timing quantiles); forecast the timing quantiles as usual.
+- Timing questions can NEVER be "failed" — the event has either occurred or not.
 - resolution_values.source_date = the date the value represents, not the source's publication date."""
 
-    return """Resolution value guidance:
-Some requested rows have value_type="resolution": their target date has passed, so try to find the metric's authoritative value as of that exact target date. A past date does not guarantee that a resolved value exists.
+    if not any(f.value_type == "resolution" for f in question.expected_forecasts):
+        return "No requested forecast rows are past their resolution date. Return an empty resolution_values list unless a future target date has already resolved early."
 
-- If you find an authoritative value for the target date: report it in resolution_values (with source and source_date), set all quantiles for that group to that single value, and use color_code="black".
-- If no authoritative value exists for the target date (the metric was never measured for it, the data is not published yet, or only post-target-date sources exist): leave that group out of resolution_values, give your best-estimate distribution across the quantiles, and use the non-black color that reflects your remaining uncertainty. Put your single best guess in current_estimates so the estimate is not lost. A non-black distribution for a past target date where no official value has been published is correct behavior and will not be penalized.
-- resolution_values.source_date = the date the value represents, not the source's publication date.
-- current_estimates reflect today's best guess and must never overwrite or substitute for a past resolution value."""
+    # quantile / probability with at least one past (resolution) target date
+    return """Resolution value guidance (mandatory for past target dates):
+Some requested rows have value_type="resolution": their target date has passed, so you MUST check hard whether the metric has an authoritative value as of that exact target date, as defined by the question's resolution criteria. Consult multiple sources before concluding it is unresolved. For EACH such (date, dimension) add exactly one resolution_values entry:
+
+- If you find an authoritative value: resolution_status="resolved", value=<the value>, with source and source_date. Leave best_guess_resolution null.
+- If after thorough checking no authoritative value exists: resolution_status="failed", value null, best_guess_resolution=<your single best estimate>, source and source_date empty.
+- Do NOT craft a genuine forecast distribution for a past date: still list its expected quantile rows (for completeness) but their forecast_value will be ignored/nulled — put your effort into the resolution_values entry.
+- resolution_values.source_date = the date the value represents, not the source's publication date."""
 
 
 def _question_type_guidance(question: QuestionSpec, full: bool = True) -> str:
@@ -401,8 +420,8 @@ def _schema_name(question: QuestionSpec) -> str:
 def _task_steps(question: QuestionSpec) -> str:
     if question.question_type in ("probability", "when"):
         return """Task:
-1. Determine whether any expected target row is already resolved. If an authoritative resolution exists, report it in resolution_values with source and source_date.
-2. Generate forecast rows for every expected date/dimension/quantile listed above. For unresolved rows, these are the model's forecast/probability/timing estimates; for resolved rows, all relevant values should collapse to the resolution value.
+1. Check hard whether any expected target has already resolved (see the resolution guidance) and report it in resolution_values with resolution_status, value, source, and source_date.
+2. Generate forecast rows for every expected date/dimension/quantile listed above. For rows whose target date has resolved, still list the rows but do not craft a distribution — their forecast_value will be ignored/nulled.
 3. Provide structured sources with url, title, and snippet.
 
 Do not return latest official values or current estimates for this question type; those fields are intentionally absent from the output schema."""
@@ -410,8 +429,8 @@ Do not return latest official values or current estimates for this question type
     return """Task:
 1. Find the latest official value for the metric, including date and source. Do not guess. If no exact official value exists, use the closest quasi-official value that the background or resolution criteria clearly point to, and say so in the rationale. Report exactly one last_official_value per dimension: the final figure in the question's own unit. If the metric is derived (e.g. a ratio or per-capita figure), report the computed result, not its separate components. Set date to the date the value represents (the measurement or reporting period), not the source's publication date — same convention as resolution_values.source_date.
 2. Estimate the current value as of the run date: if the question resolved today, what value would you score the forecast against? This may differ from the latest official value and can combine the latest data point, current reporting, and reasonable extrapolation.
-3. For past target dates, report a resolution value only when an authoritative source supports it. If no such value exists, leave it unresolved rather than guessing one.
-4. Generate forecast rows for every expected date/dimension/quantile listed above.
+3. For EACH past target date (value_type="resolution"), check hard for an authoritative value and add a resolution_values entry with resolution_status (resolved/failed), value or best_guess_resolution, source, and source_date (see the resolution guidance).
+4. Generate genuine forecast distributions only for FUTURE target dates. Still list the expected quantile rows for past dates (for completeness), but their forecast_value will be ignored/nulled — put your effort into their resolution_values entry.
 5. Provide structured sources with url, title, and snippet."""
 
 
@@ -430,15 +449,20 @@ def _claude_research(
 ) -> tuple[SurveillanceResponse, list[EvidenceItem]]:
     """Research via Anthropic SDK with server-side web search and adaptive thinking."""
     schema = _research_schema(question)
+    # strict: True makes the API guarantee tool inputs validate against the schema,
+    # eliminating malformed produce_forecast payloads (missing fields, wrong nesting).
+    # Numeric bounds are stripped (unsupported under strict); validate_response enforces them.
     produce_tool = {
         "name": "produce_forecast",
         "description": "Output the structured surveillance forecast.",
-        "input_schema": schema,
+        "strict": True,
+        "input_schema": strict_tool_schema(schema),
     }
     messages = [{"role": "user", "content": prompt}]
     model_id = strip_provider_prefix(model)
 
     timeout_attempt = 0
+    rate_limit_attempt = 0
     search_round = 0
     while True:
         try:
@@ -452,13 +476,13 @@ def _claude_research(
                 **thinking,
             )
         except Exception as e:
-            error_str = str(e).lower()
-            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+            if _is_timeout_error(e) and timeout_attempt < MAX_TIMEOUT_RETRIES:
                 timeout_attempt += 1
                 print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
                 continue
-            if isinstance(e, anthropic.RateLimitError):
-                print("    rate limit; sleeping 60s...")
+            if isinstance(e, anthropic.RateLimitError) and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+                rate_limit_attempt += 1
+                print(f"    rate limit; sleeping 60s (retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
                 time.sleep(60)
                 continue
             raise
@@ -490,8 +514,7 @@ def _claude_research(
         try:
             return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
         except Exception as e:
-            retryable = "EOF while parsing" in str(e) or "expected ident" in str(e) or "validation error" in str(e).lower()
-            if attempt < 3 and retryable:
+            if attempt < 3 and _is_retryable_parse_error(e):
                 print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
                 return _claude_research(question, model, prompt, attempt=attempt + 1, costs=costs, cost_bucket=cost_bucket)
             print(f"    validation error (raw text[:500]): {text[:500]}")
@@ -514,6 +537,7 @@ def _gpt_research(
     extra = {} if test_mode else {"reasoning": {"effort": DEFAULT_REASONING_EFFORT}}
 
     timeout_attempt = 0
+    rate_limit_attempt = 0
     while True:
         try:
             response = openai.OpenAI().responses.create(
@@ -528,13 +552,13 @@ def _gpt_research(
             )
             break
         except Exception as e:
-            error_str = str(e).lower()
-            if ("timeout" in error_str or "timed out" in error_str) and timeout_attempt < MAX_TIMEOUT_RETRIES:
+            if _is_timeout_error(e) and timeout_attempt < MAX_TIMEOUT_RETRIES:
                 timeout_attempt += 1
                 print(f"    timeout retry {timeout_attempt}/{MAX_TIMEOUT_RETRIES}...")
                 continue
-            if isinstance(e, openai.RateLimitError):
-                print("    rate limit; sleeping 60s...")
+            if isinstance(e, openai.RateLimitError) and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+                rate_limit_attempt += 1
+                print(f"    rate limit; sleeping 60s (retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})...")
                 time.sleep(60)
                 continue
             raise
@@ -547,7 +571,7 @@ def _gpt_research(
     try:
         return strict_to_regular_response(text, question.expected_forecasts, question.question_type)
     except Exception as e:
-        if attempt < 3 and ("EOF while parsing" in str(e) or "validation error" in str(e).lower()):
+        if attempt < 3 and _is_retryable_parse_error(e):
             print(f"    parse retry {attempt + 1}/3 ({len(text)} chars): {e}")
             return _gpt_research(question, model, prompt, attempt=attempt + 1, test_mode=test_mode, costs=costs, cost_bucket=cost_bucket)
         print(f"    validation error (raw text[:500]): {text[:500]}")
@@ -634,7 +658,7 @@ def _rc_source_mismatch_rule(question: QuestionSpec) -> str:
         return ""
     src = rc["named_source"]
     return (
-        f"\n6. SOURCE_MISMATCH: The response did not cite {src} (the RC-named primary source) "
+        f"\n6. SOURCE_MISMATCH: The response did not cite {src} (the resolution criteria-named primary source) "
         f"and does not explain why a different source is a better fit. Only flag if the rationale "
         f"had a feasible path to {src} but chose a secondary or unofficial substitute instead."
     )
@@ -985,6 +1009,7 @@ def refine_with_browser(
     prompt = f"""Update the surveillance response with new browser-extracted data.
 
 Question: {question.name}
+Run date: {datetime.now(timezone.utc).date().isoformat()}
 Background: {question.prompt}
 
 {evidence_plan_summary}
@@ -1022,8 +1047,9 @@ Instructions:
 - If the browser data only shows that a dashboard does not expose the needed value, say so in the rationale and keep the original forecast distribution unless it was directly contradicted.
 - If the browser data successfully extracts the needed value, update the affected official/current/resolution values and rewrite the rationale so it no longer claims that value was unreadable, unavailable, or only inferable from stale/secondary sources.
 - Return exactly the expected rows. The system assigns value_type from those rows.
-- Use -999 only when no defensible estimate is possible.
+- Set a value to null only when no defensible estimate is possible.
 - When incorporating browser data: match the question's period, unit, and scope; for derived or aggregate metrics, compute using the method the resolution criteria specifies; do not assert values the browser page does not explicitly state.
+- Do not anchor on existing LEAP forecasts. If the browser content or original sources include a LEAP Wave report or forecastingresearch.org page, do not use it as a source, official value, or anchor for any estimate.
 
 {_rationale_requirements(question)}"""
 
@@ -1034,7 +1060,7 @@ Instructions:
 
     try:
         if provider_for_model(model) == "anthropic":
-            produce_tool = {"name": "produce_forecast", "description": "Output the refined surveillance forecast.", "input_schema": schema}
+            produce_tool = {"name": "produce_forecast", "description": "Output the refined surveillance forecast.", "strict": True, "input_schema": strict_tool_schema(schema)}
             response = anthropic.Anthropic().messages.create(
                 model=model_id,
                 max_tokens=64000,

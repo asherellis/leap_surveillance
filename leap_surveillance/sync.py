@@ -38,10 +38,13 @@ def _load_run_data(run_id: str) -> dict | None:
         return None
 
 
-def _write_run_items(run_id: str, items: list[dict]) -> None:
+def _write_run_items(run_id: str, items: list[dict]) -> int:
+    """Write one run's reviewed rows to the three BQ tables. Returns the number of failed writes."""
     run_data = _load_run_data(run_id)
     if run_data is None:
-        return
+        return 1
+
+    failures = 0
 
     try:
         base_stats = write_to_dim_baseline(run_data, items)
@@ -50,6 +53,7 @@ def _write_run_items(run_id: str, items: list[dict]) -> None:
         else:
             print(f"BigQuery dim_baseline ({run_id}): no rows")
     except Exception as e:
+        failures += 1
         print(f"BigQuery dim_baseline write failed ({run_id}): {e}")
 
     try:
@@ -59,6 +63,7 @@ def _write_run_items(run_id: str, items: list[dict]) -> None:
         else:
             print(f"BigQuery fact_resolution ({run_id}): no rows written")
     except Exception as e:
+        failures += 1
         print(f"BigQuery fact_resolution write failed ({run_id}): {e}")
 
     try:
@@ -68,10 +73,13 @@ def _write_run_items(run_id: str, items: list[dict]) -> None:
         else:
             print(f"BigQuery surveillance_result ({run_id}): no rows")
     except Exception as e:
+        failures += 1
         print(f"BigQuery surveillance_result write failed ({run_id}): {e}")
 
+    return failures
 
-def cmd_sync(args) -> None:
+
+def cmd_sync(args) -> int:
     all_items, _ = get_reviewed_items(DEFAULT_SHEET_ID, tab_name=args.tab, reviewed_only=False)
     reviewed_count = sum(1 for r in all_items if r.get("reviewed"))
     rlov_count = sum(1 for r in all_items if r.get("review_last_official_value") not in (None, ""))
@@ -80,17 +88,23 @@ def cmd_sync(args) -> None:
 
     if not all_items:
         print("Nothing to sync.")
-        return
+        return 0
 
     _print_sheet_rows(all_items)
 
     if args.no_bq:
         print(f"\n{len(all_items)} rows. Re-run without --no-bq to write to BQ.")
-        return
+        return 0
 
     by_run: dict[str, list[dict]] = {}
     for item in all_items:
         by_run.setdefault(item.get("run_id", ""), []).append(item)
 
+    total_failures = 0
     for run_id, items in by_run.items():
-        _write_run_items(run_id, items)
+        total_failures += _write_run_items(run_id, items)
+
+    if total_failures:
+        print(f"\nsync finished with {total_failures} failed BigQuery write(s) — re-run after fixing; writes are idempotent MERGEs.")
+        return 1
+    return 0

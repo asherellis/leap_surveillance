@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import os
 import re
+import socket
 import threading
 from urllib.parse import urlparse
 
@@ -81,15 +82,22 @@ def is_safe_url(url: str) -> tuple[bool, str]:
         if host in ("localhost", "127.0.0.1", "::1"):
             return False, "Localhost blocked"
 
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
-                return False, f"Private/reserved IP blocked: {host}"
-        except ValueError:
-            pass
+        if host == "metadata.google.internal" or host.endswith(".internal"):
+            return False, "Internal hostname blocked"
 
-        if host == "metadata.google.internal":
-            return False, "Metadata endpoint blocked"
+        # Resolve hostnames and check EVERY resolved address — a public-looking hostname
+        # can point at 127.0.0.1 / 169.254.169.254 / RFC1918 (SSRF via DNS).
+        try:
+            ips = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, None)
+                ips = [ipaddress.ip_address(info[4][0]) for info in infos]
+            except (OSError, ValueError):
+                return False, f"Hostname does not resolve: {host}"
+        for ip in ips:
+            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                return False, f"Private/reserved IP blocked: {host} -> {ip}"
 
         return True, ""
     except Exception as e:
@@ -137,7 +145,9 @@ def browser_extract(
 ) -> BrowserEvidence:
     """Drive Chromium via browser-use to extract `objective` from `url`."""
     # Download files can't be navigated or read by the browser agent.
-    if any(url.lower().endswith(ext) for ext in (".pdf", ".zip", ".xlsx", ".xls", ".csv")):
+    # Check the URL *path* so query strings (report.csv?dl=1) don't slip through.
+    url_path = urlparse(url).path.lower()
+    if any(url_path.endswith(ext) for ext in (".pdf", ".zip", ".xlsx", ".xls", ".csv")):
         return BrowserEvidence(
             url=url,
             objective=objective,
@@ -206,7 +216,10 @@ def browser_extract(
         extracted = getattr(result, "final_result", lambda: None)() or ""
 
         unusable_reason = _unusable_extraction_reason(extracted)
-        if unusable_reason or '"error":' in extracted:
+        # Only treat '"error":' as an agent error payload when the extraction IS a JSON blob,
+        # not when a legitimate page's text merely contains that substring.
+        looks_like_error_payload = extracted.lstrip().startswith("{") and '"error":' in extracted
+        if unusable_reason or looks_like_error_payload:
             return BrowserEvidence(
                 url=url,
                 objective=objective,

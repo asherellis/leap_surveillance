@@ -129,6 +129,12 @@ class ValueType(str, Enum):
     resolution = "resolution"
 
 
+class ResolutionStatus(str, Enum):
+    resolved = "resolved"      # authoritative value found
+    failed = "failed"          # resolution date passed, no value findable (date-based only)
+    unresolved = "unresolved"  # not resolved and not failed (e.g. timing event not yet occurred)
+
+
 class OfficialValue(BaseModel):
     dimension: str
     value: Optional[float]
@@ -149,6 +155,8 @@ class ResolutionValue(BaseModel):
     source_date: str
     source: str
     confidence: int = Field(ge=0, le=100)
+    resolution_status: str = "unresolved"          # resolved / failed / unresolved
+    best_guess_resolution: Optional[float] = None   # model estimate when value is unavailable
 
 
 class ForecastValue(BaseModel):
@@ -173,7 +181,7 @@ class SurveillanceResponse(BaseModel):
 class StrictOfficialValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
-    value: float
+    value: Optional[float]   # null when no official value is available (no -999 sentinel)
     date: str
     source: str
 
@@ -181,7 +189,7 @@ class StrictOfficialValue(BaseModel):
 class StrictCurrentValue(BaseModel):
     model_config = STRICT_CONFIG
     dimension: str
-    value: float
+    value: Optional[float]   # null when no current estimate is available (no -999 sentinel)
     confidence: int = Field(ge=0, le=100)
 
 
@@ -189,7 +197,9 @@ class StrictResolutionValue(BaseModel):
     model_config = STRICT_CONFIG
     forecast_date: str
     dimension: str
-    value: float
+    resolution_status: ResolutionStatus
+    value: Optional[float]                   # authoritative value; null when none was found
+    best_guess_resolution: Optional[float]   # only set for a "failed" resolution; null otherwise
     source_date: str
     source: str
     confidence: int = Field(ge=0, le=100)
@@ -200,7 +210,7 @@ class StrictForecastValue(BaseModel):
     forecast_date: str
     dimension: str
     quantile: int
-    forecast_value: float
+    forecast_value: Optional[float]   # null when no estimate is possible (no -999 sentinel)
     color_code: ColorCode
 
 
@@ -247,6 +257,8 @@ def make_strict_schema(
         if "properties" in obj:
             obj["additionalProperties"] = False
             obj["required"] = list(obj["properties"].keys())
+        # The generic recursion below also descends into "$defs" (it's a dict value),
+        # so no separate $defs pass is needed.
         for value in obj.values():
             if isinstance(value, dict):
                 fix_schema(value)
@@ -254,9 +266,6 @@ def make_strict_schema(
                 for item in value:
                     if isinstance(item, dict):
                         fix_schema(item)
-        if "$defs" in obj:
-            for def_schema in obj["$defs"].values():
-                fix_schema(def_schema)
         return obj
 
     schema = fix_schema(schema)
@@ -280,16 +289,64 @@ def make_strict_schema(
             if "dimension" in props:
                 props["dimension"]["enum"] = allowed_dimensions
     if unit_min is not None or unit_max is not None:
-        fv_prop = properties.get("forecast_value", {})
+        # forecast_value is nullable (anyOf [number, null]); apply bounds to the number branch,
+        # not the anyOf wrapper, so a null value is still allowed but non-null values are bounded.
+        fv_num = _numeric_branch(properties.get("forecast_value", {}))
         if unit_min is not None:
-            fv_prop["minimum"] = unit_min
+            fv_num["minimum"] = unit_min
         if unit_max is not None:
-            fv_prop["maximum"] = unit_max
+            fv_num["maximum"] = unit_max
     return schema
 
 
-def _convert_sentinel_value(v: float) -> Optional[float]:
+def _numeric_branch(prop: dict) -> dict:
+    """Return the sub-schema that carries the numeric type, unwrapping an Optional's anyOf."""
+    for sub in prop.get("anyOf", []):
+        if sub.get("type") == "number":
+            return sub
+    return prop
+
+
+_STRICT_UNSUPPORTED_KEYS = (
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "minItems", "maxItems",
+)
+
+
+def strict_tool_schema(schema: dict) -> dict:
+    """Deep-copied schema safe for Anthropic strict tool use.
+
+    Strict tool use guarantees tool inputs validate exactly against input_schema, but does
+    not support numeric/string bound constraints — strip them (bounds are still enforced
+    post-hoc by validate_response and stated in the prompt).
+    """
+    import copy
+
+    def strip(obj):
+        if isinstance(obj, dict):
+            for key in _STRICT_UNSUPPORTED_KEYS:
+                obj.pop(key, None)
+            for value in obj.values():
+                strip(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                strip(item)
+
+    cleaned = copy.deepcopy(schema)
+    strip(cleaned)
+    return cleaned
+
+
+def _convert_sentinel_value(v: Optional[float]) -> Optional[float]:
+    # Value fields are now nullable, so the model emits null directly. This stays only as a
+    # defensive backstop for a stray legacy -999.
     return None if v == -999 else v
+
+
+def _resolution_status_str(rv) -> str:
+    """Normalize a resolution entry's status (enum or str) to a plain string."""
+    status = getattr(rv, "resolution_status", "unresolved")
+    return getattr(status, "value", status) or "unresolved"
 
 
 def strict_to_regular_response(
@@ -315,9 +372,9 @@ def strict_to_regular_response(
         (e.forecast_date, e.dimension, e.quantile): e.value_type
         for e in expected_forecasts or []
     }
+    strict_resolutions = getattr(strict, "resolution_values", [])
     resolution_by_key = {
-        (rv.forecast_date, rv.dimension): _convert_sentinel_value(rv.value)
-        for rv in strict.resolution_values
+        (rv.forecast_date, rv.dimension): rv for rv in strict_resolutions
     }
     expected_date_dim_keys = {
         (e.forecast_date, e.dimension)
@@ -328,10 +385,12 @@ def strict_to_regular_response(
     for fv in strict.forecasts:
         key = (fv.forecast_date, fv.dimension, fv.quantile)
         value_type = ValueType(expected_value_types.get(key, "forecast"))
-        resolution_value = resolution_by_key.get((fv.forecast_date, fv.dimension))
-        if value_type == ValueType.resolution and resolution_value is not None:
-            forecast_value = resolution_value
-            color_code = ColorCode.black
+        if value_type == ValueType.resolution:
+            # No forecast distribution on a past date — the value lives in resolution_values.
+            forecast_value = None
+            rv = resolution_by_key.get((fv.forecast_date, fv.dimension))
+            resolved = rv is not None and _resolution_status_str(rv) == "resolved"
+            color_code = ColorCode.black if resolved else fv.color_code
         else:
             forecast_value = _convert_sentinel_value(fv.forecast_value)
             color_code = fv.color_code
@@ -372,8 +431,11 @@ def strict_to_regular_response(
                 source_date=rv.source_date,
                 source=rv.source,
                 confidence=rv.confidence,
+                resolution_status=_resolution_status_str(rv),
+                best_guess_resolution=_convert_sentinel_value(getattr(rv, "best_guess_resolution", None))
+                if getattr(rv, "best_guess_resolution", None) is not None else None,
             )
-            for rv in strict.resolution_values
+            for rv in strict_resolutions
             if expected_forecasts is None
             or (rv.forecast_date, rv.dimension) in expected_date_dim_keys
         ],
@@ -435,6 +497,9 @@ def validate_response(
 
     if expected:
         expected_keys = {(e.forecast_date, e.dimension) for e in expected}
+        expected_resolution_keys = {
+            (e.forecast_date, e.dimension) for e in expected if e.value_type == "resolution"
+        }
         forecast_keys = {(f.forecast_date, f.dimension) for f in response.forecasts}
         missing_keys = expected_keys - forecast_keys
         if missing_keys:
@@ -449,7 +514,8 @@ def validate_response(
                 for f in response.forecasts
                 if f.quantile == 50 and f.forecast_value is not None
             }
-            missing_q50s = expected_keys - q50s
+            # Resolution rows intentionally null their q50 (the value lives in resolution_values).
+            missing_q50s = expected_keys - q50s - expected_resolution_keys
             if missing_q50s:
                 issues.append(f"missing_{len(missing_q50s)}_q50s")
 
@@ -470,19 +536,20 @@ def validate_response(
             if target_date and source_date and source_date > target_date:
                 issues.append(f"resolution_source_after_target_{r.forecast_date}_{r.dimension}")
 
-        expected_resolution_keys = {
-            (e.forecast_date, e.dimension) for e in expected if e.value_type == "resolution"
-        }
         if expected_resolution_keys:
+            # A resolution row counts as returned if it carries an authoritative value OR a best guess.
             returned_resolution_keys = {
-                (r.forecast_date, r.dimension) for r in response.resolution_values if r.value is not None
+                (r.forecast_date, r.dimension) for r in response.resolution_values
+                if r.value is not None or r.best_guess_resolution is not None
             }
             missing_resolutions = expected_resolution_keys - returned_resolution_keys
             if missing_resolutions:
                 issues.append(f"missing_{len(missing_resolutions)}_resolution_values")
 
-    null_count = sum(1 for f in response.forecasts if f.forecast_value is None)
-    if null_count > len(response.forecasts) // 2:
+    # Nulls on resolution rows are expected (no forecast on a past date); only count forecast rows.
+    forecast_rows = [f for f in response.forecasts if getattr(f.value_type, "value", f.value_type) != "resolution"]
+    null_count = sum(1 for f in forecast_rows if f.forecast_value is None)
+    if forecast_rows and null_count > len(forecast_rows) // 2:
         issues.append(f"{null_count}_null_values")
 
     if unit_min is not None or unit_max is not None:
@@ -524,6 +591,20 @@ def validate_response(
             if f.forecast_value is not None:
                 black_groups[key].append(f.forecast_value)
 
+    # A failed/unresolved resolution row legitimately isn't black (no authoritative value),
+    # and its (nulled) quantile colors carry no meaning — exempt those groups from the
+    # color-consistency checks below.
+    resolution_status_by_key = {
+        (r.forecast_date, r.dimension): (r.resolution_status or "unresolved")
+        for r in response.resolution_values
+    }
+    unresolved_resolution_keys = {
+        (f.forecast_date, f.dimension)
+        for f in response.forecasts
+        if getattr(f.value_type, "value", f.value_type) == "resolution"
+        and resolution_status_by_key.get((f.forecast_date, f.dimension), "unresolved") in ("failed", "unresolved")
+    }
+
     for key, values in black_groups.items():
         if len({round(v, 12) for v in values}) > 1:
             issues.append(f"black_quantiles_differ_{key[0]}_{key[1]}")
@@ -531,13 +612,15 @@ def validate_response(
         if key not in resolution_keys:
             issues.append(f"black_without_resolution_value_{key[0]}_{key[1]}")
     for key, colors in group_colors.items():
-        if len(colors) > 1:
+        if len(colors) > 1 and key not in unresolved_resolution_keys:
             issues.append(f"mixed_colors_{key[0]}_{key[1]}_{'/'.join(sorted(colors))}")
 
     seen_resolution_not_black: set[tuple] = set()
     for f in response.forecasts:
         if getattr(f.value_type, "value", f.value_type) == "resolution" and f.color_code.value != "black":
             key = (f.forecast_date, f.dimension)
+            if resolution_status_by_key.get(key, "unresolved") in ("failed", "unresolved"):
+                continue
             if key not in seen_resolution_not_black:
                 seen_resolution_not_black.add(key)
                 issues.append(f"resolution_not_black_{f.forecast_date}_{f.dimension}")

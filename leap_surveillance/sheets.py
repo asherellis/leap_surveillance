@@ -1,5 +1,6 @@
 """Google Sheets review UI for LEAP surveillance."""
 
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from .common import (
     enum_value,
     is_empty,
     make_review_group_id,
-    resolution_status,
+    row_resolution_status,
     safe_str,
 )
 from .storage import context_maps, pick_by_dimension
@@ -48,7 +49,7 @@ _REVIEWER_COLS = [
     "reviewed_question_resolution_status", "reviewed_question_resolution_value",
     "review_source", "review_color", "review_notes", "reviewed",
 ]
-_SYNC_COLS = ["review_row_id", "group_question_id", "question_id", "run_id"]
+_SYNC_COLS = ["review_row_id", "group_question_id", "question_id", "surveillance_timestamp"]
 
 
 def _interleaved_model_cols() -> list[str]:
@@ -89,7 +90,7 @@ INSTRUCTIONS_CONTENT = [
     ["Model columns", "--both mode has GPT/Claude interleaved pairs. Forecast values come first, then official/current values and sources, then diagnostics."],
     ["Consensus/stability", "Model agreement, q50 delta, run stability, runs seen, confidence tier, value-change flags."],
     ["Reviewer columns", "Fill these in."],
-    ["Sync IDs", "review_row_id, group_question_id, question_id, run_id — leave alone."],
+    ["Sync IDs", "review_row_id, group_question_id, question_id, surveillance_timestamp — leave alone."],
     [""],
     ["Key columns"],
     ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
@@ -173,10 +174,10 @@ INSTRUCTIONS_CONTENT = [
     ["review_color", "Color override. Same options as gpt_color/claude_color."],
     ["review_notes", "Free-text notes."],
     ["reviewed", "Tick when done with your review. All rows sync regardless — reviewed rows carry human values, unreviewed rows carry model projections."],
-    ["review_row_id", "Stable Sheet row ID: run_id + group_question_id + target_date + dimension."],
+    ["review_row_id", "Stable Sheet row ID: surveillance_timestamp + group_question_id + target_date + dimension."],
     ["group_question_id", "BigQuery ID for the question group (dim_question_group)."],
     ["question_id", "BigQuery ID for the date/dimension question row (dim_question)."],
-    ["run_id", "Unique identifier for this pipeline run. Matches the tab name suffix."],
+    ["surveillance_timestamp", "UTC timestamp of this pipeline run (YYYYMMDD_HHMMSS). Matches the tab name suffix; sync uses it to locate the run's JSON."],
 ]
 
 
@@ -285,9 +286,16 @@ def _needs_review(
     return "FALSE"
 
 
+_RUN_TAB_RE = re.compile(r"^run_\d{8}_\d{6}$")
+
+
 def _latest_run_tab(sheet):
-    """Return the latest run_* worksheet, or None."""
-    run_tabs = [ws for ws in sheet.worksheets() if ws.title.startswith(RUN_TAB_PREFIX)]
+    """Return the latest run_YYYYMMDD_HHMMSS worksheet, or None.
+
+    Strict format match: a manual tab like run_backup would otherwise sort after every
+    timestamped tab ('b' > '2') and silently become "latest" for sync.
+    """
+    run_tabs = [ws for ws in sheet.worksheets() if _RUN_TAB_RE.match(ws.title)]
     if not run_tabs:
         return None
     return max(run_tabs, key=lambda ws: ws.title)
@@ -479,7 +487,7 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
 
             # Driving color for the status column: prefer GPT, fall back to Claude.
             display_color = gpt_row.get("color") or claude_row.get("color") or ""
-            row_status = resolution_status(fdate, display_color)
+            row_status = row_resolution_status(fdate, display_color)
             resolution_fields = _question_resolution_fields(row_status, gpt_row, claude_row)
 
             row_diff = row_diff_by_key.get((fdate, dim)) or {}
@@ -568,7 +576,7 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "review_row_id": review_row_id,
                 "group_question_id": group_question_id,
                 "question_id": dim_question_id,
-                "run_id": run_id,
+                "surveillance_timestamp": run_id,
             }
             rows.append([row.get(h, "") for h in headers])
 
@@ -906,7 +914,8 @@ def get_reviewed_items(
         else:
             reviewed = str(reviewed_raw).strip().lower() in ("true", "1", "yes")
 
-        run_id = row.get("run_id", "")
+        # New tabs use surveillance_timestamp; older tabs still carry run_id — read both.
+        run_id = safe_str(row.get("surveillance_timestamp") or row.get("run_id", "")).strip()
         group_question_id = safe_str(row.get("group_question_id") or row.get("question_id", "")).strip()
         target_date = row.get("target_date", "")
         dimension = row.get("dimension", "Overall") or "Overall"
@@ -922,7 +931,7 @@ def get_reviewed_items(
         items.append({
             "review_row_id": review_row_id,
             "group_question_id": group_question_id,
-            "run_id": row.get("run_id"),
+            "run_id": run_id,  # internal key stays run_id so sync.py grouping/file lookup is untouched
             "question_id": row.get("question_id"),
             "question_name": row.get("question_name"),
             "target_date": row.get("target_date"),

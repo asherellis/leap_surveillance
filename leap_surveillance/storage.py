@@ -23,7 +23,7 @@ from .common import (
     WHEN_TOLERANCE_YR,
     enum_value,
     is_empty,
-    resolution_status,
+    row_resolution_status,
     within_relative_tolerance,
 )
 
@@ -105,8 +105,7 @@ def _forecast_output_row(
     current_value = pick_by_dimension(current, dim, single_dim)
     resolution_value = resolution.get((forecast_date, dim)) or resolution.get((forecast_date, "Overall")) or {}
     # Route by whether the row resolved (black), not by date — past-dated unresolved rows are still gray estimates.
-    color = forecast.get("color_code", "")
-    is_resolved = getattr(color, "value", color) == "black"
+    is_resolved = enum_value(forecast.get("color_code", "")) == "black"
     target_value_type = "resolution" if is_resolved else "forecast"
     forecast_value = forecast.get("forecast_value", "")
     if is_resolved:
@@ -128,7 +127,7 @@ def _forecast_output_row(
         "forecast_target_value": forecast_target_value,
         "resolution_target_value": resolution_target_value,
         "color_code": forecast.get("color_code", ""),
-        "resolution_status": resolution_status(forecast_date, forecast.get("color_code", "")),
+        "resolution_status": row_resolution_status(forecast_date, forecast.get("color_code", "")),
         "resolution_source_date": resolution_value.get("source_date", ""),
         "resolution_source": resolution_value.get("source", ""),
         "current_estimate_value": current_value.get("value", ""),
@@ -317,8 +316,14 @@ def _adequate_q50s(model_block: dict):
             yield fc.get("forecast_date", ""), fc.get("dimension", "Overall"), fc.get("forecast_value"), color
 
 
+_history_cache: dict[tuple, list] = {}  # both enrichers read the same history; parse it once per run
+
+
 def _read_production_history(output_dir: str, current_models: dict, current_run_id: str) -> list[dict]:
     """Most-recent prior runs whose models match the current production models, oldest→newest."""
+    cache_key = (output_dir, current_run_id, tuple(sorted(current_models.items())))
+    if cache_key in _history_cache:
+        return _history_cache[cache_key]
     files = sorted(Path(output_dir).glob("run_*.json"), reverse=True)
     runs: list[dict] = []
     for path in files[:_STABILITY_SCAN_CAP]:
@@ -336,6 +341,7 @@ def _read_production_history(output_dir: str, current_models: dict, current_run_
         if any(m and models.get(tag) == m for tag, m in current_models.items()):
             runs.append(run)
     runs.reverse()
+    _history_cache[cache_key] = runs
     return runs
 
 
@@ -400,12 +406,17 @@ def enrich_with_value_changes(run_data: dict, output_dir: str) -> dict:
     current_run_id = run_data.get("run_id", "")
 
     prior_runs = _read_production_history(output_dir, current_models, current_run_id)
-    if not prior_runs:
+    # Compare GPT against GPT's own production history: history admits a run if ANY tag
+    # matched, so filter to runs whose gpt model equals the current one (same semantics as
+    # the per-tag filter in enrich_with_run_stability's ingest).
+    current_gpt = current_models.get("gpt")
+    gpt_prior_runs = [r for r in prior_runs if current_gpt and (r.get("models") or {}).get("gpt") == current_gpt]
+    if not gpt_prior_runs:
         for q in run_data.get("questions", []):
             q["value_changed"] = False
         return run_data
 
-    prior_run = prior_runs[-1]  # most recent prior run
+    prior_run = gpt_prior_runs[-1]  # most recent prior run with the same GPT model
     prior_by_id: dict[str, dict] = {q.get("id", ""): q for q in prior_run.get("questions", [])}
 
     for q in run_data.get("questions", []):
@@ -421,8 +432,9 @@ def enrich_with_value_changes(run_data: dict, output_dir: str) -> dict:
         prior_official, prior_current, _ = context_maps((prior_gpt.get("response") or {}))
 
         changed = False
-        all_dims = set(curr_official) | set(curr_current) | {"Overall"}
-        single = len({d for d in curr_official} | {d for d in curr_current}) <= 1
+        # Include prior-run dims so a value that disappeared since last run also flags a change.
+        all_dims = set(curr_official) | set(curr_current) | set(prior_official) | set(prior_current) | {"Overall"}
+        single = len(set(curr_official) | set(curr_current)) <= 1
         for dim in all_dims:
             c_lov = pick_by_dimension(curr_official, dim, single).get("value")
             p_lov = pick_by_dimension(prior_official, dim, single).get("value")
@@ -460,7 +472,7 @@ def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
                 if key in seen:
                     continue
                 seen.add(key)
-                if resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
+                if row_resolution_status(f.forecast_date, f.color_code) == "due_unresolved":
                     due_unresolved += 1
         any_inadequate = False
         for tag, model_result in (per_model or {}).items():
@@ -493,7 +505,7 @@ def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
 
 def write_json_output(run_data: dict, output_dir: str) -> str:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    path = Path(output_dir) / f"run_{run_data['run_id']}.json"
+    path = Path(output_dir) / f"run_{run_data.get('run_id', '')}.json"
     with open(path, "w") as f:
         json.dump(run_data, f, indent=2, default=str)
     return str(path)
@@ -533,8 +545,11 @@ def write_csv_output(run_id, questions, per_model_lists, output_dir):
     if not rows:
         return None
     path = Path(output_dir) / f"run_{run_id}.csv"
+    # Union of all row keys: rows are heterogeneous (validation fields are conditional),
+    # so fieldnames=rows[0].keys() would crash order-dependently on mixed data.
+    fieldnames = list(dict.fromkeys(k for r in rows for k in r))
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows)
     return str(path)
@@ -705,6 +720,15 @@ def _try_merge_bigquery_rows(
         return None
 
 
+def _q50_forecast(model_block: dict | None, fdate: str, dim: str) -> dict | None:
+    """The q50 forecast row for (fdate, dim) in one serialized model block, or None."""
+    for fc in ((model_block or {}).get("response") or {}).get("forecasts", []) or []:
+        if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
+            if (fc.get("dimension", "Overall") or "Overall") == dim:
+                return fc
+    return None
+
+
 def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = None):
     """Write resolved/projected target-date values to fact.fact_resolution."""
     now = datetime.now(timezone.utc)
@@ -722,25 +746,19 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
             review_color = review_color.strip().lower().replace(" ", "_")
             return review_color
         for tag in ("gpt", "claude"):
-            for fc in (per_model.get(tag) or {}).get("response", {}).get("forecasts", []):
-                if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
-                    if (fc.get("dimension", "Overall") or "Overall") == dim:
-                        return enum_value(fc.get("color_code"))
+            fc = _q50_forecast(per_model.get(tag), fdate, dim)
+            if fc is not None:
+                return enum_value(fc.get("color_code"))
         return None
 
     def black_q50_avg(per_model: dict, fdate: str, dim: str) -> float | None:
         vals = []
         for block in per_model.values():
-            for fc in (block.get("response") or {}).get("forecasts", []):
-                if fc.get("quantile") != 50 or fc.get("forecast_date") != fdate:
-                    continue
-                if (fc.get("dimension", "Overall") or "Overall") != dim:
-                    continue
-                c = enum_value(fc.get("color_code"))
-                if c == "black":
-                    v = fc.get("forecast_value")
-                    if v is not None:
-                        vals.append(float(v))
+            fc = _q50_forecast(block, fdate, dim)
+            if fc is not None and enum_value(fc.get("color_code")) == "black":
+                v = _safe_float_or_none(fc.get("forecast_value"))
+                if v is not None:
+                    vals.append(v)
         return sum(vals) / len(vals) if vals else None
 
     def model_resolution_source(per_model: dict, fdate: str, dim: str) -> tuple[str, date | None]:
@@ -761,9 +779,13 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
         dim_q_map = q.get("dim_question_map") or {}
 
         for key, dq_id in dim_q_map.items():
+            if "|" not in key:
+                print(f"  warning: malformed dim_question_map key '{key}' (no '|'); skipping")
+                continue
             fdate, dim = key.split("|", 1)
             if fdate == TIMING_FORECAST_DATE:
                 continue
+            fdate_date = _parse_date_or_none(fdate)  # fallback resolution_date; None if key is non-ISO
 
             item = item_map.get((group_qid, fdate, dim))
             color = effective_color(item, per_model, fdate, dim)
@@ -783,10 +805,10 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
                 value = reviewed_value
                 source = (item or {}).get("review_source") or "surveillance_reviewed"
                 resolution_status_value = "projected" if reviewed_status == "projected" else "confirmed"
-                resolved_at = now if resolution_status_value in ("resolved", "confirmed") else None
+                resolved_at = now if resolution_status_value == "confirmed" else None
                 resolution_date = (
                     _parse_date_or_none((item or {}).get("question_resolution_source_date"))
-                    or date.fromisoformat(fdate)
+                    or fdate_date
                 )
             elif system_value is not None:
                 value = system_value
@@ -795,7 +817,7 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
                 resolved_at = None
                 resolution_date = (
                     _parse_date_or_none((item or {}).get("question_resolution_source_date"))
-                    or date.fromisoformat(fdate)
+                    or fdate_date
                 )
             else:
                 value = black_q50_avg(per_model, fdate, dim)
@@ -804,7 +826,11 @@ def write_accepted_to_fact_resolution(run_data: dict, all_items: list | None = N
                 source, source_date = model_resolution_source(per_model, fdate, dim)
                 resolution_status_value = "projected"
                 resolved_at = None
-                resolution_date = source_date or date.fromisoformat(fdate)
+                resolution_date = source_date or fdate_date
+
+            if resolution_date is None:
+                print(f"  warning: no parseable resolution date for '{key}'; skipping")
+                continue
 
             rows.append({
                 "question_id": dq_id,
@@ -908,19 +934,12 @@ def write_to_surveillance_result(run_data: dict, all_sheet_rows: list[dict]):
         sheet_map[key] = item
 
     def q50_for(per_model: dict, model: str, fdate: str, dim: str) -> float | None:
-        for fc in (per_model.get(model) or {}).get("response", {}).get("forecasts", []):
-            if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
-                if (fc.get("dimension", "Overall") or "Overall") == dim:
-                    v = fc.get("forecast_value")
-                    return float(v) if v is not None else None
-        return None
+        fc = _q50_forecast(per_model.get(model), fdate, dim)
+        return _safe_float_or_none(fc.get("forecast_value")) if fc is not None else None
 
     def color_for(per_model: dict, model: str, fdate: str, dim: str) -> str | None:
-        for fc in (per_model.get(model) or {}).get("response", {}).get("forecasts", []):
-            if fc.get("quantile") == 50 and fc.get("forecast_date") == fdate:
-                if (fc.get("dimension", "Overall") or "Overall") == dim:
-                    return enum_value(fc.get("color_code"))
-        return None
+        fc = _q50_forecast(per_model.get(model), fdate, dim)
+        return enum_value(fc.get("color_code")) if fc is not None else None
 
     rows = []
     for q in run_data.get("questions", []):
@@ -930,6 +949,9 @@ def write_to_surveillance_result(run_data: dict, all_sheet_rows: list[dict]):
         dim_q_map = q.get("dim_question_map") or {}
 
         for key, dq_id in dim_q_map.items():
+            if "|" not in key:
+                print(f"  warning: malformed dim_question_map key '{key}' (no '|'); skipping")
+                continue
             fdate, dim = key.split("|", 1)
             is_timing = fdate == TIMING_FORECAST_DATE
             sheet = sheet_map.get((group_qid, fdate, dim)) or {}
