@@ -111,7 +111,7 @@ INSTRUCTIONS_CONTENT = [
     ["has_current_value", "TRUE if a current-day estimate exists for this question."],
     ["value_has_changed", "TRUE if either model's last official value or current estimate changed since the prior run. Blank on the first run."],
     ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
-    ["review_last_official_value", "Human-verified last official value. Fill from Task 1 or manual lookup."],
+    ["review_last_official_value", "Human-verified last official value, from the cited source or a manual lookup."],
     ["review_current_value", "Human-verified current value as of the run date."],
     ["reviewed_question_resolution_status", "Human-verified resolution status: open / resolved / failed_to_resolve / projected."],
     ["reviewed_question_resolution_value", "Human-verified value at the question's resolution date. Use this for black/resolved rows instead of review_last_official_value."],
