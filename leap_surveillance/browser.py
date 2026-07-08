@@ -1,6 +1,7 @@
 """Chromium navigation via browser-use: URL safety checks and page extraction."""
 
 import asyncio
+from datetime import datetime
 import ipaddress
 import os
 import re
@@ -16,6 +17,7 @@ from .models import BrowserEvidence
 
 BROWSER_TIMEOUT = _env_float("LEAP_BROWSER_TIMEOUT", 180.0)
 MAX_BROWSER_STEPS = _env_int("LEAP_BROWSER_MAX_STEPS", 15)
+WAYBACK_MAX_DRIFT_DAYS = _env_int("LEAP_WAYBACK_MAX_DRIFT_DAYS", 45)
 BROWSER_EVIDENCE_LIMIT = _env_int("LEAP_BROWSER_EVIDENCE_LIMIT", 4000)
 
 # Each browser-use Agent spawns a Chromium process, so cap concurrency across worker threads.
@@ -120,10 +122,19 @@ def wayback_snapshot(url: str, target_date: str) -> BrowserEvidence:
         avail = requests.get(
             "http://archive.org/wayback/available", params={"url": url, "timestamp": ts}, timeout=20
         ).json()
-        snap_url = ((avail.get("archived_snapshots") or {}).get("closest") or {}).get("url")
+        closest = (avail.get("archived_snapshots") or {}).get("closest") or {}
+        snap_url = closest.get("url")
         if not snap_url:
             return BrowserEvidence(url=url, objective=f"wayback {target_date}", extracted_text="",
                                    success=False, error="No Wayback snapshot near target date")
+        # A far-off capture shows the wrong period's value, which is worse than no snapshot.
+        try:
+            drift = abs((datetime.strptime(closest.get("timestamp", "")[:8], "%Y%m%d") - datetime.strptime(ts, "%Y%m%d")).days)
+        except (ValueError, TypeError):
+            drift = None
+        if drift is not None and drift > WAYBACK_MAX_DRIFT_DAYS:
+            return BrowserEvidence(url=snap_url, objective=f"wayback {target_date}", extracted_text="",
+                                   success=False, error=f"Nearest snapshot is {drift} days off the target date")
         for fetch_url in (f"https://r.jina.ai/{snap_url}", snap_url):
             r = requests.get(fetch_url, timeout=30,
                              headers={"Accept": "text/markdown", "X-Return-Format": "markdown"})
