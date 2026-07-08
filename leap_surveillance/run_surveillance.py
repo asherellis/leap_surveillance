@@ -43,6 +43,7 @@ from .sheets import (
     run_tab_name,
     publish_to_sheet,
     setup_sheet,
+    write_review_csv,
 )
 from .sync import cmd_sync
 from .questions import load_questions
@@ -574,6 +575,9 @@ def cmd_run(args):
             print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}'")
         except Exception as e:
             print(f"Sheet publishing failed: {e}")
+    else:
+        review_path = write_review_csv(run_data, DEFAULT_OUTPUT_DIR)
+        print(f"Sheet skipped; review rows written to {review_path}")
 
 
 def cmd_setup(args):
@@ -610,7 +614,11 @@ Examples:
         type=str,
         help="Comma-separated question IDs to run (or path to file with one ID per line)",
     )
-    run_parser.add_argument("--no-sheet", action="store_true", help="Skip publishing to Sheet")
+    run_parser.add_argument(
+        "--no-sheet",
+        action="store_true",
+        help="Skip publishing to Sheet; write the review rows to run_<run_id>_review.csv instead",
+    )
     run_parser.add_argument(
         "--no-browser",
         action="store_true",

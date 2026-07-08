@@ -1,5 +1,6 @@
 """Google Sheets review UI for LEAP surveillance."""
 
+import csv
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -581,6 +582,20 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
             rows.append([row.get(h, "") for h in headers])
 
     return rows, headers
+
+
+def write_review_csv(run_data: dict, output_dir: str) -> str:
+    """Write the review-tab rows to a local CSV — same columns and sort order as the published tab."""
+    rows, headers = build_review_rows(run_data)
+    sort_keys = [headers.index("question_name"), headers.index("target_date"), headers.index("dimension")]
+    rows.sort(key=lambda r: tuple(str(r[i]) for i in sort_keys))
+    path = Path(output_dir) / f"run_{run_data.get('run_id', 'unknown')}_review.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    return str(path)
 
 
 def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
