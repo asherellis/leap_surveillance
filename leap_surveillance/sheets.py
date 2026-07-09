@@ -7,12 +7,15 @@ from pathlib import Path
 from .common import (
     DEFAULT_SHEET_ID,
     NEVER_YEAR,
+    Q50_TOLERANCE,
     SHEET_TEXT_LIMIT,
     enum_value,
     is_empty,
     make_review_group_id,
     row_resolution_status,
     safe_str,
+    to_float,
+    within_relative_tolerance,
 )
 from .storage import context_maps, pick_by_dimension
 
@@ -24,11 +27,11 @@ SHEET_SCOPES = [
 CREDENTIALS_DIR = Path.home() / ".config" / "leap-surveillance"
 
 _MODEL_FIELDS = [
-    "answer", "color",
+    "q50", "color",
     "q0", "q5", "q25", "q75", "q95", "q100",
     "latest_official_value", "latest_official_date", "latest_official_source",
     "current_estimate", "current_estimate_confidence",
-    "resolution_source", "resolution_source_date",
+    "resolution_value", "resolution_source", "resolution_source_date",
     "judge_confidence", "browser_status", "browser_url", "browser_objective", "browser_error",
     "missing_data", "validation_issues", "judge_reason",
     "rationale", "sources",
@@ -98,11 +101,12 @@ INSTRUCTIONS_CONTENT = [
     ["question_resolution_status", "open / resolved / failed_to_resolve / projected. This is the model/system view of whether a target row has a resolution value."],
     ["question_resolution_value", "Model/system resolution value for this target row, if one exists. Human-confirmed values belong in reviewed_question_resolution_value."],
     ["needs_review", "TRUE when the row likely needs human attention because it is resolved/due, changed, disagreed, or had extraction/quality issues."],
-    ["gpt_answer / claude_answer", "Each model's value at the target date. For forecast rows this is q50; for resolved rows it's the known value."],
+    ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved rows, which use gpt_resolution_value / claude_resolution_value instead."],
+    ["gpt_resolution_value / claude_resolution_value", "Each model's confirmed value at the target date, for resolved (black) rows. Blank otherwise."],
     ["gpt_color / claude_color", "black = resolved/known, white = no defensible estimate, gray = forecast/partial information."],
     ["gpt_latest_official_value / claude_latest_official_value", "The most recent published official figure the model found."],
-    ["gpt_current_estimate / claude_current_estimate", "The model's estimate of the current value (as of the run date). Different from gpt_answer/claude_answer, which is at the target date."],
-    ["gpt_q25 / gpt_q75 / claude_q25 / claude_q75", "50% confidence interval (IQR) around gpt_answer / claude_answer."],
+    ["gpt_current_estimate / claude_current_estimate", "The model's estimate of the current value (as of the run date). Different from gpt_q50/claude_q50, which is at the target date."],
+    ["gpt_q25 / gpt_q75 / claude_q25 / claude_q75", "50% confidence interval (IQR) around gpt_q50 / claude_q50."],
     ["gpt_judge_confidence / claude_judge_confidence", "Judge's confidence in its adequacy assessment for this model's research."],
     ["gpt_missing_data / claude_missing_data", "Specific gaps the per-model judge flagged (e.g. STALE DATA, EXTRACTION FAILURE)."],
     ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Auto-accept requires model adequacy, validation, color agreement, and agreement on shared official/current values."],
@@ -132,7 +136,8 @@ INSTRUCTIONS_CONTENT = [
     ["resolution_criteria", "The exact condition that determines when and how this question resolves."],
     ["question_type", "quantile / probability / when."],
     ["unit", "Unit of the forecast value (e.g. '% GDP growth', 'USD billions')."],
-    ["gpt_answer / claude_answer", "Each model's value at the target date (q50 for forecasts, resolved value for black rows)."],
+    ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved (black) rows."],
+    ["gpt_resolution_value / claude_resolution_value", "Each model's confirmed value at the target date, for resolved (black) rows only."],
     ["gpt_color / claude_color", "black / dark gray / light gray / white — resolved, hard bound, directional signal, or no narrowing information."],
     ["gpt_q0 / claude_q0", "Lowest feasible bound (0th percentile-style bound, not an ordinary credible interval endpoint)."],
     ["gpt_q5 / claude_q5", "5th percentile."],
@@ -155,7 +160,7 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_current_estimate_confidence / claude_current_estimate_confidence", "Confidence in the current estimate (high / medium / low)."],
     ["gpt_rationale / claude_rationale", "Model's written explanation for its forecast."],
     ["gpt_sources / claude_sources", "Research URLs the model cited."],
-    ["gpt_resolution_source / claude_resolution_source", "Source used for a resolved (black) row's answer."],
+    ["gpt_resolution_source / claude_resolution_source", "Source used for a resolved (black) row's resolution value."],
     ["gpt_resolution_source_date / claude_resolution_source_date", "Date of the resolution source."],
     ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed."],
     ["consensus_q50_delta_pct", "|gpt_q50 − claude_q50| / mean(gpt_q50, claude_q50). Informational for non-timing questions; official/current values are the primary match signal."],
@@ -232,8 +237,6 @@ def _question_resolution_fields(status: str, gpt_row: dict, claude_row: dict) ->
     status_norm = str(status or "").strip().lower()
     for row in (gpt_row, claude_row):
         value = row.get("resolution_value")
-        if is_empty(value) and row.get("color") == "black":
-            value = row.get("answer")
         if not is_empty(value):
             return {
                 "question_resolution_status": "resolved",
@@ -270,6 +273,9 @@ def _needs_review(
     value_changed,
     gpt_view: dict,
     claude_view: dict,
+    q_type: str = "",
+    gpt_q50=None,
+    claude_q50=None,
 ) -> str:
     """Flag rows where human review is likely valuable before DWH confirmation."""
     status_norm = str(row_status or "").strip().lower()
@@ -279,6 +285,11 @@ def _needs_review(
         return "TRUE"
     if consensus_status and consensus_status != "auto_accepted":
         return "TRUE"
+    # Quantile auto-accept intentionally skips q50 (differing forecasts are expected) - still flag wild divergence for review.
+    if q_type == "quantile":
+        a, b = to_float(gpt_q50), to_float(claude_q50)
+        if a is not None and b is not None and not within_relative_tolerance(a, b, Q50_TOLERANCE):
+            return "TRUE"
     for view in (gpt_view, claude_view):
         if view.get("browser_status") in ("extract_failed", "refinement_rejected"):
             return "TRUE"
@@ -376,10 +387,10 @@ def _extract_model_view(model_block: dict) -> dict:
 
 
 def _row_fields_for_model(view: dict, fdate: str, dim: str, q_type: str) -> dict:
-    """Compute the per-row fields for one model (answer, color, distribution, official values, etc)."""
+    """Compute the per-row fields for one model (q50, color, distribution, official values, etc)."""
     if view.get("absent"):
         return {k: "" for k in (
-            "answer", "color",
+            "q50", "color",
             "q0", "q5", "q25", "q75", "q95", "q100",
             "latest_official_value", "latest_official_date", "latest_official_source",
             "current_estimate", "current_estimate_confidence",
@@ -393,33 +404,28 @@ def _row_fields_for_model(view: dict, fdate: str, dim: str, q_type: str) -> dict
 
     res_val = view["resolution_map"].get((fdate, dim)) or view["resolution_map"].get((fdate, "Overall")) or {}
 
+    # Read as-is: the pipeline already nulls quantiles for resolved non-timing rows at the source.
+    q0_val, q5_val, q25_val, q75_val, q95_val, q100_val = (
+        safe_str(quants.get(q, {}).get("forecast_value", "")) for q in (0, 5, 25, 75, 95, 100)
+    )
+    q50_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
+    if q_type == "when":
+        q0_val = _render_when_year(q0_val)
+        q5_val = _render_when_year(q5_val)
+        q25_val = _render_when_year(q25_val)
+        q50_val = _render_when_year(q50_val)
+        q75_val = _render_when_year(q75_val)
+        q95_val = _render_when_year(q95_val)
+        q100_val = _render_when_year(q100_val)
+
     if row_type == "resolved":
-        td_val = safe_str(display_forecast.get("forecast_value", ""))
-        if not td_val:
-            td_val = safe_str(res_val.get("value", ""))
-        resolution_value = safe_str(res_val.get("value", "")) or td_val
-        q0_val = q5_val = q25_val = q75_val = q95_val = q100_val = ""
+        resolution_value = safe_str(res_val.get("value", ""))
         res_source_date = safe_str(res_val.get("source_date", ""))
         res_source = safe_str(res_val.get("source", ""))[:SHEET_TEXT_LIMIT]
     else:
-        td_val = safe_str(quants.get(50, {}).get("forecast_value", ""))
         resolution_value = ""
-        q0_val = safe_str(quants.get(0, {}).get("forecast_value", ""))
-        q5_val = safe_str(quants.get(5, {}).get("forecast_value", ""))
-        q25_val = safe_str(quants.get(25, {}).get("forecast_value", ""))
-        q75_val = safe_str(quants.get(75, {}).get("forecast_value", ""))
-        q95_val = safe_str(quants.get(95, {}).get("forecast_value", ""))
-        q100_val = safe_str(quants.get(100, {}).get("forecast_value", ""))
         res_source_date = ""
         res_source = ""
-        if q_type == "when":
-            td_val = _render_when_year(td_val)
-            q0_val = _render_when_year(q0_val)
-            q5_val = _render_when_year(q5_val)
-            q25_val = _render_when_year(q25_val)
-            q75_val = _render_when_year(q75_val)
-            q95_val = _render_when_year(q95_val)
-            q100_val = _render_when_year(q100_val)
 
     # Dimension labels are free text on older runs, so fall back to the sole dimension when it doesn't match.
     single_dim = len({d for _, d in view["groups"]}) <= 1
@@ -434,7 +440,7 @@ def _row_fields_for_model(view: dict, fdate: str, dim: str, q_type: str) -> dict
     off_source = safe_str(off_val_obj.get("source", ""))[:SHEET_TEXT_LIMIT]
 
     return {
-        "answer": td_val, "color": color_code,
+        "q50": q50_val, "color": color_code,
         "q0": q0_val, "q5": q5_val, "q25": q25_val,
         "q75": q75_val, "q95": q95_val, "q100": q100_val,
         "latest_official_value": off_val, "latest_official_date": off_date,
@@ -508,6 +514,9 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                     value_changed=value_changed,
                     gpt_view=gpt_view,
                     claude_view=claude_view,
+                    q_type=q_type,
+                    gpt_q50=gpt_row.get("q50"),
+                    claude_q50=claude_row.get("q50"),
                 ),
                 "question_text": q_text,
                 "resolution_criteria": q_criteria,
@@ -533,7 +542,7 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "claude_validation_issues": claude_view["validation_issues"],
                 "claude_rationale": claude_view["rationale"],
                 "claude_sources": claude_view["sources"],
-                "gpt_answer": gpt_row["answer"], "claude_answer": claude_row["answer"],
+                "gpt_q50": gpt_row["q50"], "claude_q50": claude_row["q50"],
                 "gpt_color": gpt_row["color"], "claude_color": claude_row["color"],
                 "gpt_q0": gpt_row["q0"], "claude_q0": claude_row["q0"],
                 "gpt_q5": gpt_row["q5"], "claude_q5": claude_row["q5"],
@@ -551,6 +560,8 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "claude_current_estimate": claude_row["current_estimate"],
                 "gpt_current_estimate_confidence": gpt_row["current_estimate_confidence"],
                 "claude_current_estimate_confidence": claude_row["current_estimate_confidence"],
+                "gpt_resolution_value": gpt_row["resolution_value"],
+                "claude_resolution_value": claude_row["resolution_value"],
                 "gpt_resolution_source": gpt_row["resolution_source"],
                 "claude_resolution_source": claude_row["resolution_source"],
                 "gpt_resolution_source_date": gpt_row["resolution_source_date"],
@@ -723,14 +734,14 @@ def _format_instructions(sheet, ws) -> None:
 _N, _M = 80, 140
 
 _FIELD_WIDTH = {
-    "answer": _M, "color": _N,
+    "q50": _M, "color": _N,
     "q0": _N, "q5": _N, "q25": _N, "q75": _N, "q95": _N, "q100": _N,
     "judge_confidence": _N, "browser_status": _M,
     "missing_data": _M, "judge_reason": _M, "validation_issues": _M,
     "latest_official_value": _M, "latest_official_date": _M, "latest_official_source": _M,
     "current_estimate": _M, "current_estimate_confidence": _N,
     "rationale": _M, "sources": _M,
-    "resolution_source": _M, "resolution_source_date": _M,
+    "resolution_value": _M, "resolution_source": _M, "resolution_source_date": _M,
 }
 
 
@@ -915,13 +926,12 @@ def get_reviewed_items(
         else:
             reviewed = str(reviewed_raw).strip().lower() in ("true", "1", "yes")
 
-        # New tabs use surveillance_timestamp; older tabs still carry run_id — read both.
-        run_id = safe_str(row.get("surveillance_timestamp") or row.get("run_id", "")).strip()
-        group_question_id = safe_str(row.get("group_question_id") or row.get("question_id", "")).strip()
+        run_id = safe_str(row.get("surveillance_timestamp", "")).strip()
+        group_question_id = safe_str(row.get("group_question_id", "")).strip()
         target_date = row.get("target_date", "")
         dimension = row.get("dimension", "Overall") or "Overall"
         fallback_row_id = make_review_group_id(run_id, group_question_id, target_date, dimension)
-        review_row_id = safe_str(row.get("review_row_id") or row.get("group_id", "") or fallback_row_id).strip()
+        review_row_id = safe_str(row.get("review_row_id") or fallback_row_id).strip()
         if not review_row_id:
             continue
 
@@ -951,7 +961,6 @@ def get_reviewed_items(
             "review_current_value": row.get("review_current_value"),
             "reviewed_question_resolution_status": row.get("reviewed_question_resolution_status"),
             "reviewed_question_resolution_value": row.get("reviewed_question_resolution_value"),
-            "has_reviewed_question_resolution_value_col": "reviewed_question_resolution_value" in row,
             "review_source": row.get("review_source"),
             "review_verdict": row.get("review_verdict"),
             "review_color": row.get("review_color"),

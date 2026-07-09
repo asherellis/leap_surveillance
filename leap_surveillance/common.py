@@ -16,6 +16,8 @@ DEFAULT_SHEET_ID = (
     os.environ.get("LEAP_SHEET_ID")
     or "1lT7zVfKAsVZU7bKaEALq1AWApfFmWMisprTK42l7RDo"
 )
+# Dev/test runs publish here instead - no hardcoded fallback, a missing var should fail loudly, not reuse the prod ID.
+DEFAULT_DEV_SHEET_ID = os.environ.get("LEAP_DEV_SHEET_ID")
 DEFAULT_MODEL = os.environ.get("LEAP_MODEL") or "gpt-5.5"
 DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "gpt-4.1-mini"
 DEFAULT_BROWSER_MODEL = os.environ.get("LEAP_BROWSER_MODEL") or "gpt-4o"

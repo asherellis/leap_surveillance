@@ -42,11 +42,11 @@ columns and the `status` values (`resolved`, `due_unresolved`, `forecast`, `reso
 Fill the `review_*` columns, tick `reviewed`, then:
 
 ```bash
-leap-surveillance sync          # writes dim_baseline + fact_resolution + surveillance_result
-leap-surveillance sync --no-bq  # previews rows without writing
+leap-surveillance sync --tab run_<run_id>          # previews that tab's rows without writing
+leap-surveillance sync --tab run_<run_id> --write   # writes dim_baseline + fact_resolution + surveillance_result
 ```
 
-`sync` reads the most recent `run_*` tab; pass `--tab run_<run_id>` for a specific one.
+`sync` without `--tab` reads the most recent `run_*` tab, but `--tab` is required whenever `--write` is set — an actual write always names its tab explicitly.
 All Sheet rows sync to `surveillance.surveillance_result`; reviewed rows include human
 review fields, and unreviewed rows carry model projections. Historical/current baselines
 sync to `dim.dim_baseline`. Resolved or projected target-date values sync to

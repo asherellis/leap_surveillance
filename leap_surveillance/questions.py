@@ -26,7 +26,7 @@ def _infer_surveillance_question_type(
         # Explicit return so a no-dates probability-unit question can't fall through to "when".
         print(f"  warning: '{question_text}' - probability unit question with non-50 percentiles not supported; handled as a quantile question instead.")
         return "quantile"
-    if not dates:
+    if unit_name.strip().lower() == "year" or not dates:
         return "when"
     return "quantile"
 
@@ -92,6 +92,12 @@ DEV_QUESTION_IDS = (
     "10a514657ba6e075f831ef8d5e4635ffd9003f24e0f6a2e4db8f95999c98bfeb",  # U.S. versus China Polarity (multi-dim)
 )
 
+# TEMPORARY - remove once Airtable backfills question_horizon_date=2040-12-31 for these (data gap, RC already states the date).
+MISSING_HORIZON_DATE_OVERRIDES = {
+    "9d0f9fa9fcbda247ab2231c6ea41d78539754f36edaeea3ab06d3f45274041c6": "2040-12-31",  # Determinants of "AGI" Progress, Part II (1)
+    "9ead8457145e4705f395e3eaab9c370cf58089f102d3d66eb6613447eb22b58d": "2040-12-31",  # Determinants of "AGI" Progress, Part II (2)
+}
+
 
 def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
 
@@ -148,6 +154,9 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 if not is_empty(d)
             }
         )
+        override_date = MISSING_HORIZON_DATE_OVERRIDES.get(row.get("question_set_id"))
+        if override_date and not dates:
+            dates = [override_date]
         dimensions = sorted(
             {
                 safe_str(d).strip()
@@ -166,9 +175,9 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         question_text = safe_str(row.get("question_set_text"))
         unit_name = safe_str(row.get("unit_name"))
 
-        # Points-allocation groups are not quantile, timing, or probability questions.
+        # Genuinely empty groups only - a missing date alone is handled by the override above, not here.
         if not dates and not source_percentiles:
-            print(f"  warning: skipping '{row.get('question_set_name')}' - points-allocation type not supported")
+            print(f"  warning: skipping '{row.get('question_set_name')}' - no date or percentile data, cannot build a forecast")
             continue
 
         question_type = _infer_surveillance_question_type(
@@ -191,7 +200,12 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
             if is_empty(pct) or int(float(pct)) != 50:
                 continue
             raw_date = r.get("question_resolution_date")
-            fdate = str(raw_date).strip() if not is_empty(raw_date) else TIMING_FORECAST_DATE
+            if not is_empty(raw_date):
+                fdate = str(raw_date).strip()
+            elif override_date:
+                fdate = override_date
+            else:
+                fdate = TIMING_FORECAST_DATE
             # NaN is truthy, so `or "Overall"` alone would produce a "nan" key; use is_empty.
             raw_dim = r.get("question_dimension")
             dim = (safe_str(raw_dim).strip() if not is_empty(raw_dim) else "") or "Overall"

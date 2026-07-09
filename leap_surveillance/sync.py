@@ -80,6 +80,10 @@ def _write_run_items(run_id: str, items: list[dict]) -> int:
 
 
 def cmd_sync(args) -> int:
+    if args.write and not args.tab:
+        print("--write requires --tab <run_id> - pass it explicitly so a write can never target whatever happens to be the latest tab.")
+        return 1
+
     all_items, _ = get_reviewed_items(DEFAULT_SHEET_ID, tab_name=args.tab, reviewed_only=False)
     reviewed_count = sum(1 for r in all_items if r.get("reviewed"))
     rlov_count = sum(1 for r in all_items if r.get("review_last_official_value") not in (None, ""))
@@ -92,8 +96,8 @@ def cmd_sync(args) -> int:
 
     _print_sheet_rows(all_items)
 
-    if args.no_bq:
-        print(f"\n{len(all_items)} rows. Re-run without --no-bq to write to BQ.")
+    if not args.write:
+        print(f"\n{len(all_items)} rows. Re-run with --write to write to BQ.")
         return 0
 
     by_run: dict[str, list[dict]] = {}

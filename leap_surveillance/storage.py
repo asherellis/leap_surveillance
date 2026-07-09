@@ -319,9 +319,9 @@ def _adequate_q50s(model_block: dict):
 _history_cache: dict[tuple, list] = {}  # both enrichers read the same history; parse it once per run
 
 
-def _read_production_history(output_dir: str, current_models: dict, current_run_id: str) -> list[dict]:
-    """Most-recent prior runs whose models match the current production models, oldest→newest."""
-    cache_key = (output_dir, current_run_id, tuple(sorted(current_models.items())))
+def _read_production_history(output_dir: str, current_models: dict, current_run_id: str, environment: str) -> list[dict]:
+    """Most-recent prior runs matching the current run's models AND environment (dev/prod), oldest→newest. Untagged runs never match."""
+    cache_key = (output_dir, current_run_id, tuple(sorted(current_models.items())), environment)
     if cache_key in _history_cache:
         return _history_cache[cache_key]
     files = sorted(Path(output_dir).glob("run_*.json"), reverse=True)
@@ -337,6 +337,8 @@ def _read_production_history(output_dir: str, current_models: dict, current_run_
             run = json.loads(path.read_text())
         except Exception:
             continue
+        if run.get("environment") != environment:
+            continue
         models = run.get("models") or {}
         if any(m and models.get(tag) == m for tag, m in current_models.items()):
             runs.append(run)
@@ -346,9 +348,10 @@ def _read_production_history(output_dir: str, current_models: dict, current_run_
 
 
 def annotate_run_stability(run_data: dict, output_dir: str) -> dict:
-    """Annotate each question with cross-run stability, scanning prior production runs once."""
+    """Annotate each question with cross-run stability, scanning prior same-environment runs once."""
     current_models = run_data.get("models") or {}
     current_run_id = run_data.get("run_id", "")
+    environment = run_data.get("environment", "prod")
     q_types = {q.get("id", ""): q.get("question_type", "quantile") for q in run_data.get("questions", [])}
 
     seq: dict[tuple, list] = defaultdict(list)   # (qid, tag, fdate, dim) -> [(q50, color), ...] oldest→newest
@@ -366,7 +369,7 @@ def annotate_run_stability(run_data: dict, output_dir: str) -> dict:
                     seq[(qid, tag, fdate, dim)].append((q50, color))
                     runs_seen[qid].add(rid)
 
-    for run in _read_production_history(output_dir, current_models, current_run_id):
+    for run in _read_production_history(output_dir, current_models, current_run_id, environment):
         ingest(run)
     ingest(run_data)  # current run is the newest point
 
@@ -421,8 +424,9 @@ def annotate_value_changes(run_data: dict, output_dir: str) -> dict:
     """Annotate each question with whether either model's LOV or current estimate changed vs the prior run."""
     current_models = run_data.get("models") or {}
     current_run_id = run_data.get("run_id", "")
+    environment = run_data.get("environment", "prod")
 
-    prior_runs = _read_production_history(output_dir, current_models, current_run_id)
+    prior_runs = _read_production_history(output_dir, current_models, current_run_id, environment)
     # Anchor on GPT's own history; also compare Claude when the prior run's Claude model matches.
     current_gpt = current_models.get("gpt")
     gpt_prior_runs = [r for r in prior_runs if current_gpt and (r.get("models") or {}).get("gpt") == current_gpt]
@@ -785,8 +789,7 @@ def write_to_fact_resolution(run_data: dict, all_items: list | None = None):
                 print(f"  warning: malformed dim_question_map key '{key}' (no '|'); skipping")
                 continue
             fdate, dim = key.split("|", 1)
-            if fdate == TIMING_FORECAST_DATE:
-                continue
+            # Timing rows aren't excluded here - the status gate below and the no-date skip further down already handle them.
             fdate_date = _parse_date_or_none(fdate)  # fallback resolution_date; None if key is non-ISO
 
             item = item_map.get((group_qid, fdate, dim))
@@ -798,10 +801,6 @@ def write_to_fact_resolution(run_data: dict, all_items: list | None = None):
                 continue
 
             reviewed_value = _safe_float_or_none((item or {}).get("reviewed_question_resolution_value"))
-            # Old-schema tabs lack reviewed_question_resolution_value; in those tabs, black review rows used rlov as the resolution value.
-            has_resolution_value_col = (item or {}).get("has_reviewed_question_resolution_value_col", True)
-            if reviewed_value is None and not has_resolution_value_col and (item or {}).get("review_color", "").strip().lower() == "black":
-                reviewed_value = _safe_float_or_none((item or {}).get("review_last_official_value"))
             system_value = _safe_float_or_none((item or {}).get("question_resolution_value"))
             if reviewed_value is not None:
                 value = reviewed_value

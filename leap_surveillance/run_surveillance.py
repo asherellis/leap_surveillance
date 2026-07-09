@@ -13,6 +13,7 @@ from .common import (
     CLAUDE_EVALUATOR_MODEL,
     CLAUDE_RESEARCH_MODEL,
     DEFAULT_BROWSER_MODEL,
+    DEFAULT_DEV_SHEET_ID,
     DEFAULT_EVALUATOR_MODEL,
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
@@ -180,7 +181,12 @@ def _refine_model_with_browser_result(
     costs: RunCost,
     browser_result: BrowserEvidence,
     test_mode: bool = False,
+    display_url: str | None = None,
+    display_objective: str | None = None,
 ) -> ModelRunResult:
+    # Lets a caller show this model's own requested URL even when applying another model's evidence.
+    display_url = display_url or browser_result.url
+    display_objective = display_objective or browser_result.objective
     if result.response is None or result.quality is None:
         return result
 
@@ -220,8 +226,8 @@ def _refine_model_with_browser_result(
             quality=refined_quality,
             browser_used=True,
             browser_status="accepted",
-            browser_url=browser_result.url,
-            browser_objective=browser_result.objective,
+            browser_url=display_url,
+            browser_objective=display_objective,
         )
 
     print(f"  [{stack.tag}] Browser data kept as evidence; original response retained ({accept_reason})")
@@ -234,8 +240,8 @@ def _refine_model_with_browser_result(
         quality=result.quality,
         browser_used=True,
         browser_status="refinement_rejected",
-        browser_url=browser_result.url,
-        browser_objective=browser_result.objective,
+        browser_url=display_url,
+        browser_objective=display_objective,
         browser_error=accept_reason,
     )
 
@@ -299,13 +305,16 @@ def _apply_shared_browser_refinements(
                 continue
             if tag not in stacks:
                 continue
-            result.browser_url = url
-            result.browser_objective = objective
+            # Keep this model's own URL displayed even when another model's URL is also applied to it.
+            display_url = result.browser_url if (tag not in requesters and result.browser_url) else url
+            display_objective = result.browser_objective if (tag not in requesters and result.browser_url) else objective
             per_model[tag] = _refine_model_with_browser_result(
                 q,
                 result,
                 stack=stacks[tag],
                 costs=costs,
+                display_url=display_url,
+                display_objective=display_objective,
                 browser_result=browser_result,
                 test_mode=test_mode,
             )
@@ -546,6 +555,8 @@ def cmd_run(args):
         consensus_blocks=consensus_blocks,
         errors_list=errors_list,
     )
+    # Dev/test runs must never pollute production stability history, and vice versa.
+    run_data["environment"] = "dev" if (args.dev or args.test_mode) else "prod"
     run_data = annotate_run_stability(run_data, DEFAULT_OUTPUT_DIR)
     run_data = annotate_value_changes(run_data, DEFAULT_OUTPUT_DIR)
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
@@ -569,11 +580,15 @@ def cmd_run(args):
     print(f"Estimated cost: ${s['total_cost']:.4f}")
 
     if not args.no_sheet:
-        try:
-            n = publish_to_sheet(run_data, DEFAULT_SHEET_ID)
-            print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}'")
-        except Exception as e:
-            print(f"Sheet publishing failed: {e}")
+        if run_data["environment"] == "dev" and not DEFAULT_DEV_SHEET_ID:
+            print("Sheet publishing skipped: dev run but LEAP_DEV_SHEET_ID is not set (see .env.example)")
+        else:
+            try:
+                target_sheet_id = DEFAULT_DEV_SHEET_ID if run_data["environment"] == "dev" else DEFAULT_SHEET_ID
+                n = publish_to_sheet(run_data, target_sheet_id)
+                print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}' ({run_data['environment']})")
+            except Exception as e:
+                print(f"Sheet publishing failed: {e}")
 
 
 def cmd_setup(args):
@@ -594,9 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s run --limit 5        Run surveillance on 5 questions
   %(prog)s run --limit 5 -y     Same, skip confirmation
-  %(prog)s sync                 Sync latest run tab to BigQuery
-  %(prog)s sync --tab run_...   Sync a specific run tab to BigQuery
-  %(prog)s sync --no-bq         Dry-run: print what would be synced, no write
+  %(prog)s sync                          Dry-run: print what the latest tab would sync, no write
+  %(prog)s sync --tab run_...            Dry-run: print what a specific tab would sync, no write
+  %(prog)s sync --tab run_... --write    Sync that tab to BigQuery (--tab required with --write)
   %(prog)s setup                Rebuild the Instructions tab
         """,
     )
@@ -640,8 +655,8 @@ Examples:
                               help="Run both GPT and Claude in parallel (default)")
 
     sync_parser = subparsers.add_parser("sync", help="Sync a run tab to BigQuery")
-    sync_parser.add_argument("--no-bq", action="store_true", help="Dry-run: print what would be written; no write")
-    sync_parser.add_argument("--tab", type=str, default=None, help="Specific run_<run_id> tab to read (default: most recent)")
+    sync_parser.add_argument("--write", action="store_true", help="Actually write to BigQuery. Requires --tab. Without this flag, sync only previews what would be written.")
+    sync_parser.add_argument("--tab", type=str, default=None, help="Specific run_<run_id> tab to read (default: most recent). Required when --write is set.")
 
     setup_parser = subparsers.add_parser("setup", help="Rebuild the Instructions tab (does not touch run_* tabs)")
     setup_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
