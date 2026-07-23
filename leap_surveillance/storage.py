@@ -11,18 +11,19 @@ from uuid import uuid4
 
 import pandas as pd
 from google.auth import default
-from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud.bigquery import DmlStats
 
 from .common import (
     DEFAULT_BQ_PROJECT,
     DEFAULT_SURVEILLANCE_DATASET,
+    PROBABILITY_TOLERANCE_POINTS,
     Q50_TOLERANCE,
     TIMING_FORECAST_DATE,
     WHEN_TOLERANCE_YR,
     enum_value,
     is_empty,
+    is_truthy,
     row_resolution_status,
     within_relative_tolerance,
 )
@@ -256,8 +257,6 @@ def build_run_data(
     }
 
 
-_STABILITY_MAX_RUNS = 10   # prior production runs to consider
-_STABILITY_SCAN_CAP = 40   # files to scan looking for them (most are legacy/test runs)
 def _stable_pair(a: float | None, b: float | None, color: str | None, q_type: str) -> bool:
     """Two q50s agree: exact for resolved (black) rows, tolerance band otherwise."""
     if a is None or b is None:
@@ -266,7 +265,16 @@ def _stable_pair(a: float | None, b: float | None, color: str | None, q_type: st
         return abs(a - b) < 1e-9
     if q_type == "when":
         return abs(a - b) <= WHEN_TOLERANCE_YR
+    if q_type == "probability":
+        return abs(a - b) <= PROBABILITY_TOLERANCE_POINTS  # absolute points, not relative - relative % is meaningless near 0
     return within_relative_tolerance(a, b, Q50_TOLERANCE)
+
+
+def _value_changed(prior: float | None, current: float | None, q_type: str) -> bool:
+    """Did a baseline fact move since the last comparable run? Both missing isn't a change - nothing to compare."""
+    if prior is None and current is None:
+        return False
+    return not _stable_pair(prior, current, None, q_type)
 
 
 def _classify_sequence(points: list[tuple], q_type: str) -> str:
@@ -275,21 +283,7 @@ def _classify_sequence(points: list[tuple], q_type: str) -> str:
     if len(pts) <= 1:
         return "new"
     consistent = all(_stable_pair(pts[i][0], pts[i + 1][0], pts[i + 1][1], q_type) for i in range(len(pts) - 1))
-    if not consistent:
-        return "volatile"
-    return "converging" if len(pts) == 2 else "stable"
-
-
-def _worst_stability(labels: list[str]) -> str:
-    """Roll a model's per-row stability up to one label — worst wins; new only if no data."""
-    non_new = [label for label in labels if label != "new"]
-    if not non_new:
-        return "new"
-    if "volatile" in non_new:
-        return "volatile"
-    if "converging" in non_new:
-        return "converging"
-    return "stable"
+    return "stable" if consistent else "volatile"
 
 
 def _combine_stability(gpt_stab: str, claude_stab: str) -> str:
@@ -299,160 +293,14 @@ def _combine_stability(gpt_stab: str, claude_stab: str) -> str:
         return "new"
     if "volatile" in (gpt_stab, claude_stab):
         return "volatile"
-    if gpt_stab in ("stable", "converging") and claude_stab in ("stable", "converging"):
-        return "converging"
     return "one_stable"
 
 
-def _adequate_q50s(model_block: dict):
-    """Yield (fdate, dim, q50, color) for each adequate q50 forecast in a model block."""
-    if not model_block or model_block.get("error"):
-        return
-    if not (model_block.get("quality") or {}).get("adequate", False):
-        return
-    for fc in (model_block.get("response") or {}).get("forecasts", []):
-        if fc.get("quantile") == 50 and fc.get("forecast_value") is not None:
-            color = enum_value(fc.get("color_code"))
-            yield fc.get("forecast_date", ""), fc.get("dimension", "Overall"), fc.get("forecast_value"), color
-
-
-_history_cache: dict[tuple, list] = {}  # both enrichers read the same history; parse it once per run
-
-
-def _read_production_history(output_dir: str, current_models: dict, current_run_id: str, environment: str) -> list[dict]:
-    """Most-recent prior runs matching the current run's models AND environment (dev/prod), oldest→newest. Untagged runs never match."""
-    cache_key = (output_dir, current_run_id, tuple(sorted(current_models.items())), environment)
-    if cache_key in _history_cache:
-        return _history_cache[cache_key]
-    files = sorted(Path(output_dir).glob("run_*.json"), reverse=True)
-    runs: list[dict] = []
-    for path in files[:_STABILITY_SCAN_CAP]:
-        if len(runs) >= _STABILITY_MAX_RUNS:
-            break
-        if "_partial" in path.stem:
-            continue
-        if path.stem[len("run_"):] == current_run_id:
-            continue
-        try:
-            run = json.loads(path.read_text())
-        except Exception:
-            continue
-        if run.get("environment") != environment:
-            continue
-        models = run.get("models") or {}
-        if any(m and models.get(tag) == m for tag, m in current_models.items()):
-            runs.append(run)
-    runs.reverse()
-    _history_cache[cache_key] = runs
-    return runs
-
-
-def annotate_run_stability(run_data: dict, output_dir: str) -> dict:
-    """Annotate each question with cross-run stability, scanning prior same-environment runs once."""
-    current_models = run_data.get("models") or {}
-    current_run_id = run_data.get("run_id", "")
-    environment = run_data.get("environment", "prod")
-    q_types = {q.get("id", ""): q.get("question_type", "quantile") for q in run_data.get("questions", [])}
-
-    seq: dict[tuple, list] = defaultdict(list)   # (qid, tag, fdate, dim) -> [(q50, color), ...] oldest→newest
-    runs_seen: dict[str, set] = defaultdict(set)  # qid -> {run_id, ...}
-
-    def ingest(run: dict) -> None:
-        rid = run.get("run_id", "")
-        models = run.get("models") or {}
-        for q in run.get("questions", []):
-            qid = q.get("id", "")
-            for tag, model_block in (q.get("per_model") or {}).items():
-                if models.get(tag) != current_models.get(tag):  # only this model's own production history
-                    continue
-                for fdate, dim, q50, color in _adequate_q50s(model_block):
-                    seq[(qid, tag, fdate, dim)].append((q50, color))
-                    runs_seen[qid].add(rid)
-
-    for run in _read_production_history(output_dir, current_models, current_run_id, environment):
-        ingest(run)
-    ingest(run_data)  # current run is the newest point
-
-    per_qtag: dict[tuple, list] = defaultdict(list)  # (qid, tag) -> [row labels]
-    for (qid, tag, _fdate, _dim), points in seq.items():
-        per_qtag[(qid, tag)].append(_classify_sequence(points, q_types.get(qid, "quantile")))
-
-    for q in run_data.get("questions", []):
-        qid = q.get("id", "")
-        gpt_stab = _worst_stability(per_qtag.get((qid, "gpt"), []))
-        claude_stab = _worst_stability(per_qtag.get((qid, "claude"), []))
-        q["run_stability"] = {
-            "gpt_run_stability": gpt_stab,
-            "claude_run_stability": claude_stab,
-            "run_stability": _combine_stability(gpt_stab, claude_stab),
-            "runs_seen": len(runs_seen.get(qid, set())),
-        }
-    return run_data
-
-
-def _values_differ(a, b) -> bool:
-    """True if two LOV/current-estimate values are meaningfully different."""
-    if a is None and b is None:
-        return False
-    if a is None or b is None:
-        return True
-    try:
-        fa, fb = float(a), float(b)
-        return abs(fa - fb) > max(abs(fa), abs(fb), 1.0) * 0.001
-    except (ValueError, TypeError):
-        return str(a).strip() != str(b).strip()
-
-
-def _baseline_changed(curr_block: dict | None, prior_block: dict | None) -> bool:
-    """True if a model's last-official or current value moved between runs, for any dimension."""
-    curr_official, curr_current, _ = context_maps((curr_block or {}).get("response") or {})
-    prior_official, prior_current, _ = context_maps((prior_block or {}).get("response") or {})
-    # Include prior-run dims so a value that disappeared since last run also flags a change.
-    all_dims = set(curr_official) | set(curr_current) | set(prior_official) | set(prior_current) | {"Overall"}
-    single = len(set(curr_official) | set(curr_current)) <= 1
-    for dim in all_dims:
-        c_lov = pick_by_dimension(curr_official, dim, single).get("value")
-        p_lov = pick_by_dimension(prior_official, dim, single).get("value")
-        c_cur = pick_by_dimension(curr_current, dim, single).get("value")
-        p_cur = pick_by_dimension(prior_current, dim, single).get("value")
-        if _values_differ(c_lov, p_lov) or _values_differ(c_cur, p_cur):
-            return True
-    return False
-
-
-def annotate_value_changes(run_data: dict, output_dir: str) -> dict:
-    """Annotate each question with whether either model's LOV or current estimate changed vs the prior run."""
-    current_models = run_data.get("models") or {}
-    current_run_id = run_data.get("run_id", "")
-    environment = run_data.get("environment", "prod")
-
-    prior_runs = _read_production_history(output_dir, current_models, current_run_id, environment)
-    # Anchor on GPT's own history; also compare Claude when the prior run's Claude model matches.
-    current_gpt = current_models.get("gpt")
-    gpt_prior_runs = [r for r in prior_runs if current_gpt and (r.get("models") or {}).get("gpt") == current_gpt]
-    if not gpt_prior_runs:
-        for q in run_data.get("questions", []):
-            q["value_changed"] = False
-        return run_data
-
-    prior_run = gpt_prior_runs[-1]  # most recent prior run with the same GPT model
-    prior_by_id: dict[str, dict] = {q.get("id", ""): q for q in prior_run.get("questions", [])}
-    current_claude = current_models.get("claude")
-    compare_claude = bool(current_claude and (prior_run.get("models") or {}).get("claude") == current_claude)
-
-    for q in run_data.get("questions", []):
-        prior_q = prior_by_id.get(q.get("id", ""))
-        if not prior_q:
-            q["value_changed"] = False
-            continue
-        curr_pm = q.get("per_model") or {}
-        prior_pm = prior_q.get("per_model") or {}
-        changed = _baseline_changed(curr_pm.get("gpt"), prior_pm.get("gpt"))
-        if not changed and compare_claude:
-            changed = _baseline_changed(curr_pm.get("claude"), prior_pm.get("claude"))
-        q["value_changed"] = changed
-
-    return run_data
+def _combine_change_flags(tag_results: list[bool]) -> str:
+    """One bool per model with a comparable prior run; blank (not "unchanged") if no model had one."""
+    if not tag_results:
+        return ""
+    return "TRUE" if any(tag_results) else "FALSE"
 
 
 def _summarize_run(per_model_lists, costs_iter, errors_iter) -> dict:
@@ -597,8 +445,8 @@ def _merge_bigquery(
     *,
     clock_col: str | None = None,
     update_cols: Sequence[str] | None = None,
-    create_target_if_missing: bool = False,
 ) -> DmlStats | None:
+    """MERGE df into an existing BQ table. Assumes the table and its schema already exist - never creates or alters them (Jordan owns schema)."""
     if pk not in df.columns:
         raise ValueError(f"DataFrame must include '{pk}'.")
 
@@ -614,16 +462,6 @@ def _merge_bigquery(
     target = f"{DEFAULT_BQ_PROJECT}.{dataset}.{table}"
     temp = f"{DEFAULT_BQ_PROJECT}.{dataset}.{table}_staging_{uuid4().hex}"
 
-    if create_target_if_missing:
-        try:
-            client.get_table(target)
-        except NotFound:
-            client.load_table_from_dataframe(
-                df.head(0),
-                target,
-                job_config=bigquery.LoadJobConfig(write_disposition="WRITE_EMPTY"),
-            ).result()
-
     try:
         client.load_table_from_dataframe(
             df,
@@ -631,28 +469,9 @@ def _merge_bigquery(
             job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
         ).result()
 
-        temp_schema = client.get_table(temp).schema
-        cols = [field.name for field in temp_schema]
+        cols = [field.name for field in client.get_table(temp).schema]
         if pk not in cols:
             raise RuntimeError(f"TEMP table is missing '{pk}' after load.")
-
-        target_table = client.get_table(target)
-        target_cols = {field.name for field in target_table.schema}
-        missing_fields = [field for field in temp_schema if field.name not in target_cols]
-        if missing_fields:
-            target_table.schema = [
-                *target_table.schema,
-                *[
-                    bigquery.SchemaField(
-                        field.name,
-                        field.field_type,
-                        mode="NULLABLE",
-                        description=field.description,
-                    )
-                    for field in missing_fields
-                ],
-            ]
-            client.update_table(target_table, ["schema"])
 
         non_pk_cols = [col for col in cols if col != pk]
         update_cols = [col for col in (update_cols or non_pk_cols) if col in non_pk_cols]
@@ -692,38 +511,24 @@ def _merge_bigquery(
             pass
 
 
-def _try_merge_bigquery_rows(
-    label: str,
+def _merge_bigquery_rows(
     rows: list[dict],
     *,
     pk: str,
     dataset: str,
     table: str,
     clock_col: str | None = None,
-    dtypes: dict | None = None,
 ):
+    """None for empty input (nothing to write) vs. a real write failure, which propagates - see _merge_bigquery."""
     if not rows:
         return None
-
-    df = pd.DataFrame(rows)
-
-    if dtypes:
-        for col, dtype in dtypes.items():
-            if col in df.columns:
-                df[col] = df[col].astype(dtype)
-
-    try:
-        return _merge_bigquery(
-            df,
-            pk=pk,
-            dataset=dataset,
-            table=table,
-            clock_col=clock_col,
-            create_target_if_missing=True,
-        )
-    except Exception as e:
-        print(f"  {label} write failed: {e}")
-        return None
+    return _merge_bigquery(
+        pd.DataFrame(rows),
+        pk=pk,
+        dataset=dataset,
+        table=table,
+        clock_col=clock_col,
+    )
 
 
 def _q50_forecast(model_block: dict | None, fdate: str, dim: str) -> dict | None:
@@ -800,12 +605,15 @@ def write_to_fact_resolution(run_data: dict, all_items: list | None = None):
             if color != "black" and status not in ("resolved", "projected"):
                 continue
 
-            reviewed_value = _safe_float_or_none((item or {}).get("reviewed_question_resolution_value"))
+            reviewed_value = (
+                _safe_float_or_none((item or {}).get("reviewed_question_resolution_value"))
+                if is_truthy((item or {}).get("reviewed")) else None
+            )
             system_value = _safe_float_or_none((item or {}).get("question_resolution_value"))
             if reviewed_value is not None:
                 value = reviewed_value
                 source = (item or {}).get("review_source") or "surveillance_reviewed"
-                resolution_status_value = "projected" if reviewed_status == "projected" else "confirmed"
+                resolution_status_value = "confirmed" if reviewed_status == "resolved" else "projected"
                 resolved_at = now if resolution_status_value == "confirmed" else None
                 resolution_date = (
                     _parse_date_or_none((item or {}).get("question_resolution_source_date"))
@@ -844,8 +652,8 @@ def write_to_fact_resolution(run_data: dict, all_items: list | None = None):
 
     if not rows:
         return None
-    return _try_merge_bigquery_rows(
-        "fact_resolution", rows,
+    return _merge_bigquery_rows(
+        rows,
         pk="question_id", dataset="fact", table="fact_resolution",
     )
 
@@ -877,18 +685,20 @@ def write_to_dim_baseline(run_data: dict, all_sheet_rows: list[dict]):
             continue
         dim = item.get("dimension") or "Overall"
 
+        reviewed_row = is_truthy(item.get("reviewed"))
         lov, lov_origin = first_float(
-            ("reviewed", item.get("review_last_official_value")),
+            ("reviewed", item.get("review_last_official_value") if reviewed_row else None),
             ("gpt", item.get("gpt_latest_official_value")),
             ("claude", item.get("claude_latest_official_value")),
         )
         lov_date = (
-            _parse_date_or_none(item.get("gpt_latest_official_date"))
+            current_date if lov_origin == "reviewed"  # the human's own review date, not the model's source date
+            else _parse_date_or_none(item.get("gpt_latest_official_date"))
             or _parse_date_or_none(item.get("claude_latest_official_date"))
             or current_date
         )
         current, current_origin = first_float(
-            ("reviewed", item.get("review_current_value")),
+            ("reviewed", item.get("review_current_value") if reviewed_row else None),
             ("gpt", item.get("gpt_current_estimate")),
             ("claude", item.get("claude_current_estimate")),
         )
@@ -917,8 +727,8 @@ def write_to_dim_baseline(run_data: dict, all_sheet_rows: list[dict]):
 
     if not rows:
         return None
-    return _try_merge_bigquery_rows(
-        "dim_baseline", rows,
+    return _merge_bigquery_rows(
+        rows,
         pk="baseline_id", dataset="dim", table="dim_baseline",
     )
 
@@ -992,8 +802,8 @@ def write_to_surveillance_result(run_data: dict, all_sheet_rows: list[dict]):
 
     if not rows:
         return None
-    return _try_merge_bigquery_rows(
-        "surveillance_result", rows,
+    return _merge_bigquery_rows(
+        rows,
         pk="run_question_id",
         dataset=DEFAULT_SURVEILLANCE_DATASET,
         table="surveillance_result",

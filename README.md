@@ -5,7 +5,7 @@ generates structured forecasts with web search (and optional browser automation)
 writes local JSON/CSV plus a per-run Google Sheet review tab. Runs land in `outputs/`
 as `run_<run_id>.{json,csv}`.
 
-This pipeline intentionally excludes conditional questions for now. To re-implement them, look at memory/conditional_questions.md
+This pipeline intentionally excludes conditional questions for now.
 
 ## Setup
 
@@ -52,3 +52,19 @@ review fields, and unreviewed rows carry model projections. Historical/current b
 sync to `dim.dim_baseline`. Resolved or projected target-date values sync to
 `fact.fact_resolution`.
 To rebuild only the Instructions tab: `leap-surveillance setup -y`.
+
+## Troubleshooting
+
+**BigQuery/Google API calls fail with an SSL error** (e.g. `SSLError`, `NO_CERTIFICATE_OR_CRL_FOUND`,
+`Max retries exceeded ... oauth2.googleapis.com`), while `curl https://oauth2.googleapis.com` works
+fine in the same terminal: your Python venv's bundled `certifi` cert store doesn't recognize a CA
+your network injects (common on university/corporate networks with their own network-auth
+profile). Point Python at the OS trust store instead:
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+export REQUESTS_CA_BUNDLE=/etc/ssl/cert.pem
+```
+
+This is a local network/environment issue, not a pipeline bug — don't add these to `.env` or hardcode
+them in code, since that would mask real cert errors for people who don't have this problem.

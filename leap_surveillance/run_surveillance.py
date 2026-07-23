@@ -35,12 +35,11 @@ from .models import (
 from .storage import (
     _serialize_model_result,
     build_run_data,
-    annotate_run_stability,
-    annotate_value_changes,
     write_csv_output,
     write_json_output,
 )
 from .sheets import (
+    annotate_stability_in_sheet,
     run_tab_name,
     publish_to_sheet,
     setup_sheet,
@@ -557,8 +556,6 @@ def cmd_run(args):
     )
     # Dev/test runs must never pollute production stability history, and vice versa.
     run_data["environment"] = "dev" if (args.dev or args.test_mode) else "prod"
-    run_data = annotate_run_stability(run_data, DEFAULT_OUTPUT_DIR)
-    run_data = annotate_value_changes(run_data, DEFAULT_OUTPUT_DIR)
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     try:
         os.remove(partial_path)
@@ -580,15 +577,22 @@ def cmd_run(args):
     print(f"Estimated cost: ${s['total_cost']:.4f}")
 
     if not args.no_sheet:
-        if run_data["environment"] == "dev" and not DEFAULT_DEV_SHEET_ID:
-            print("Sheet publishing skipped: dev run but LEAP_DEV_SHEET_ID is not set (see .env.example)")
+        target_env_var = "LEAP_DEV_SHEET_ID" if run_data["environment"] == "dev" else "LEAP_SHEET_ID"
+        target_id = DEFAULT_DEV_SHEET_ID if run_data["environment"] == "dev" else DEFAULT_SHEET_ID
+        if not target_id:
+            print(f"Sheet publishing skipped: {target_env_var} is not set (see .env.example)")
         else:
             try:
-                target_sheet_id = DEFAULT_DEV_SHEET_ID if run_data["environment"] == "dev" else DEFAULT_SHEET_ID
-                n = publish_to_sheet(run_data, target_sheet_id)
+                n = publish_to_sheet(run_data, target_id)
                 print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}' ({run_data['environment']})")
             except Exception as e:
                 print(f"Sheet publishing failed: {e}")
+            else:
+                try:
+                    stab = annotate_stability_in_sheet(target_id, run_id)
+                    print(f"Stability computed for {stab['rows_updated']} rows ({stab['prior_runs_used']} prior runs found)")
+                except Exception as e:
+                    print(f"Stability computation failed (non-fatal, Sheet still published): {e}")
 
 
 def cmd_setup(args):

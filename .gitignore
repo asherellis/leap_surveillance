@@ -8,4 +8,6 @@ outputs/
 internal/
 logs/
 HANDOFF.md
+HANDOFF-*.md
 .ruff_cache/
+pytest-of-*/

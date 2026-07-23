@@ -12,11 +12,8 @@ load_dotenv()
 DEFAULT_OUTPUT_DIR = "outputs"
 DEFAULT_BQ_PROJECT = os.environ.get("LEAP_BQ_PROJECT") or "data-warehouse-dev-492608"
 DEFAULT_SURVEILLANCE_DATASET = os.environ.get("LEAP_SURVEILLANCE_DATASET") or "surveillance"
-DEFAULT_SHEET_ID = (
-    os.environ.get("LEAP_SHEET_ID")
-    or "1lT7zVfKAsVZU7bKaEALq1AWApfFmWMisprTK42l7RDo"
-)
-# Dev/test runs publish here instead - no hardcoded fallback, a missing var should fail loudly, not reuse the prod ID.
+# No hardcoded fallback for either - a missing env var should fail loudly, not silently reuse someone else's ID (see .env.example for the real values).
+DEFAULT_SHEET_ID = os.environ.get("LEAP_SHEET_ID")
 DEFAULT_DEV_SHEET_ID = os.environ.get("LEAP_DEV_SHEET_ID")
 DEFAULT_MODEL = os.environ.get("LEAP_MODEL") or "gpt-5.5"
 DEFAULT_EVALUATOR_MODEL = os.environ.get("LEAP_EVALUATOR_MODEL") or "gpt-4.1-mini"
@@ -94,6 +91,7 @@ SHEET_TEXT_LIMIT = 10000
 FULL_QUANTILES = [0, 5, 25, 50, 75, 95, 100]
 TIMING_FORECAST_DATE = "event_occurrence"
 Q50_TOLERANCE = 0.10   # 10% relative-to-mean tolerance for non-black q50 agreement
+PROBABILITY_TOLERANCE_POINTS = 5  # +/- percentage points for non-black probability-type q50 agreement (0-100 scale; relative tolerance is meaningless near 0)
 NEAR_ZERO_SUM = 1e-9   # treat |a| + |b| below this as "both effectively zero"
 WHEN_TOLERANCE_YR = 2  # ±years for non-black when-type q50 agreement (years, not relative)
 NEVER_YEAR = 9999      # sentinel meaning "never" in when-type forecasts
@@ -179,6 +177,12 @@ def is_empty(val) -> bool:
         pass
     s = safe_str(val).strip()
     return s == "" or s.lower() in ("nat", "nan", "none")
+
+
+def is_truthy(value) -> bool:
+    """Sheets can hand back a checkbox cell as a real bool or as the string 'TRUE' depending on
+    how it's read - normalize both rather than assuming one."""
+    return value is True or (isinstance(value, str) and value.strip().upper() == "TRUE")
 
 
 def make_review_group_id(run_id: str, question_id: str, forecast_date: str, dimension: str) -> str:

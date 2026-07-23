@@ -40,6 +40,21 @@ def _all_shared_values_match(a_by_dim: dict[str, Any], b_by_dim: dict[str, Any])
     return all(_values_match(a_by_dim[d], b_by_dim[d]) for d in shared_dims) if shared_dims else True
 
 
+def _avg_delta_pct(a_by_dim: dict[str, Any], b_by_dim: dict[str, Any]) -> float | None:
+    """Mean relative delta across shared numeric dimensions; None if nothing numeric to compare."""
+    shared_dims = set(a_by_dim) & set(b_by_dim)
+    deltas = []
+    for d in shared_dims:
+        try:
+            fa, fb = float(str(a_by_dim[d]).replace(",", "")), float(str(b_by_dim[d]).replace(",", ""))
+        except (ValueError, TypeError):
+            continue
+        denom = (abs(fa) + abs(fb)) / 2
+        if denom > 0:
+            deltas.append(abs(fa - fb) / denom)
+    return sum(deltas) / len(deltas) if deltas else None
+
+
 def _extract_q50_by_row(forecasts) -> dict[tuple[str, str], dict[str, Any]]:
     """Index forecasts by (forecast_date, dimension) → {"q50", "color"} dict."""
     by_row: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"q50": None, "color": None})
@@ -142,6 +157,7 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
     gpt_official = _extract_values_by_dim(gpt.response, "last_official_values")
     claude_official = _extract_values_by_dim(claude.response, "last_official_values")
     official_all_match = _all_shared_values_match(gpt_official, claude_official)
+    official_delta_pct = _avg_delta_pct(gpt_official, claude_official)
     gpt_current = _extract_values_by_dim(gpt.response, "current_estimates")
     claude_current = _extract_values_by_dim(claude.response, "current_estimates")
     current_all_match = _all_shared_values_match(gpt_current, claude_current)
@@ -228,6 +244,7 @@ def compute_consensus(per_model: dict, question_type: str = "quantile") -> dict:
         "q50_agreement": q50_all_match,
         "resolution_agreement": resolution_all_match,
         "official_agreement": official_all_match,
+        "official_delta_pct": official_delta_pct,
         "current_agreement": current_all_match,
         "row_diffs": row_diffs,
         "reason": reason,

@@ -11,6 +11,7 @@ from .common import (
     SHEET_TEXT_LIMIT,
     enum_value,
     is_empty,
+    is_truthy,
     make_review_group_id,
     row_resolution_status,
     safe_str,
@@ -42,11 +43,22 @@ _METADATA_COLS = ["question_name", "needs_review", "status", "target_date", "dim
                   "question_resolution_status", "question_resolution_value",
                   "question_resolution_source", "question_resolution_source_date",
                   "question_text", "resolution_criteria"]
-# Diagnostics apply to any run; consensus columns are dual-model-only.
-_CONSENSUS_COLS = ["model_consensus", "consensus_q50_delta_pct", "confidence_tier"]
+# consensus_*_delta_pct = this-run GPT/Claude agreement; *_stability = cross-run consistency (different axis)
+_CONSENSUS_COLS = ["model_consensus", "consensus_q50_delta_pct", "consensus_official_value_delta_pct", "confidence_tier"]
 _DIAGNOSTIC_COLS = [
-    "run_stability", "gpt_run_stability", "claude_run_stability", "runs_seen",
-    "has_official_value", "has_current_value", "value_has_changed",
+    "forecast_stability", "gpt_forecast_stability", "claude_forecast_stability",
+    "official_value_stability", "gpt_official_value_stability", "claude_official_value_stability",
+    "official_value_changed", "current_value_changed",
+    "runs_seen", "gpt_model", "claude_model",
+    "has_official_value", "has_current_value",
+]
+# filled in post-publish by annotate_stability_in_sheet, once this run's tab exists to compare against
+_STABILITY_PATCH_COLS = [
+    "confidence_tier",
+    "forecast_stability", "gpt_forecast_stability", "claude_forecast_stability",
+    "official_value_stability", "gpt_official_value_stability", "claude_official_value_stability",
+    "official_value_changed", "current_value_changed",
+    "runs_seen",
 ]
 _REVIEWER_COLS = [
     "review_verdict", "review_last_official_value", "review_current_value",
@@ -86,46 +98,47 @@ INSTRUCTIONS_CONTENT = [
     ["Open the newest run tab."],
     ["Read the question and resolution criteria. Check the answer, rationale, and sources."],
     ["For rows you review: set review_verdict, fill review_last_official_value/current_value for baselines, fill reviewed_question_resolution_status/value for resolved outcomes, add review_source, and tick reviewed."],
-    ["Skip rows you don't review — they sync using the model q50 as the projected value."],
-    ["When finished, run leap-surveillance sync."],
+    ["Skip rows you don't review — their model values remain unreviewed."],
+    ["Multiple reviewers work the same tab — don't copy it. Use cell comments to flag questions or corrections."],
+    ["When finished, hand the tab to the pipeline owner for sync."],
     [""],
     ["Column groups"],
     ["Metadata", "Question name, status, target date, dimension, resolution state, question type/unit, full question text, and resolution criteria."],
     ["Model columns", "--both mode has GPT/Claude interleaved pairs. Forecast values come first, then official/current values and sources, then diagnostics."],
-    ["Consensus/stability", "Model agreement, q50 delta, run stability, runs seen, confidence tier, value-change flags."],
+    ["Consensus/stability", "Model agreement, q50/official-value deltas this run, forecast and official-value stability across runs, whether the official/current value changed since the last comparable run, runs seen, confidence tier."],
     ["Reviewer columns", "Fill these in."],
     ["Sync IDs", "review_row_id, group_question_id, question_id, surveillance_timestamp — leave alone."],
     [""],
     ["Key columns"],
     ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
-    ["question_resolution_status", "open / resolved / failed_to_resolve / projected. This is the model/system view of whether a target row has a resolution value."],
+    ["question_resolution_status", "System status: open / resolved / failed_to_resolve. projected is a reviewer provisional value."],
     ["question_resolution_value", "Model/system resolution value for this target row, if one exists. Human-confirmed values belong in reviewed_question_resolution_value."],
-    ["needs_review", "TRUE when the row likely needs human attention because it is resolved/due, changed, disagreed, or had extraction/quality issues."],
+    ["needs_review", "TRUE when the row likely needs human attention: resolved/due, the models disagreed, research/browser extraction had a problem, or the official/current value changed since the last comparable run (patched in post-publish, once that comparison is possible)."],
     ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved rows, which use gpt_resolution_value / claude_resolution_value instead."],
     ["gpt_resolution_value / claude_resolution_value", "Each model's confirmed value at the target date, for resolved (black) rows. Blank otherwise."],
-    ["gpt_color / claude_color", "black = resolved/known, white = no defensible estimate, gray = forecast/partial information."],
+    ["gpt_color / claude_color", "black = resolved; dark gray = hard bound; light gray = directional evidence; white = no range-narrowing evidence."],
     ["gpt_latest_official_value / claude_latest_official_value", "The most recent published official figure the model found."],
     ["gpt_current_estimate / claude_current_estimate", "The model's estimate of the current value (as of the run date). Different from gpt_q50/claude_q50, which is at the target date."],
     ["gpt_q25 / gpt_q75 / claude_q25 / claude_q75", "50% confidence interval (IQR) around gpt_q50 / claude_q50."],
     ["gpt_judge_confidence / claude_judge_confidence", "Judge's confidence in its adequacy assessment for this model's research."],
     ["gpt_missing_data / claude_missing_data", "Specific gaps the per-model judge flagged (e.g. STALE DATA, EXTRACTION FAILURE)."],
-    ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Auto-accept requires model adequacy, validation, color agreement, and agreement on shared official/current values."],
-    ["confidence_tier", "high = auto_accepted + both_stable. medium = auto_accepted + partially stable. low = everything else."],
+    ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Auto-accepted passed model, validation, and checked-value agreement; it is not human verification."],
+    ["confidence_tier", "high = safe to trust without opening the row. medium = probably fine, spot-check if unsure. low = review it. Note: auto_accepted alone doesn't require this-run q50 agreement (forecasts are expected to differ between models) - but high does, so a currently divergent forecast can't read as high confidence. Full definition in the All columns section below."],
+    ["forecast_stability / official_value_stability", "Cross-run consistency of this row's forecast (q50) and, separately, of the underlying last official value. Two different things: forecast is the model's judgment about the future; official value is the fact it's based on."],
     ["has_official_value", "TRUE if an authoritative last official value exists for this question."],
     ["has_current_value", "TRUE if a current-day estimate exists for this question."],
-    ["value_has_changed", "TRUE if either model's last official value or current estimate changed since the prior run. Blank on the first run."],
     ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value, from the cited source or a manual lookup."],
     ["review_current_value", "Human-verified current value as of the run date."],
     ["reviewed_question_resolution_status", "Human-verified resolution status: open / resolved / failed_to_resolve / projected."],
     ["reviewed_question_resolution_value", "Human-verified value at the question's resolution date. Use this for black/resolved rows instead of review_last_official_value."],
     ["review_source", "Source URL or citation for the verified values above."],
-    ["reviewed", "Tick when done with your review. All rows sync regardless — reviewed rows carry human values, unreviewed rows carry model projections."],
+    ["reviewed", "Tick when done. Reviewed values take priority; unreviewed rows retain model outputs."],
     [""],
     ["All columns"],
     ["question_name", "Short name identifying the question."],
     ["status", "resolved / due_unresolved / forecast / resolved_early."],
-    ["question_resolution_status", "open / resolved / failed_to_resolve / projected, derived from model outputs and row status."],
+    ["question_resolution_status", "System status: open / resolved / failed_to_resolve, derived from model outputs and row status. projected only ever appears in reviewed_question_resolution_status - a reviewer-entered value, never a system one."],
     ["question_resolution_value", "Model/system resolution value at the target date, when available."],
     ["question_resolution_source", "Source for question_resolution_value."],
     ["question_resolution_source_date", "Date the resolution source value represents."],
@@ -157,20 +170,23 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_latest_official_date / claude_latest_official_date", "Date that official figure was published or measured."],
     ["gpt_latest_official_source / claude_latest_official_source", "URL or citation for the latest official value."],
     ["gpt_current_estimate / claude_current_estimate", "Model's estimate of the current value as of the run date."],
-    ["gpt_current_estimate_confidence / claude_current_estimate_confidence", "Confidence in the current estimate (high / medium / low)."],
+    ["gpt_current_estimate_confidence / claude_current_estimate_confidence", "Confidence in the current estimate, 0-100."],
     ["gpt_rationale / claude_rationale", "Model's written explanation for its forecast."],
     ["gpt_sources / claude_sources", "Research URLs the model cited."],
     ["gpt_resolution_source / claude_resolution_source", "Source used for a resolved (black) row's resolution value."],
     ["gpt_resolution_source_date / claude_resolution_source_date", "Date of the resolution source."],
     ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed."],
-    ["consensus_q50_delta_pct", "|gpt_q50 − claude_q50| / mean(gpt_q50, claude_q50). Informational for non-timing questions; official/current values are the primary match signal."],
-    ["run_stability", "Aggregate cross-run stability: both_stable / one_stable / converging / volatile / new."],
-    ["gpt_run_stability / claude_run_stability", "Per-model q50 stability over the last 10 production runs."],
-    ["runs_seen", "Number of production runs that included this question (denominator for run_stability)."],
-    ["confidence_tier", "high / medium / low. Derived from consensus status and run stability."],
+    ["consensus_q50_delta_pct", "|gpt_q50 − claude_q50| / mean(gpt_q50, claude_q50), this run only."],
+    ["consensus_official_value_delta_pct", "Same idea as consensus_q50_delta_pct, but for the last official value: |gpt − claude| / mean(gpt, claude), averaged across dimensions, this run only. Blank when no official value applies (e.g. probability/when questions)."],
+    ["forecast_stability", "Cross-run consistency of THIS row's q50 (not shared across a question's other date/dimension rows): both_stable / one_stable / volatile / new."],
+    ["gpt_forecast_stability / claude_forecast_stability", "Per-model q50 stability for this row over the last 10 production runs."],
+    ["official_value_stability", "Cross-run consistency of the last official value for this question/dimension (shared across a question's date rows, since the official value itself doesn't vary by date): both_stable / one_stable / volatile / new. Blank when no official value applies."],
+    ["gpt_official_value_stability / claude_official_value_stability", "Per-model official-value stability over the last 10 production runs."],
+    ["official_value_changed / current_value_changed", "TRUE if the official value / current estimate moved (or appeared/disappeared) since the last comparable prior run, for at least one model. FALSE if a comparable prior run exists and nothing changed. Blank if no comparable prior run exists yet (first run, or every prior run used a different model version). Drives needs_review."],
+    ["runs_seen", "Number of comparable runs with an adequate q50 for this row."],
+    ["confidence_tier", "high = auto_accepted + forecast_stability both_stable + official_value_stability both_stable or n/a + this-run q50 agreement + seen in 3+ runs. medium = auto_accepted + forecast_stability both_stable or one_stable. low = everything else."],
     ["has_official_value", "TRUE if GPT or Claude found a published last official value for this question. FALSE for question types where no official figure exists."],
     ["has_current_value", "TRUE if GPT or Claude produced a current-day estimate for this question. FALSE where not applicable."],
-    ["value_has_changed", "TRUE if either model's last official value or current estimate changed since the prior run. FALSE = unchanged. Blank = first run."],
     ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value."],
     ["review_current_value", "Human-verified current value as of the run date."],
@@ -179,7 +195,7 @@ INSTRUCTIONS_CONTENT = [
     ["review_source", "Source URL or citation for the verified values above."],
     ["review_color", "Color override. Same options as gpt_color/claude_color."],
     ["review_notes", "Free-text notes."],
-    ["reviewed", "Tick when done with your review. All rows sync regardless — reviewed rows carry human values, unreviewed rows carry model projections."],
+    ["reviewed", "Tick when done. Reviewed values take priority; unreviewed rows retain model outputs."],
     ["review_row_id", "Stable Sheet row ID: surveillance_timestamp + group_question_id + target_date + dimension."],
     ["group_question_id", "BigQuery ID for the question group (dim_question_group)."],
     ["question_id", "BigQuery ID for the date/dimension question row (dim_question)."],
@@ -270,7 +286,6 @@ def _needs_review(
     *,
     row_status: str,
     consensus_status: str,
-    value_changed,
     gpt_view: dict,
     claude_view: dict,
     q_type: str = "",
@@ -278,10 +293,9 @@ def _needs_review(
     claude_q50=None,
 ) -> str:
     """Flag rows where human review is likely valuable before DWH confirmation."""
+    # stability columns aren't known yet at this point (computed post-publish) - check confidence_tier for that signal instead
     status_norm = str(row_status or "").strip().lower()
     if status_norm in ("resolved", "resolved_early", "due_unresolved"):
-        return "TRUE"
-    if value_changed is True:
         return "TRUE"
     if consensus_status and consensus_status != "auto_accepted":
         return "TRUE"
@@ -302,15 +316,255 @@ _RUN_TAB_RE = re.compile(r"^run_\d{8}_\d{6}$")
 
 
 def _latest_run_tab(sheet):
-    """Return the latest run_YYYYMMDD_HHMMSS worksheet, or None.
-
-    Strict format match: a manual tab like run_backup would otherwise sort after every
-    timestamped tab ('b' > '2') and silently become "latest" for sync.
-    """
+    """Return the latest run_YYYYMMDD_HHMMSS worksheet, or None."""
+    # strict format match - a manual tab like run_backup would otherwise sort after every timestamped tab ('b' > '2') and silently become "latest"
     run_tabs = [ws for ws in sheet.worksheets() if _RUN_TAB_RE.match(ws.title)]
     if not run_tabs:
         return None
     return max(run_tabs, key=lambda ws: ws.title)
+
+
+_RUN_HISTORY_TAB_RE = re.compile(r"^run_(\d{8}_\d{6})")
+
+
+def _sheets_retry(fn, *args, max_attempts: int = 5, base_delay: float = 2.0, **kwargs):
+    """Retry a Sheets API call with exponential backoff on rate-limit/transient server errors."""
+    import time
+    import gspread
+
+    for attempt in range(max_attempts):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 503) or attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(f"  Sheets API {status}, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_attempts})")
+            time.sleep(delay)
+
+
+def _dedupe_run_tabs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """One (title, run_id) per run_id - keeps the shortest title, since duplicate/renamed tabs (run_..._verified) would otherwise double-count as separate prior runs."""
+    by_run_id: dict[str, str] = {}
+    for title, rid in pairs:
+        if rid not in by_run_id or len(title) < len(by_run_id[rid]):
+            by_run_id[rid] = title
+    return [(title, rid) for rid, title in by_run_id.items()]
+
+
+def list_run_history_tabs(sheet_id: str, _sheet=None) -> list[tuple[str, str]]:
+    """(tab_name, run_id) for every run_<timestamp>[...] tab, newest first, one tab per run_id."""
+    # looser than _RUN_TAB_RE - also matches renamed/reviewed copies (run_..._verified) since reviewers only touch review_*/reviewed_* columns, not the model-output columns this reads
+    sheet = _sheet or _sheets_retry(lambda: get_sheets_client().open_by_key(sheet_id))
+    worksheets = _sheets_retry(sheet.worksheets)
+    found = [(ws.title, m.group(1)) for ws in worksheets if (m := _RUN_HISTORY_TAB_RE.match(ws.title))]
+    found = _dedupe_run_tabs(found)
+    found.sort(key=lambda pair: pair[1], reverse=True)
+    return found
+
+
+def read_run_tab_records(sheet_id: str, tab_name: str, _sheet=None) -> list[dict]:
+    """Raw row dicts (by header) for one run tab."""
+    import gspread
+
+    sheet = _sheet or _sheets_retry(lambda: get_sheets_client().open_by_key(sheet_id))
+    try:
+        ws = _sheets_retry(sheet.worksheet, tab_name)
+    except gspread.WorksheetNotFound:
+        return []
+    return _sheets_retry(ws.get_all_records)
+
+
+def _matching_tags(current_models: dict, prior_models: dict) -> set[str]:
+    """Which tags (gpt/claude) a prior run shares a model with - checked per model, not per tab, so a stale Claude version doesn't ride along on a GPT match."""
+    return {tag for tag, m in current_models.items() if m and prior_models.get(tag) == m}
+
+
+def annotate_stability_in_sheet(sheet_id: str, run_id: str, *, max_prior_runs: int = 10, scan_cap: int = 40) -> dict:
+    """Compute cross-run stability for a just-published tab entirely from the Sheet, and patch it back in."""
+    import gspread
+    from .storage import _classify_sequence, _combine_stability, _combine_change_flags, _value_changed  # pure, JSON-shape-agnostic
+
+    sheet = _sheets_retry(lambda: get_sheets_client().open_by_key(sheet_id))  # opened once, reused below — avoids one API round-trip per tab
+    tab_name = run_tab_name(run_id)
+    records = read_run_tab_records(sheet_id, tab_name, _sheet=sheet)
+    if not records:
+        return {"tab": tab_name, "rows_updated": 0, "prior_runs_used": 0}
+
+    current_models = {"gpt": records[0].get("gpt_model") or "", "claude": records[0].get("claude_model") or ""}
+
+    forecast_seq: dict[tuple, list] = defaultdict(list)   # (qid, tag, fdate, dim) -> [(q50, color), ...] oldest -> newest
+    official_seq: dict[tuple, list] = defaultdict(list)   # (qid, tag, dim) -> [(value, ""), ...] oldest -> newest, no date key
+    runs_seen: dict[tuple, set] = defaultdict(set)        # (qid, fdate, dim) -> {run_id, ...} - per row, not per question
+    q_types: dict[str, str] = {}
+    # tag -> {(qid, dim): {"official":.., "current":..}} for the single most-recent comparable prior run per tag
+    prior_snapshot: dict[str, dict[tuple, dict]] = {}
+
+    def ingest(rows: list[dict], rid: str, tags=("gpt", "claude")) -> None:
+        for row in rows:
+            qid = row.get("group_question_id") or ""
+            if not qid:
+                continue
+            q_type = row.get("question_type") or "quantile"
+            q_types.setdefault(qid, q_type)
+            fdate, dim = row.get("target_date", ""), row.get("dimension") or "Overall"
+            for tag in tags:
+                # judge_reason is populated on adequate rows too (the judge explains its verdict either way) - not a valid signal here.
+                adequate = not (row.get(f"{tag}_missing_data") or row.get(f"{tag}_validation_issues"))
+                if not adequate:
+                    continue
+                q50 = to_float(row.get(f"{tag}_q50"))
+                if q50 is not None:
+                    forecast_seq[(qid, tag, fdate, dim)].append((q50, row.get(f"{tag}_color", "")))
+                    runs_seen[(qid, fdate, dim)].add(rid)
+                official = to_float(row.get(f"{tag}_latest_official_value"))
+                if official is not None:
+                    official_seq[(qid, tag, dim)].append((official, ""))  # no color concept for a baseline fact - always relative tolerance
+
+    prior_runs_used = 0
+    for tab, rid in list_run_history_tabs(sheet_id, _sheet=sheet)[:scan_cap]:
+        if prior_runs_used >= max_prior_runs:
+            break
+        if rid == run_id:
+            continue
+        prior_records = read_run_tab_records(sheet_id, tab, _sheet=sheet)
+        if not prior_records:
+            continue
+        prior_models = {"gpt": prior_records[0].get("gpt_model") or "", "claude": prior_records[0].get("claude_model") or ""}
+        matching_tags = _matching_tags(current_models, prior_models)
+        if not matching_tags:
+            continue
+        ingest(prior_records, rid, tags=matching_tags)
+        for tag in matching_tags:
+            if tag in prior_snapshot:  # already captured from a newer matching prior run - this one's older, skip
+                continue
+            snap: dict[tuple, dict] = {}
+            for row in prior_records:
+                qid = row.get("group_question_id") or ""
+                if not qid:
+                    continue
+                dim = row.get("dimension") or "Overall"
+                adequate = not (row.get(f"{tag}_missing_data") or row.get(f"{tag}_validation_issues"))
+                snap[(qid, dim)] = {
+                    "official": to_float(row.get(f"{tag}_latest_official_value")) if adequate else None,
+                    "current": to_float(row.get(f"{tag}_current_estimate")) if adequate else None,
+                }
+            prior_snapshot[tag] = snap
+        prior_runs_used += 1
+
+    ingest(records, run_id)  # current run is the newest point
+
+    current_snapshot: dict[str, dict[tuple, dict]] = {"gpt": {}, "claude": {}}
+    for row in records:
+        qid = row.get("group_question_id") or ""
+        if not qid:
+            continue
+        dim = row.get("dimension") or "Overall"
+        for tag in ("gpt", "claude"):
+            adequate = not (row.get(f"{tag}_missing_data") or row.get(f"{tag}_validation_issues"))
+            current_snapshot[tag][(qid, dim)] = {
+                "official": to_float(row.get(f"{tag}_latest_official_value")) if adequate else None,
+                "current": to_float(row.get(f"{tag}_current_estimate")) if adequate else None,
+            }
+
+    official_stability_by_qdim: dict[tuple, dict] = {}  # (qid, dim) -> {gpt, claude, combined}
+
+    def _official_stability(qid: str, dim: str, q_type: str) -> dict:
+        key = (qid, dim)
+        if key not in official_stability_by_qdim:
+            gpt_s = _classify_sequence(official_seq.get((qid, "gpt", dim), []), q_type)
+            claude_s = _classify_sequence(official_seq.get((qid, "claude", dim), []), q_type)
+            official_stability_by_qdim[key] = {"gpt": gpt_s, "claude": claude_s, "combined": _combine_stability(gpt_s, claude_s)}
+        return official_stability_by_qdim[key]
+
+    change_flags_by_qdim: dict[tuple, dict] = {}  # (qid, dim) -> {"official_value_changed": "TRUE"/"FALSE"/"", "current_value_changed": ...}
+
+    def _change_flags(qid: str, dim: str, q_type: str) -> dict:
+        key = (qid, dim)
+        if key in change_flags_by_qdim:
+            return change_flags_by_qdim[key]
+        result = {}
+        for field in ("official_value", "current_value"):
+            snap_field = "official" if field == "official_value" else "current"
+            tag_results = []
+            for tag in ("gpt", "claude"):
+                if tag not in prior_snapshot:  # no comparable prior run at all for this model
+                    continue
+                prior_val = prior_snapshot[tag].get(key, {}).get(snap_field)
+                cur_val = current_snapshot[tag].get(key, {}).get(snap_field)
+                tag_results.append(_value_changed(prior_val, cur_val, q_type))
+            result[f"{field}_changed"] = _combine_change_flags(tag_results)
+        change_flags_by_qdim[key] = result
+        return result
+
+    # Each (question, date, dimension) row gets its own forecast_stability - no smearing one bad row's
+    # label onto its siblings. official_value_stability is legitimately shared within (question, dimension).
+    stability_by_row: dict[tuple, dict] = {}
+    for row in records:
+        qid = row.get("group_question_id") or ""
+        if not qid:
+            continue
+        row_key = (qid, row.get("target_date", ""), row.get("dimension") or "Overall")
+        if row_key in stability_by_row:
+            continue
+        dim = row_key[2]
+        q_type = q_types.get(qid, "quantile")
+        gpt_stab = _classify_sequence(forecast_seq.get((qid, "gpt", *row_key[1:]), []), q_type)
+        claude_stab = _classify_sequence(forecast_seq.get((qid, "claude", *row_key[1:]), []), q_type)
+        forecast_stab = _combine_stability(gpt_stab, claude_stab)
+        official = _official_stability(qid, dim, q_type)
+        changed = _change_flags(qid, dim, q_type)
+        n_runs = len(runs_seen.get(row_key, set()))
+        stability_by_row[row_key] = {
+            "confidence_tier": _confidence_tier(row.get("model_consensus", ""), forecast_stab, official["combined"], n_runs, row.get("consensus_q50_delta_pct")),
+            "forecast_stability": forecast_stab,
+            "gpt_forecast_stability": gpt_stab,
+            "claude_forecast_stability": claude_stab,
+            "official_value_stability": official["combined"] if official_seq.get((qid, "gpt", dim)) or official_seq.get((qid, "claude", dim)) else "",
+            "gpt_official_value_stability": official["gpt"] if official_seq.get((qid, "gpt", dim)) else "",
+            "claude_official_value_stability": official["claude"] if official_seq.get((qid, "claude", dim)) else "",
+            "official_value_changed": changed["official_value_changed"],
+            "current_value_changed": changed["current_value_changed"],
+            "runs_seen": n_runs,
+            "needs_review": "TRUE" if (is_truthy(row.get("needs_review")) or "TRUE" in (changed["official_value_changed"], changed["current_value_changed"])) else "FALSE",
+        }
+
+    ws = _sheets_retry(sheet.worksheet, tab_name)
+    headers = _sheets_retry(ws.row_values, 1)
+    try:
+        col_idxs = [headers.index(col) + 1 for col in _STABILITY_PATCH_COLS]
+    except ValueError as e:
+        return {"tab": tab_name, "rows_updated": 0, "prior_runs_used": prior_runs_used, "error": f"missing column: {e}"}
+
+    def _row_key(row: dict) -> tuple:
+        return (row.get("group_question_id") or "", row.get("target_date", ""), row.get("dimension") or "Overall")
+
+    values = [[stability_by_row.get(_row_key(row), {}).get(col, "") for col in _STABILITY_PATCH_COLS]
+              for row in records]
+
+    if col_idxs == list(range(col_idxs[0], col_idxs[0] + len(col_idxs))):
+        # Fast path: columns are contiguous and in order (true for every tab published under the current schema) - one range write.
+        start_a1 = gspread.utils.rowcol_to_a1(2, col_idxs[0])
+        end_a1 = gspread.utils.rowcol_to_a1(1 + len(records), col_idxs[-1])
+        _sheets_retry(ws.update, f"{start_a1}:{end_a1}", values, value_input_option="USER_ENTERED")
+    else:
+        # Older tab published under a prior schema version - columns may not be contiguous/ordered. Patch each column separately.
+        for i, col_idx in enumerate(col_idxs):
+            col_values = [[row[i]] for row in values]
+            start_a1 = gspread.utils.rowcol_to_a1(2, col_idx)
+            end_a1 = gspread.utils.rowcol_to_a1(1 + len(records), col_idx)
+            _sheets_retry(ws.update, f"{start_a1}:{end_a1}", col_values, value_input_option="USER_ENTERED")
+
+    # needs_review lives in _METADATA_COLS, far from the diagnostics block - patched separately to keep the fast range-write above intact
+    if "needs_review" in headers:
+        nr_col = headers.index("needs_review") + 1
+        nr_values = [[stability_by_row.get(_row_key(row), {}).get("needs_review", row.get("needs_review", ""))] for row in records]
+        start_a1 = gspread.utils.rowcol_to_a1(2, nr_col)
+        end_a1 = gspread.utils.rowcol_to_a1(1 + len(records), nr_col)
+        _sheets_retry(ws.update, f"{start_a1}:{end_a1}", nr_values, value_input_option="USER_ENTERED")
+
+    return {"tab": tab_name, "rows_updated": len(stability_by_row), "prior_runs_used": prior_runs_used}
 
 
 def _reorder_tabs(sheet) -> None:
@@ -456,6 +710,7 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
     mode = run_data.get("mode", "both")
     headers = _review_headers(mode)
     run_id = run_data.get("run_id", "unknown")
+    models = run_data.get("models") or {}
     rows: list[list] = []
 
     for question in run_data.get("questions", []):
@@ -474,15 +729,14 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
 
         consensus_block = question.get("consensus") or {}
         consensus_status_val = consensus_block.get("status", "") if consensus_block else ""
+        official_delta = consensus_block.get("official_delta_pct")
+        official_delta_str = "" if official_delta is None else f"{official_delta:.3f}"
         row_diff_by_key: dict[tuple, dict] = {
             (rd.get("forecast_date", ""), rd.get("dimension", "Overall")): rd
             for rd in consensus_block.get("row_diffs", []) or []
         }
-        stab = question.get("run_stability") or {}
-        run_stab = stab.get("run_stability", "")
-        gpt_run_stab = stab.get("gpt_run_stability", "")
-        claude_run_stab = stab.get("claude_run_stability", "")
-        runs_seen = stab.get("runs_seen", "")
+        # forecast_stability/official_value_stability/confidence_tier are computed after publish, by
+        # annotate_stability_in_sheet (reads this run's own tab + prior tabs from the Sheet) - blank here.
 
         for (fdate, dim) in sorted(all_keys):
             group_question_id = question.get("id", "")
@@ -500,7 +754,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
             row_diff = row_diff_by_key.get((fdate, dim)) or {}
             delta_pct = row_diff.get("delta_pct")
             delta_pct_str = "" if delta_pct is None else f"{delta_pct:.3f}"
-            value_changed = question.get("value_changed")
 
             row = {
                 "question_name": q_name,
@@ -511,7 +764,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "needs_review": _needs_review(
                     row_status=row_status,
                     consensus_status=consensus_status_val,
-                    value_changed=value_changed,
                     gpt_view=gpt_view,
                     claude_view=claude_view,
                     q_type=q_type,
@@ -568,14 +820,21 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "claude_resolution_source_date": claude_row["resolution_source_date"],
                 "model_consensus": consensus_status_val,
                 "consensus_q50_delta_pct": delta_pct_str,
-                "run_stability": run_stab,
-                "gpt_run_stability": gpt_run_stab,
-                "claude_run_stability": claude_run_stab,
-                "runs_seen": runs_seen,
-                "confidence_tier": _confidence_tier(consensus_status_val, run_stab),
+                "consensus_official_value_delta_pct": official_delta_str,
+                "forecast_stability": "",
+                "gpt_forecast_stability": "",
+                "claude_forecast_stability": "",
+                "official_value_stability": "",
+                "gpt_official_value_stability": "",
+                "claude_official_value_stability": "",
+                "official_value_changed": "",
+                "current_value_changed": "",
+                "runs_seen": "",
+                "gpt_model": models.get("gpt", ""),
+                "claude_model": models.get("claude", ""),
+                "confidence_tier": "",
                 "has_official_value": _has_official_value(gpt_row, claude_row),
                 "has_current_value": _has_current_value(gpt_row, claude_row),
-                "value_has_changed": "" if question.get("value_changed") is None else ("TRUE" if question.get("value_changed") else "FALSE"),
                 "review_verdict": "",
                 "review_last_official_value": "",
                 "review_current_value": "",
@@ -755,10 +1014,15 @@ def _has_current_value(gpt_row: dict, claude_row: dict) -> bool:
     return bool(ce and "not applicable" not in str(ce).lower())
 
 
-def _confidence_tier(model_consensus: str, run_stability: str) -> str:
-    if model_consensus == "auto_accepted" and run_stability == "both_stable":
+def _confidence_tier(model_consensus: str, forecast_stability: str, official_value_stability: str = "", runs_seen="", consensus_q50_delta_pct=None) -> str:
+    """high / medium / low - this-run agreement plus forecast and official-value stability, gated on this-run q50 agreement too so a currently divergent forecast can't read as high."""
+    n = to_float(runs_seen) or 0
+    official_ok = official_value_stability in ("", "both_stable")  # "" means not-applicable (e.g. probability/when types have no official value) - never blocks "high"
+    delta = to_float(consensus_q50_delta_pct)
+    q50_ok = delta is None or delta <= Q50_TOLERANCE  # blank means n/a (e.g. single-model run) - never blocks "high"
+    if model_consensus == "auto_accepted" and forecast_stability == "both_stable" and official_ok and q50_ok and n >= 3:
         return "high"
-    if model_consensus == "auto_accepted" and run_stability in ("converging", "one_stable"):
+    if model_consensus == "auto_accepted" and forecast_stability in ("both_stable", "one_stable"):
         return "medium"
     return "low"
 
@@ -768,8 +1032,8 @@ def _header_width(col: str) -> int:
     for prefix in ("gpt_", "claude_"):
         if col.startswith(prefix):
             return _FIELD_WIDTH.get(col[len(prefix):], _M)
-    if col in ("consensus_q50_delta_pct", "reviewed", "runs_seen", "needs_review",
-               "gpt_run_stability", "claude_run_stability", "has_official_value", "has_current_value", "value_has_changed"):
+    if col in ("consensus_q50_delta_pct", "consensus_official_value_delta_pct", "reviewed", "runs_seen", "needs_review",
+               "forecast_stability", "official_value_stability", "has_official_value", "has_current_value"):
         return _N
     return _M
 

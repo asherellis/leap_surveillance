@@ -92,12 +92,6 @@ DEV_QUESTION_IDS = (
     "10a514657ba6e075f831ef8d5e4635ffd9003f24e0f6a2e4db8f95999c98bfeb",  # U.S. versus China Polarity (multi-dim)
 )
 
-# TEMPORARY - remove once Airtable backfills question_horizon_date=2040-12-31 for these (data gap, RC already states the date).
-MISSING_HORIZON_DATE_OVERRIDES = {
-    "9d0f9fa9fcbda247ab2231c6ea41d78539754f36edaeea3ab06d3f45274041c6": "2040-12-31",  # Determinants of "AGI" Progress, Part II (1)
-    "9ead8457145e4705f395e3eaab9c370cf58089f102d3d66eb6613447eb22b58d": "2040-12-31",  # Determinants of "AGI" Progress, Part II (2)
-}
-
 
 def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
 
@@ -108,7 +102,7 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
 
     # Conditional (scenario) questions are excluded: scenario_id IS NULL is filtered per-row,
     # before any GROUP BY, so mixed groups keep only their unconditional questions and
-    # fully-conditional groups drop out entirely. See memory/conditional_questions.md.
+    # fully-conditional groups drop out entirely.
     query = f"""
     WITH forecast_groups AS (
         SELECT qg.question_group_id, qg.question_group_name
@@ -154,9 +148,6 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
                 if not is_empty(d)
             }
         )
-        override_date = MISSING_HORIZON_DATE_OVERRIDES.get(row.get("question_set_id"))
-        if override_date and not dates:
-            dates = [override_date]
         dimensions = sorted(
             {
                 safe_str(d).strip()
@@ -175,7 +166,6 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
         question_text = safe_str(row.get("question_set_text"))
         unit_name = safe_str(row.get("unit_name"))
 
-        # Genuinely empty groups only - a missing date alone is handled by the override above, not here.
         if not dates and not source_percentiles:
             print(f"  warning: skipping '{row.get('question_set_name')}' - no date or percentile data, cannot build a forecast")
             continue
@@ -202,8 +192,6 @@ def load_questions(limit=None, dev=False) -> list[QuestionSpec]:
             raw_date = r.get("question_resolution_date")
             if not is_empty(raw_date):
                 fdate = str(raw_date).strip()
-            elif override_date:
-                fdate = override_date
             else:
                 fdate = TIMING_FORECAST_DATE
             # NaN is truthy, so `or "Overall"` alone would produce a "nan" key; use is_empty.
