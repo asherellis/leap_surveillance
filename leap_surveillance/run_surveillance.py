@@ -453,17 +453,14 @@ def cmd_run(args):
     if mode in ("claude", "both") and not os.environ.get("ANTHROPIC_API_KEY"):
         print("Error: ANTHROPIC_API_KEY not set; required for --claude and --both modes. Rerun with --gpt to skip Claude.")
         return 2
-    if not args.yes:
-        active_models = {
-            "gpt": active_model,
-            "claude": TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL,
-            "both": f"{active_model} + {TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL}",
-        }[mode]
-        print(f"Mode: {mode} ({active_models})")
-        print(f"Limit: {args.limit or 'all'}")
-        print(f"Sheet: {'skip' if args.no_sheet else 'yes'}")
-        if input("Continue? [y/N] ").lower() != "y":
-            return
+    active_models = {
+        "gpt": active_model,
+        "claude": TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL,
+        "both": f"{active_model} + {TEST_CLAUDE_MODEL if args.test_mode else CLAUDE_RESEARCH_MODEL}",
+    }[mode]
+    print(f"Mode: {mode} ({active_models})")
+    print(f"Limit: {args.limit or 'all'}")
+    print(f"Sheet: {'skip' if args.no_sheet else 'yes'}")
 
     print("Loading questions from BigQuery...")
     questions = load_questions(None if args.questions else args.limit, dev=args.dev)
@@ -554,8 +551,10 @@ def cmd_run(args):
         consensus_blocks=consensus_blocks,
         errors_list=errors_list,
     )
-    # Dev/test runs must never pollute production stability history, and vice versa.
-    run_data["environment"] = "dev" if (args.dev or args.test_mode) else "prod"
+    # Every run publishes to Dev - Prod only ever gets a tab via `sync`, which promotes
+    # a reviewed Dev tab there once it's ready. Stability history stays safe either way since
+    # cross-run comparison already gates on matching model versions, not on this tag.
+    run_data["environment"] = "dev"
     json_path = write_json_output(run_data, DEFAULT_OUTPUT_DIR)
     try:
         os.remove(partial_path)
@@ -577,14 +576,13 @@ def cmd_run(args):
     print(f"Estimated cost: ${s['total_cost']:.4f}")
 
     if not args.no_sheet:
-        target_env_var = "LEAP_DEV_SHEET_ID" if run_data["environment"] == "dev" else "LEAP_SHEET_ID"
-        target_id = DEFAULT_DEV_SHEET_ID if run_data["environment"] == "dev" else DEFAULT_SHEET_ID
+        target_id = DEFAULT_DEV_SHEET_ID
         if not target_id:
-            print(f"Sheet publishing skipped: {target_env_var} is not set (see .env.example)")
+            print("Sheet publishing skipped: LEAP_DEV_SHEET_ID is not set (see .env.example)")
         else:
             try:
                 n = publish_to_sheet(run_data, target_id)
-                print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}' ({run_data['environment']})")
+                print(f"Published {n} rows to Sheet tab '{run_tab_name(run_id)}'")
             except Exception as e:
                 print(f"Sheet publishing failed: {e}")
             else:
@@ -596,12 +594,19 @@ def cmd_run(args):
 
 
 def cmd_setup(args):
-    if not args.yes:
-        confirm = input("Rebuild the Instructions tab from current code? Per-run review tabs are not touched. [y/N] ")
-        if confirm.lower() != "y":
-            print("Aborted.")
-            return
-    setup_sheet(DEFAULT_SHEET_ID)
+    if not DEFAULT_DEV_SHEET_ID and not DEFAULT_SHEET_ID:
+        print("Neither LEAP_DEV_SHEET_ID nor LEAP_SHEET_ID is set (see .env.example) - nothing to rebuild.")
+        return
+    if DEFAULT_DEV_SHEET_ID:
+        setup_sheet(DEFAULT_DEV_SHEET_ID)
+        print("Rebuilt Instructions on Dev.")
+    else:
+        print("Skipped Dev: LEAP_DEV_SHEET_ID is not set.")
+    if DEFAULT_SHEET_ID:
+        setup_sheet(DEFAULT_SHEET_ID)
+        print("Rebuilt Instructions on Prod.")
+    else:
+        print("Skipped Prod: LEAP_SHEET_ID is not set.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -611,12 +616,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s run --limit 5        Run surveillance on 5 questions
-  %(prog)s run --limit 5 -y     Same, skip confirmation
-  %(prog)s sync                          Dry-run: print what the latest tab would sync, no write
-  %(prog)s sync --tab run_...            Dry-run: print what a specific tab would sync, no write
-  %(prog)s sync --tab run_... --write    Sync that tab to BigQuery (--tab required with --write)
-  %(prog)s setup                Rebuild the Instructions tab
+  %(prog)s run --limit 5           Run surveillance on 5 questions
+  %(prog)s sync --tab run_...      Write that Dev tab to BigQuery, then promote it to Prod
+  %(prog)s setup                   Rebuild the Instructions tab on both Dev and Prod
         """,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -645,10 +647,9 @@ Examples:
         "--workers",
         "-w",
         type=int,
-        default=1,
-        help="Parallel question workers (default 1, recommended 5)",
+        default=3,
+        help="Parallel question workers (default 3)",
     )
-    run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
     model_group = run_parser.add_mutually_exclusive_group()
     model_group.add_argument("--gpt", dest="mode_flag", action="store_const", const="gpt",
@@ -658,12 +659,10 @@ Examples:
     model_group.add_argument("--both", dest="mode_flag", action="store_const", const="both",
                               help="Run both GPT and Claude in parallel (default)")
 
-    sync_parser = subparsers.add_parser("sync", help="Sync a run tab to BigQuery")
-    sync_parser.add_argument("--write", action="store_true", help="Actually write to BigQuery. Requires --tab. Without this flag, sync only previews what would be written.")
-    sync_parser.add_argument("--tab", type=str, default=None, help="Specific run_<run_id> tab to read (default: most recent). Required when --write is set.")
+    sync_parser = subparsers.add_parser("sync", help="Finalize a reviewed Dev tab: write to BigQuery, then promote it to Prod")
+    sync_parser.add_argument("--tab", type=str, required=True, help="run_<run_id> tab to finalize, from the Dev sheet")
 
-    setup_parser = subparsers.add_parser("setup", help="Rebuild the Instructions tab (does not touch run_* tabs)")
-    setup_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    subparsers.add_parser("setup", help="Rebuild the Instructions tab on both Dev and Prod (does not touch run_* tabs)")
 
     return parser
 

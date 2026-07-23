@@ -3,8 +3,8 @@
 import json
 import os
 
-from .common import DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, safe_str
-from .sheets import get_reviewed_items
+from .common import DEFAULT_DEV_SHEET_ID, DEFAULT_OUTPUT_DIR, DEFAULT_SHEET_ID, safe_str
+from .sheets import RUN_TAB_PREFIX, get_reviewed_items, promote_tab_to_prod, run_tab_name
 from .storage import (
     write_to_fact_resolution,
     write_to_dim_baseline,
@@ -80,11 +80,22 @@ def _write_run_items(run_id: str, items: list[dict]) -> int:
 
 
 def cmd_sync(args) -> int:
-    if args.write and not args.tab:
-        print("--write requires --tab <run_id> - pass it explicitly so a write can never target whatever happens to be the latest tab.")
+    if not DEFAULT_DEV_SHEET_ID:
+        print("LEAP_DEV_SHEET_ID is not set (see .env.example) - sync reads from the Dev sheet, nothing to do without it.")
+        return 1
+    if not DEFAULT_SHEET_ID:
+        print("LEAP_SHEET_ID is not set (see .env.example) - sync promotes to the Prod sheet, nothing to promote to without it.")
         return 1
 
-    all_items, _ = get_reviewed_items(DEFAULT_SHEET_ID, tab_name=args.tab, reviewed_only=False)
+    all_items, _ = get_reviewed_items(DEFAULT_DEV_SHEET_ID, tab_name=args.tab, reviewed_only=False)
+
+    expected_run_id = args.tab.removeprefix(RUN_TAB_PREFIX)
+    mismatched = [r for r in all_items if r.get("run_id") != expected_run_id]
+    if mismatched:
+        bad_ids = sorted({r.get("run_id") for r in mismatched})
+        print(f"Aborting: {len(mismatched)} row(s) on tab {args.tab} carry a run_id that doesn't match the tab ({bad_ids}) - the tab's surveillance_timestamp cells may have been edited or copied from elsewhere.")
+        return 1
+
     reviewed_count = sum(1 for r in all_items if r.get("reviewed"))
     rlov_count = sum(1 for r in all_items if r.get("review_last_official_value") not in (None, ""))
     rres_count = sum(1 for r in all_items if r.get("reviewed_question_resolution_value") not in (None, ""))
@@ -96,10 +107,6 @@ def cmd_sync(args) -> int:
 
     _print_sheet_rows(all_items)
 
-    if not args.write:
-        print(f"\n{len(all_items)} rows. Re-run with --write to write to BQ.")
-        return 0
-
     by_run: dict[str, list[dict]] = {}
     for item in all_items:
         by_run.setdefault(item.get("run_id", ""), []).append(item)
@@ -107,8 +114,16 @@ def cmd_sync(args) -> int:
     total_failures = 0
     for run_id, items in by_run.items():
         total_failures += _write_run_items(run_id, items)
+        # promotion happens regardless of the BQ outcome above - a warehouse hiccup shouldn't block
+        # preserving the reviewed record in Prod, which is the only path a tab ever reaches Prod.
+        try:
+            promote_tab_to_prod(DEFAULT_DEV_SHEET_ID, DEFAULT_SHEET_ID, run_id)
+            print(f"Promoted {run_tab_name(run_id)} to Prod")
+        except Exception as e:
+            total_failures += 1
+            print(f"Promote to Prod failed ({run_id}): {e}")
 
     if total_failures:
-        print(f"\nsync finished with {total_failures} failed BigQuery write(s) — re-run after fixing; writes are idempotent MERGEs.")
+        print(f"\nsync finished with {total_failures} failed operation(s) — re-run after fixing; BQ writes are idempotent MERGEs, promotion overwrites cleanly.")
         return 1
     return 0

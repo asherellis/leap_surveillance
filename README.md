@@ -9,9 +9,18 @@ This pipeline intentionally excludes conditional questions for now.
 
 ## Setup
 
+macOS / Linux:
+
 ```bash
 cp .env.example .env
 python3 -m pip install -e .
+```
+
+Windows:
+
+```bat
+copy .env.example .env
+python -m pip install -e .
 ```
 
 Required in `.env` for the default `--both` mode:
@@ -27,31 +36,36 @@ Optional config (sheet ID, BQ project, model overrides) is in `.env.example`.
 ## Run
 
 ```bash
-leap-surveillance run --both -y                            # dual-model run (default)
-leap-surveillance run --gpt -y                             # GPT only
-leap-surveillance run --claude -y                          # Claude only
-leap-surveillance run --test-mode --limit 3 --no-sheet -y  # cheap smoke test
-leap-surveillance run --questions <id1>,<id2> -y           # specific questions
+leap-surveillance run --both                            # dual-model run (default)
+leap-surveillance run --gpt                             # GPT only
+leap-surveillance run --claude                          # Claude only
+leap-surveillance run --test-mode --limit 3 --no-sheet  # cheap smoke test
+leap-surveillance run --questions <id1>,<id2>           # specific questions
 ```
 
 ## Review and sync
 
-Each run creates a Sheet tab named `run_<run_id>`. The **Instructions** tab explains the
-columns and the `status` values (`resolved`, `due_unresolved`, `forecast`, `resolved_early`).
+Every run publishes to the Dev sheet (`LEAP_DEV_SHEET_ID`), as a tab named `run_<run_id>`,
+unless `--no-sheet` is passed. Review happens there. The Prod sheet (`LEAP_SHEET_ID`) is never written to directly - it only
+ever receives a tab via promotion (below), and is not meant to be edited. The **Instructions**
+tab on either sheet explains the columns and the `status` values (`resolved`, `due_unresolved`,
+`forecast`, `resolved_early`).
 
-Fill the `review_*` columns, tick `reviewed`, then:
+Fill the `review_*` columns, tick `reviewed` on the rows you've settled - partial review is fine,
+finalizing doesn't require every row to be reviewed - then:
 
 ```bash
-leap-surveillance sync --tab run_<run_id>          # previews that tab's rows without writing
-leap-surveillance sync --tab run_<run_id> --write   # writes dim_baseline + fact_resolution + surveillance_result
+leap-surveillance sync --tab run_<run_id>
 ```
 
-`sync` without `--tab` reads the most recent `run_*` tab, but `--tab` is required whenever `--write` is set — an actual write always names its tab explicitly.
-All Sheet rows sync to `surveillance.surveillance_result`; reviewed rows include human
-review fields, and unreviewed rows carry model projections. Historical/current baselines
-sync to `dim.dim_baseline`. Resolved or projected target-date values sync to
-`fact.fact_resolution`.
-To rebuild only the Instructions tab: `leap-surveillance setup -y`.
+`--tab` is required — sync always names its tab explicitly, never guesses at "the latest one."
+It does two things, in order: writes all Sheet rows to `surveillance.surveillance_result`
+(reviewed rows carry human review fields, unreviewed rows carry model projections),
+`dim.dim_baseline`, and `fact.fact_resolution`; then copies that same Dev tab into the Prod sheet,
+overwriting any earlier promotion of the same tab. The promotion step runs regardless of whether
+the BigQuery writes succeeded, so a warehouse hiccup doesn't block preserving the reviewed record
+in Prod - but any failure (BigQuery or promotion) is still reported and exits nonzero.
+To rebuild the Instructions tab on both sheets: `leap-surveillance setup`.
 
 ## Troubleshooting
 
@@ -59,12 +73,25 @@ To rebuild only the Instructions tab: `leap-surveillance setup -y`.
 `Max retries exceeded ... oauth2.googleapis.com`), while `curl https://oauth2.googleapis.com` works
 fine in the same terminal: your Python venv's bundled `certifi` cert store doesn't recognize a CA
 your network injects (common on university/corporate networks with their own network-auth
-profile). Point Python at the OS trust store instead:
+profile). Point Python at your OS's trust store instead:
+
+macOS:
 
 ```bash
 export SSL_CERT_FILE=/etc/ssl/cert.pem
 export REQUESTS_CA_BUNDLE=/etc/ssl/cert.pem
 ```
 
-This is a local network/environment issue, not a pipeline bug — don't add these to `.env` or hardcode
-them in code, since that would mask real cert errors for people who don't have this problem.
+Linux (path varies by distro - Debian/Ubuntu shown; RHEL/Fedora use `/etc/pki/tls/certs/ca-bundle.crt`):
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+```
+
+On Windows there's no equivalent PEM file - Python doesn't read the Windows Certificate Store by
+default. Install `pip-system-certs` instead (`python -m pip install pip-system-certs`), which
+patches Python's SSL calls to use the OS trust store automatically.
+
+This is a local network/environment issue, not a pipeline bug — setting these globally would hide
+unrelated certificate errors, so don't add them to `.env` or hardcode them in code.

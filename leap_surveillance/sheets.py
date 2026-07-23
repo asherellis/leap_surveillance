@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .common import (
-    DEFAULT_SHEET_ID,
+    DEFAULT_DEV_SHEET_ID,
     NEVER_YEAR,
     Q50_TOLERANCE,
     SHEET_TEXT_LIMIT,
@@ -92,6 +92,7 @@ RESOLUTION_STATUS_OPTIONS = ["open", "resolved", "failed_to_resolve", "projected
 INSTRUCTIONS_CONTENT = [
     ["LEAP Surveillance Review"],
     ["Use this sheet to review the results from each LEAP surveillance run."],
+    ["Every run publishes here, to the Dev sheet - this is where review happens. Once a tab is ready, running sync promotes a copy of it to the Prod sheet, which holds only finalized tabs and isn't edited directly."],
     ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
     [""],
     ["How to review"],
@@ -100,7 +101,7 @@ INSTRUCTIONS_CONTENT = [
     ["For rows you review: set review_verdict, fill review_last_official_value/current_value for baselines, fill reviewed_question_resolution_status/value for resolved outcomes, add review_source, and tick reviewed."],
     ["Skip rows you don't review — their model values remain unreviewed."],
     ["Multiple reviewers work the same tab — don't copy it. Use cell comments to flag questions or corrections."],
-    ["When finished, hand the tab to the pipeline owner for sync."],
+    ["When ready to finalize - even with some rows still unreviewed - the pipeline owner runs sync --tab run_<run_id>. This writes reviewed rows to BigQuery and promotes the tab to Prod in one step."],
     [""],
     ["Column groups"],
     ["Metadata", "Question name, status, target date, dimension, resolution state, question type/unit, full question text, and resolution criteria."],
@@ -583,6 +584,32 @@ def _reorder_tabs(sheet) -> None:
         sheet.reorder_worksheets(ordered)
 
 
+def promote_tab_to_prod(dev_sheet_id: str, prod_sheet_id: str, run_id: str) -> str:
+    """Copy a reviewed Dev tab into Prod as-is - partial review included, this is the only path data reaches Prod. Re-promoting overwrites rather than duplicating."""
+    import gspread
+
+    tab_name = run_tab_name(run_id)
+    dev_sheet = _sheets_retry(lambda: get_sheets_client().open_by_key(dev_sheet_id))
+    dev_ws = _sheets_retry(dev_sheet.worksheet, tab_name)
+
+    prod_sheet = _sheets_retry(lambda: get_sheets_client().open_by_key(prod_sheet_id))
+
+    # copy in first, under whatever title Sheets assigns - if this fails, the existing
+    # Prod tab (if any) is untouched, instead of being deleted with nothing to replace it
+    result = _sheets_retry(dev_ws.copy_to, prod_sheet_id)
+    new_ws = _sheets_retry(prod_sheet.get_worksheet_by_id, result["sheetId"])
+
+    try:
+        existing = _sheets_retry(prod_sheet.worksheet, tab_name)
+        _sheets_retry(prod_sheet.del_worksheet, existing)
+    except gspread.WorksheetNotFound:
+        pass
+
+    _sheets_retry(new_ws.update_title, tab_name)
+    _reorder_tabs(prod_sheet)
+    return tab_name
+
+
 def _render_when_year(value: str) -> str:
     """Display the 'never' sentinel as a human-readable label."""
     if not value:
@@ -854,7 +881,7 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
     return rows, headers
 
 
-def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_SHEET_ID) -> int:
+def publish_to_sheet(run_data: dict, sheet_id: str = DEFAULT_DEV_SHEET_ID) -> int:
     """Publish a run to a formatted `run_<run_id>` tab."""
     client = get_sheets_client()
     sheet = client.open_by_key(sheet_id)
@@ -1135,7 +1162,7 @@ def _create_run_tab(sheet, tab_name: str, headers: list[str]):
     return ws
 
 
-def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
+def setup_sheet(sheet_id: str = DEFAULT_DEV_SHEET_ID) -> None:
     """Refresh the Instructions tab without touching run tabs."""
     import gspread
 
@@ -1157,7 +1184,7 @@ def setup_sheet(sheet_id: str = DEFAULT_SHEET_ID) -> None:
 
 
 def get_reviewed_items(
-    sheet_id: str = DEFAULT_SHEET_ID,
+    sheet_id: str = DEFAULT_DEV_SHEET_ID,
     tab_name: str | None = None,
     reviewed_only: bool = True,
 ) -> tuple[list[dict], list[int]]:
