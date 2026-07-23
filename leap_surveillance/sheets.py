@@ -99,7 +99,7 @@ def _instructions_intro(is_dev: bool) -> list[list[str]]:
         ]
     return [
         ["LEAP Surveillance Review - Prod"],
-        ["This sheet holds finalized run tabs only - it is not where review happens."],
+        ["This sheet holds finalized run tabs."],
         ["Each tab here is a promoted copy of a reviewed Dev tab. Review and edits happen on the Dev sheet; running sync there copies the finished tab here, overwriting any earlier promotion of the same run rather than duplicating it. This Instructions tab is the one thing rebuilt directly on both sheets, by setup."],
         ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
     ]

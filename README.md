@@ -49,6 +49,9 @@ Every run publishes a `run_<run_id>` tab to the Dev sheet unless `--no-sheet` is
 Review the `review_*` fields there; partial review is fine. Prod receives promoted reference
 copies and should not be edited directly.
 
+- [Dev review Sheet](https://docs.google.com/spreadsheets/d/1lT7zVfKAsVZU7bKaEALq1AWApfFmWMisprTK42l7RDo)
+- [Prod verified Sheet](https://docs.google.com/spreadsheets/d/1OsFxYG9ar5JtIn7kkYbPEwKJGGRfTsjBnzOtQfPTbAc)
+
 ```bash
 leap-surveillance sync --tab run_<run_id>
 ```
