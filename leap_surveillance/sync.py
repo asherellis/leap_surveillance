@@ -39,7 +39,7 @@ def _load_run_data(run_id: str) -> dict | None:
 
 
 def _write_run_items(run_id: str, items: list[dict]) -> int:
-    """Write one run's reviewed rows to the three BQ tables. Returns the number of failed writes."""
+    """Write one run's rows to the three BQ tables (reviewed values take priority; unreviewed rows keep model values). Returns the number of failed writes."""
     run_data = _load_run_data(run_id)
     if run_data is None:
         return 1

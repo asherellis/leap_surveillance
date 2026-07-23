@@ -89,25 +89,46 @@ VERDICT_OPTIONS = ["correct", "close", "partially right", "wrong", "confidently 
 COLOR_OPTIONS = ["black", "dark gray", "light gray", "white"]
 RESOLUTION_STATUS_OPTIONS = ["open", "resolved", "failed_to_resolve", "projected"]
 
-INSTRUCTIONS_CONTENT = [
-    ["LEAP Surveillance Review"],
-    ["Use this sheet to review the results from each LEAP surveillance run."],
-    ["Every run publishes here, to the Dev sheet - this is where review happens. Once a tab is ready, running sync promotes a copy of it to the Prod sheet, which holds only finalized tabs and isn't edited directly."],
-    ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
-    [""],
+def _instructions_intro(is_dev: bool) -> list[list[str]]:
+    if is_dev:
+        return [
+            ["LEAP Surveillance Review - Dev"],
+            ["Use this sheet to review the results from each LEAP surveillance run."],
+            ["Every run publishes here, to the Dev sheet - this is where review happens. Once a tab is ready, running sync promotes a copy of it to the Prod sheet, which holds only finalized tabs and isn't edited directly."],
+            ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
+        ]
+    return [
+        ["LEAP Surveillance Review - Prod"],
+        ["This sheet holds finalized run tabs only - it is not where review happens."],
+        ["Each tab here is a promoted copy of a reviewed Dev tab. Review and edits happen on the Dev sheet; running sync there copies the finished tab here, overwriting any earlier promotion of the same run rather than duplicating it. This Instructions tab is the one thing rebuilt directly on both sheets, by setup."],
+        ["Each run gets its own run_<run_id> tab. Each row is one question x target_date x dimension."],
+    ]
+
+
+_HOW_TO_DEV = [
     ["How to review"],
     ["Open the newest run tab."],
     ["Read the question and resolution criteria. Check the answer, rationale, and sources."],
     ["For rows you review: set review_verdict, fill review_last_official_value/current_value for baselines, fill reviewed_question_resolution_status/value for resolved outcomes, add review_source, and tick reviewed."],
     ["Skip rows you don't review — their model values remain unreviewed."],
     ["Multiple reviewers work the same tab — don't copy it. Use cell comments to flag questions or corrections."],
-    ["When ready to finalize - even with some rows still unreviewed - the pipeline owner runs sync --tab run_<run_id>. This writes reviewed rows to BigQuery and promotes the tab to Prod in one step."],
+    ["When ready to finalize - even with some rows still unreviewed - the pipeline owner runs sync --tab run_<run_id>. This writes the full run to BigQuery (reviewed values take priority; unreviewed rows keep model values) and promotes the tab to Prod in one step."],
+]
+
+_HOW_TO_PROD = [
+    ["How to use this sheet"],
+    ["This tab is a reference copy of a reviewed Dev tab — don't edit rows here."],
+    ["To correct or update something, make the change on the matching run_<run_id> tab on the Dev sheet, then have the pipeline owner re-run sync --tab run_<run_id> to re-promote it here."],
+    ["The column reference below describes the same columns you'll see on Dev."],
+]
+
+_INSTRUCTIONS_BODY = [
     [""],
     ["Column groups"],
     ["Metadata", "Question name, status, target date, dimension, resolution state, question type/unit, full question text, and resolution criteria."],
     ["Model columns", "--both mode has GPT/Claude interleaved pairs. Forecast values come first, then official/current values and sources, then diagnostics."],
     ["Consensus/stability", "Model agreement, q50/official-value deltas this run, forecast and official-value stability across runs, whether the official/current value changed since the last comparable run, runs seen, confidence tier."],
-    ["Reviewer columns", "Fill these in."],
+    ["Reviewer columns", "The human review fields, filled in during Dev review."],
     ["Sync IDs", "review_row_id, group_question_id, question_id, surveillance_timestamp — leave alone."],
     [""],
     ["Key columns"],
@@ -124,11 +145,11 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_judge_confidence / claude_judge_confidence", "Judge's confidence in its adequacy assessment for this model's research."],
     ["gpt_missing_data / claude_missing_data", "Specific gaps the per-model judge flagged (e.g. STALE DATA, EXTRACTION FAILURE)."],
     ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Auto-accepted passed model, validation, and checked-value agreement; it is not human verification."],
-    ["confidence_tier", "high = safe to trust without opening the row. medium = probably fine, spot-check if unsure. low = review it. Note: auto_accepted alone doesn't require this-run q50 agreement (forecasts are expected to differ between models) - but high does, so a currently divergent forecast can't read as high confidence. Full definition in the All columns section below."],
+    ["confidence_tier", "high = lowest review priority - stable across runs and models agree, not human-verified. medium = probably fine, spot-check if unsure. low = review it. Note: auto_accepted alone doesn't require this-run q50 agreement (forecasts are expected to differ between models) - but high does, so a currently divergent forecast can't read as high confidence. Full definition in the All columns section below."],
     ["forecast_stability / official_value_stability", "Cross-run consistency of this row's forecast (q50) and, separately, of the underlying last official value. Two different things: forecast is the model's judgment about the future; official value is the fact it's based on."],
-    ["has_official_value", "TRUE if an authoritative last official value exists for this question."],
+    ["has_official_value", "TRUE if GPT or Claude reported a published last official value for this question - not an independent check that the value is authoritative."],
     ["has_current_value", "TRUE if a current-day estimate exists for this question."],
-    ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
+    ["review_verdict", "correct = the model(s) got it right (both, on --both runs; the one model, on a single-model run). close = roughly right. partially right = right direction but wrong magnitude, or (on --both runs) one model right and the other wrong. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value, from the cited source or a manual lookup."],
     ["review_current_value", "Human-verified current value as of the run date."],
     ["reviewed_question_resolution_status", "Human-verified resolution status: open / resolved / failed_to_resolve / projected."],
@@ -138,21 +159,21 @@ INSTRUCTIONS_CONTENT = [
     [""],
     ["All columns"],
     ["question_name", "Short name identifying the question."],
-    ["status", "resolved / due_unresolved / forecast / resolved_early."],
+    ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
     ["question_resolution_status", "System status: open / resolved / failed_to_resolve, derived from model outputs and row status. projected only ever appears in reviewed_question_resolution_status - a reviewer-entered value, never a system one."],
-    ["question_resolution_value", "Model/system resolution value at the target date, when available."],
+    ["question_resolution_value", "Model/system resolution value at the target date, when available. Human-confirmed values belong in reviewed_question_resolution_value instead."],
     ["question_resolution_source", "Source for question_resolution_value."],
     ["question_resolution_source_date", "Date the resolution source value represents."],
-    ["needs_review", "TRUE if this row should be manually inspected before treating it as confirmed."],
+    ["needs_review", "TRUE when the row likely needs human attention: resolved/due, the models disagreed, research/browser extraction had a problem, or the official/current value changed since the last comparable run (patched in post-publish, once that comparison is possible)."],
     ["target_date", "The date this forecast row is predicting. One question may have multiple target dates."],
     ["dimension", "Sub-dimension (e.g. 'Overall', 'US', 'EU'). Most questions have only 'Overall'."],
     ["question_text", "Full question text as written in the LEAP panel."],
     ["resolution_criteria", "The exact condition that determines when and how this question resolves."],
     ["question_type", "quantile / probability / when."],
     ["unit", "Unit of the forecast value (e.g. '% GDP growth', 'USD billions')."],
-    ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved (black) rows."],
+    ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved rows, which use gpt_resolution_value / claude_resolution_value instead."],
     ["gpt_resolution_value / claude_resolution_value", "Each model's confirmed value at the target date, for resolved (black) rows only."],
-    ["gpt_color / claude_color", "black / dark gray / light gray / white — resolved, hard bound, directional signal, or no narrowing information."],
+    ["gpt_color / claude_color", "black / dark gray / light gray / white — resolved, hard bound, directional evidence, or no range-narrowing evidence."],
     ["gpt_q0 / claude_q0", "Lowest feasible bound (0th percentile-style bound, not an ordinary credible interval endpoint)."],
     ["gpt_q5 / claude_q5", "5th percentile."],
     ["gpt_q25 / claude_q25", "25th percentile (lower IQR bound)."],
@@ -170,13 +191,13 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_latest_official_value / claude_latest_official_value", "Most recent published official figure the model found."],
     ["gpt_latest_official_date / claude_latest_official_date", "Date that official figure was published or measured."],
     ["gpt_latest_official_source / claude_latest_official_source", "URL or citation for the latest official value."],
-    ["gpt_current_estimate / claude_current_estimate", "Model's estimate of the current value as of the run date."],
+    ["gpt_current_estimate / claude_current_estimate", "Model's estimate of the current value as of the run date. Different from gpt_q50/claude_q50, which is at the target date."],
     ["gpt_current_estimate_confidence / claude_current_estimate_confidence", "Confidence in the current estimate, 0-100."],
     ["gpt_rationale / claude_rationale", "Model's written explanation for its forecast."],
     ["gpt_sources / claude_sources", "Research URLs the model cited."],
     ["gpt_resolution_source / claude_resolution_source", "Source used for a resolved (black) row's resolution value."],
     ["gpt_resolution_source_date / claude_resolution_source_date", "Date of the resolution source."],
-    ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed."],
+    ["model_consensus", "auto_accepted / disagreement / single_model_only / both_failed. Auto-accepted passed model, validation, and checked-value agreement; it is not human verification."],
     ["consensus_q50_delta_pct", "|gpt_q50 − claude_q50| / mean(gpt_q50, claude_q50), this run only."],
     ["consensus_official_value_delta_pct", "Same idea as consensus_q50_delta_pct, but for the last official value: |gpt − claude| / mean(gpt, claude), averaged across dimensions, this run only. Blank when no official value applies (e.g. probability/when questions)."],
     ["forecast_stability", "Cross-run consistency of THIS row's q50 (not shared across a question's other date/dimension rows): both_stable / one_stable / volatile / new."],
@@ -185,10 +206,10 @@ INSTRUCTIONS_CONTENT = [
     ["gpt_official_value_stability / claude_official_value_stability", "Per-model official-value stability over the last 10 production runs."],
     ["official_value_changed / current_value_changed", "TRUE if the official value / current estimate moved (or appeared/disappeared) since the last comparable prior run, for at least one model. FALSE if a comparable prior run exists and nothing changed. Blank if no comparable prior run exists yet (first run, or every prior run used a different model version). Drives needs_review."],
     ["runs_seen", "Number of comparable runs with an adequate q50 for this row."],
-    ["confidence_tier", "high = auto_accepted + forecast_stability both_stable + official_value_stability both_stable or n/a + this-run q50 agreement + seen in 3+ runs. medium = auto_accepted + forecast_stability both_stable or one_stable. low = everything else."],
-    ["has_official_value", "TRUE if GPT or Claude found a published last official value for this question. FALSE for question types where no official figure exists."],
+    ["confidence_tier", "high = auto_accepted + forecast_stability both_stable + official_value_stability both_stable or n/a + this-run q50 agreement + seen in 3+ runs. medium = auto_accepted + forecast_stability both_stable or one_stable. low = everything else. Lowest review priority, not a claim of correctness - none of this is human verification."],
+    ["has_official_value", "TRUE if GPT or Claude found a published last official value for this question - reported by a model, not independently confirmed authoritative. FALSE for question types where no official figure exists."],
     ["has_current_value", "TRUE if GPT or Claude produced a current-day estimate for this question. FALSE where not applicable."],
-    ["review_verdict", "correct = both models right. close = roughly right. partially right = one model right or right direction/wrong magnitude. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
+    ["review_verdict", "correct = the model(s) got it right (both, on --both runs; the one model, on a single-model run). close = roughly right. partially right = right direction but wrong magnitude, or (on --both runs) one model right and the other wrong. wrong = clearly off. confidently wrong = model was certain and wrong. unknown = reviewed but can't assess (future question, insufficient data)."],
     ["review_last_official_value", "Human-verified last official value."],
     ["review_current_value", "Human-verified current value as of the run date."],
     ["reviewed_question_resolution_status", "Human-verified resolution status for the target row."],
@@ -202,6 +223,11 @@ INSTRUCTIONS_CONTENT = [
     ["question_id", "BigQuery ID for the date/dimension question row (dim_question)."],
     ["surveillance_timestamp", "UTC timestamp of this pipeline run (YYYYMMDD_HHMMSS). Matches the tab name suffix; sync uses it to locate the run's JSON."],
 ]
+
+
+def instructions_content(is_dev: bool) -> list[list[str]]:
+    how_to = _HOW_TO_DEV if is_dev else _HOW_TO_PROD
+    return _instructions_intro(is_dev) + [[""]] + how_to + _INSTRUCTIONS_BODY
 
 
 def get_sheets_client():
@@ -954,9 +980,9 @@ def _apply_row_validation(sheet, ws_id: int, start_row: int, end_row: int, heade
     ]})
 
 
-def _format_instructions(sheet, ws) -> None:
+def _format_instructions(sheet, ws, content: list[list[str]]) -> None:
     """Style the Instructions tab."""
-    section_headers = ("How to review", "Column groups", "Key columns")
+    section_headers = ("How to review", "How to use this sheet", "Column groups", "Key columns", "All columns")
 
     def _bold(row_idx: int, col_end: int = 1) -> dict:
         return {"repeatCell": {
@@ -999,7 +1025,7 @@ def _format_instructions(sheet, ws) -> None:
                       "startColumnIndex": 0, "endColumnIndex": 2},
             "mergeType": "MERGE_ALL"}}
 
-    for i, row in enumerate(INSTRUCTIONS_CONTENT):
+    for i, row in enumerate(content):
         first = (row[0] if row else "").strip() if row else ""
         if i == 0:
             reqs.append(_merge(i))
@@ -1169,16 +1195,18 @@ def setup_sheet(sheet_id: str = DEFAULT_DEV_SHEET_ID) -> None:
     client = get_sheets_client()
     sheet = client.open_by_key(sheet_id)
 
+    content = instructions_content(is_dev=sheet_id == DEFAULT_DEV_SHEET_ID)
+
     try:
         existing = sheet.worksheet("Instructions")
         sheet.del_worksheet(existing)
     except gspread.WorksheetNotFound:
         pass
-    instructions_ws = sheet.add_worksheet("Instructions", rows=max(100, len(INSTRUCTIONS_CONTENT) + 5), cols=4)
+    instructions_ws = sheet.add_worksheet("Instructions", rows=max(100, len(content) + 5), cols=4)
 
-    rows2 = [list(r) + [""] * (2 - len(r)) for r in INSTRUCTIONS_CONTENT]
+    rows2 = [list(r) + [""] * (2 - len(r)) for r in content]
     instructions_ws.update("A1", rows2)
-    _format_instructions(sheet, instructions_ws)
+    _format_instructions(sheet, instructions_ws, content)
     _reorder_tabs(sheet)
     print(f"Instructions tab refreshed: {sheet_id}")
 

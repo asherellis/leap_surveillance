@@ -46,8 +46,9 @@ leap-surveillance run --questions <id1>,<id2>           # specific questions
 ## Review and sync
 
 Every run publishes to the Dev sheet (`LEAP_DEV_SHEET_ID`), as a tab named `run_<run_id>`,
-unless `--no-sheet` is passed. Review happens there. The Prod sheet (`LEAP_SHEET_ID`) is never written to directly - it only
-ever receives a tab via promotion (below), and is not meant to be edited. The **Instructions**
+unless `--no-sheet` is passed. Review happens there. Prod run tabs only ever arrive through
+promotion (below) and aren't meant to be edited directly - `setup` is the one exception, since
+it rebuilds the Instructions tab on both sheets. The **Instructions**
 tab on either sheet explains the columns and the `status` values (`resolved`, `due_unresolved`,
 `forecast`, `resolved_early`).
 
@@ -59,12 +60,14 @@ leap-surveillance sync --tab run_<run_id>
 ```
 
 `--tab` is required — sync always names its tab explicitly, never guesses at "the latest one."
-It does two things, in order: writes all Sheet rows to `surveillance.surveillance_result`
-(reviewed rows carry human review fields, unreviewed rows carry model projections),
-`dim.dim_baseline`, and `fact.fact_resolution`; then copies that same Dev tab into the Prod sheet,
-overwriting any earlier promotion of the same tab. The promotion step runs regardless of whether
-the BigQuery writes succeeded, so a warehouse hiccup doesn't block preserving the reviewed record
-in Prod - but any failure (BigQuery or promotion) is still reported and exits nonzero.
+It does two things, in order: writes all Sheet rows to BigQuery -
+`surveillance.surveillance_result` (every row; reviewed rows carry human review fields,
+unreviewed rows carry model projections), plus `dim.dim_baseline` and `fact.fact_resolution`
+(baseline/resolution values, reviewed values taking priority where present) - then copies that
+same Dev tab into the Prod sheet, overwriting any earlier promotion of the same tab. The
+promotion step runs regardless of whether the BigQuery writes succeeded, so a warehouse hiccup
+doesn't block preserving the reviewed record in Prod - but any failure (BigQuery or promotion)
+is still reported and exits nonzero.
 To rebuild the Instructions tab on both sheets: `leap-surveillance setup`.
 
 ## Troubleshooting
