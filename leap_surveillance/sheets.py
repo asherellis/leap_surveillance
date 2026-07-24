@@ -16,7 +16,6 @@ from .common import (
     row_resolution_status,
     safe_str,
     to_float,
-    within_relative_tolerance,
 )
 from .storage import context_maps, pick_by_dimension
 
@@ -135,7 +134,7 @@ _INSTRUCTIONS_BODY = [
     ["status", "resolved (check the value), due_unresolved (look it up), forecast (usually leave), resolved_early (check the value)."],
     ["question_resolution_status", "System status: open / resolved / failed_to_resolve. projected is a reviewer provisional value."],
     ["question_resolution_value", "Model/system resolution value for this target row, if one exists. Human-confirmed values belong in reviewed_question_resolution_value."],
-    ["needs_review", "TRUE when the row needs a look: resolved/due, models disagreed, research/browser had a problem, or a value changed since the last run. Full definition in All columns."],
+    ["needs_review", "TRUE for a resolved/due row, a failed model in a dual-model run, or a changed official/current value since the last comparable run. Full definition in All columns."],
     ["gpt_q50 / claude_q50", "Each model's forecast median. Blank on resolved rows, which use gpt_resolution_value / claude_resolution_value instead."],
     ["gpt_resolution_value / claude_resolution_value", "Each model's confirmed value at the target date, for resolved (black) rows. Blank otherwise."],
     ["gpt_color / claude_color", "black = resolved; dark gray = hard bound; light gray = directional evidence; white = no range-narrowing evidence."],
@@ -164,7 +163,7 @@ _INSTRUCTIONS_BODY = [
     ["question_resolution_value", "Model/system resolution value at the target date, when available. Human-confirmed values belong in reviewed_question_resolution_value instead."],
     ["question_resolution_source", "Source for question_resolution_value."],
     ["question_resolution_source_date", "Date the resolution source value represents."],
-    ["needs_review", "TRUE when the row likely needs human attention: resolved/due, the models disagreed, research/browser extraction had a problem, or the official/current value changed since the last comparable run (patched in post-publish, once that comparison is possible)."],
+    ["needs_review", "TRUE when a reviewer needs to confirm or update a factual value: the row is resolved/due, one model failed in a dual-model run, or an official/current value changed since the last comparable run. The last trigger is added after publish, once comparison is possible. Model disagreement and browser/judge diagnostics still appear in their columns but do not flag a row by themselves."],
     ["target_date", "The date this forecast row is predicting. One question may have multiple target dates."],
     ["dimension", "Sub-dimension (e.g. 'Overall', 'US', 'EU'). Most questions have only 'Overall'."],
     ["question_text", "Full question text as written in the LEAP panel."],
@@ -313,29 +312,15 @@ def _needs_review(
     *,
     row_status: str,
     consensus_status: str,
-    gpt_view: dict,
-    claude_view: dict,
-    q_type: str = "",
-    gpt_q50=None,
-    claude_q50=None,
 ) -> str:
-    """Flag rows where human review is likely valuable before DWH confirmation."""
-    # stability columns aren't known yet at this point (computed post-publish) - check confidence_tier for that signal instead
+    """Return TRUE when a row needs a factual review."""
     status_norm = str(row_status or "").strip().lower()
     if status_norm in ("resolved", "resolved_early", "due_unresolved"):
         return "TRUE"
-    if consensus_status and consensus_status != "auto_accepted":
+    # A missing second model removes the independent check. Intentional single-model
+    # runs have no consensus status and do not trip this.
+    if consensus_status in ("single_model_only", "both_failed"):
         return "TRUE"
-    # Quantile auto-accept intentionally skips q50 (differing forecasts are expected) - still flag wild divergence for review.
-    if q_type == "quantile":
-        a, b = to_float(gpt_q50), to_float(claude_q50)
-        if a is not None and b is not None and not within_relative_tolerance(a, b, Q50_TOLERANCE):
-            return "TRUE"
-    for view in (gpt_view, claude_view):
-        if view.get("browser_status") in ("extract_failed", "refinement_rejected"):
-            return "TRUE"
-        if view.get("missing_data") or view.get("validation_issues"):
-            return "TRUE"
     return "FALSE"
 
 
@@ -344,7 +329,7 @@ _RUN_TAB_RE = re.compile(r"^run_\d{8}_\d{6}$")
 
 def _latest_run_tab(sheet):
     """Return the latest run_YYYYMMDD_HHMMSS worksheet, or None."""
-    # strict format match - a manual tab like run_backup would otherwise sort after every timestamped tab ('b' > '2') and silently become "latest"
+    # Ignore manual tabs such as run_backup when finding the latest published run.
     run_tabs = [ws for ws in sheet.worksheets() if _RUN_TAB_RE.match(ws.title)]
     if not run_tabs:
         return None
@@ -372,7 +357,7 @@ def _sheets_retry(fn, *args, max_attempts: int = 5, base_delay: float = 2.0, **k
 
 
 def _dedupe_run_tabs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """One (title, run_id) per run_id - keeps the shortest title, since duplicate/renamed tabs (run_..._verified) would otherwise double-count as separate prior runs."""
+    """Return one title per run ID, preferring the canonical shortest title."""
     by_run_id: dict[str, str] = {}
     for title, rid in pairs:
         if rid not in by_run_id or len(title) < len(by_run_id[rid]):
@@ -382,7 +367,7 @@ def _dedupe_run_tabs(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 def list_run_history_tabs(sheet_id: str, _sheet=None) -> list[tuple[str, str]]:
     """(tab_name, run_id) for every run_<timestamp>[...] tab, newest first, one tab per run_id."""
-    # looser than _RUN_TAB_RE - also matches renamed/reviewed copies (run_..._verified) since reviewers only touch review_*/reviewed_* columns, not the model-output columns this reads
+    # Also include renamed review copies; they retain the model-output columns used here.
     sheet = _sheet or _sheets_retry(lambda: get_sheets_client().open_by_key(sheet_id))
     worksheets = _sheets_retry(sheet.worksheets)
     found = [(ws.title, m.group(1)) for ws in worksheets if (m := _RUN_HISTORY_TAB_RE.match(ws.title))]
@@ -817,11 +802,6 @@ def build_review_rows(run_data: dict) -> tuple[list[list], list[str]]:
                 "needs_review": _needs_review(
                     row_status=row_status,
                     consensus_status=consensus_status_val,
-                    gpt_view=gpt_view,
-                    claude_view=claude_view,
-                    q_type=q_type,
-                    gpt_q50=gpt_row.get("q50"),
-                    claude_q50=claude_row.get("q50"),
                 ),
                 "question_text": q_text,
                 "resolution_criteria": q_criteria,
@@ -1068,7 +1048,7 @@ def _has_current_value(gpt_row: dict, claude_row: dict) -> bool:
 
 
 def _confidence_tier(model_consensus: str, forecast_stability: str, official_value_stability: str = "", runs_seen="", consensus_q50_delta_pct=None) -> str:
-    """high / medium / low - this-run agreement plus forecast and official-value stability, gated on this-run q50 agreement too so a currently divergent forecast can't read as high."""
+    """Return high, medium, or low confidence from agreement and cross-run stability."""
     n = to_float(runs_seen) or 0
     official_ok = official_value_stability in ("", "both_stable")  # "" means not-applicable (e.g. probability/when types have no official value) - never blocks "high"
     delta = to_float(consensus_q50_delta_pct)
